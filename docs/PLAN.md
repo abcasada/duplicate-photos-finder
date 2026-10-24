@@ -1,5 +1,8 @@
 # Plan: `dpf` — duplicate photo/video finder for multi-TB archives
 
+> The user's full original requirements and planning decisions are in
+> [ORIGINAL_REQUEST.md](ORIGINAL_REQUEST.md). Read that first when resuming.
+
 ## Context
 The user has ~30 TB of photos/videos spread across 5 NTFS USB drives (`/run/media/adam/Storage *`, mounted via ntfs3; most are 96–100% full, and one has 25 MB free). They want a Linux CLI that finds duplicates and reports them as **grouped sequences/folders**, not file-by-file. It has three modes: 1 = name/date (fast), 2 = full comparison (exact / visual / both, chosen by the user), 3 = mode 1 then automatically mode 2. The tool **only reports** and never modifies files. It should reuse existing tools (rmlint, exiftool) wherever that makes sense.
 
