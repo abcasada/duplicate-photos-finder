@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dpf"
+version = "0.1.0"
+description = "Find duplicate photos and videos across many drives, reported as folder-level sequences"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Adam Casada" }]
+dependencies = []
+
+[project.scripts]
+dpf = "dpf.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
