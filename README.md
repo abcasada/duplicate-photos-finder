@@ -17,19 +17,37 @@ as **folder-level sequences** instead of millions of individual file lines:
        covers 99% of A (1,434/1,438), 89% of B (1,434/1,608)
 ```
 
-On the author's archive (5 drives, 464k photos/videos, 25.9 TB) a full mode 1 run —
-scan, match, group, report — takes about 35 seconds.
+On the author's archive (pool A: 4 drives, 381k photos/videos, 18 TB) a full mode 1 run —
+scan, match, group, report — takes about 30 seconds.
 
 dpf is **read-only**: it never modifies, moves, or deletes anything, and never writes to
 the drives it scans. Its index and reports live on the local disk under `~/.cache/dpf/`.
+
+## Project status (2026-10-25)
+
+| Area | State |
+|---|---|
+| Mode 1: name/size/date | ✅ Done and used on the author's archive (6 drives, ~550k files, ~33 TB) |
+| Folder sequences, tree roll-up, tree overview, near-identical labels | ✅ Done |
+| Reports: text, Excel (`.xlsx`), JSON, CSV | ✅ Done |
+| Drives that aren't plugged in (compared from the index) | ✅ Done |
+| Named drive pools (`--pool A`) | ✅ Done |
+| Smarter mode 1 names (copy suffixes, camera numbers in renamed files) | 🚧 In progress |
+| Mode 1b: EXIF (camera serial + shutter count) | 📋 Next: researched and benchmarked, not built |
+| Mode 2: content (exact / visual) | 📋 Planned |
+| Mode 3: mode 1 then mode 2 | 📋 Planned |
+
+Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md)
+(also available as `AGENTS.md`).
 
 ## Modes
 
 | Mode | What counts as a duplicate | Speed | Status |
 |---|---|---|---|
-| `1` / `name` | Same filename (case-insensitive), same size, modification time within 2 s | Seconds: reads only directory metadata | ✅ available |
-| `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 🚧 Phase 2 |
-| `3` / `both` | Mode 1 report first, then mode 2 automatically | | 🚧 Phase 3 |
+| `1` / `name` | Same filename (case-insensitive), same size, modification time within 2 s | Seconds: reads only folder listings | ✅ available |
+| `1b` (planned) | Same camera body serial + shutter count (from EXIF), so renamed or re-downloaded copies are caught and RAW+JPG pairs are recognised as one shot | ~50 min per large drive the first time (reads each file's header), cached afterwards | 📋 next |
+| `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 📋 planned |
+| `3` / `both` | Mode 1 report first, then mode 2 automatically | | 📋 planned |
 
 ## Install / run
 
@@ -231,14 +249,28 @@ on name and date without reading file contents.
 
 ## Roadmap
 
-- **Phase 1** (done): scanner, SQLite index, mode 1, sequence/folder grouping, reports.
-- **Phase 2**: mode 2 — rmlint exact, exiftool `ImageDataHash`, czkawka visual (`--compare`).
-- **Phase 3**: mode 3 (mode 1 then mode 2), EXIF capture-date matching (`--date-source exif`).
+- **Phase 1** (done): scanner, SQLite index, mode 1, sequence/folder grouping, tree
+  overview, text/Excel/JSON/CSV reports, offline drives, drive pools.
+- **Now**: smarter mode 1 names (copy suffixes such as `DSC00001-2.jpg` or
+  `IMG_1 (1).JPG`, and camera numbers inside renamed files). Size and date must still
+  match.
+- **Next, mode 1b (EXIF)**: shot identity from the camera body serial and shutter count.
+  The author's Sony A7R IV bodies and Pentax K-1 Mark II both record these, but not
+  sub-second times. Uses a fast exiftool pipeline that reads only the first 512 KB of
+  each file, with results cached in the index.
+- **Phase 2, mode 2 (content)**: rmlint for exact copies, exiftool `ImageDataHash` for
+  same-pixels-different-metadata, czkawka for visually similar (`--compare`).
+- **Phase 3, mode 3**: mode 1, then mode 2 automatically.
 
-See [docs/PLAN.md](docs/PLAN.md) for the design.
+Design history, research and measurements are in [docs/PLAN.md](docs/PLAN.md). The
+requirements and every decision made so far are in
+[docs/ORIGINAL_REQUEST.md](docs/ORIGINAL_REQUEST.md).
 
 ## Development
 
 ```sh
 python3 -m unittest discover -s tests -t .
 ```
+
+See [CLAUDE.md](CLAUDE.md) for the architecture, the hard rules (never write to scanned
+drives, never wipe the index, never overclaim a match), and conventions.

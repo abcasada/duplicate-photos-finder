@@ -57,6 +57,12 @@ planning, so later sessions don't lose them. See [PLAN.md](PLAN.md) for the desi
 | Git author | **Adam Casada**, `40399292+abcasada@users.noreply.github.com` (set repo-locally). |
 | Drive sets (added during Phase 1, revised 2026-10-25) | Two **pools** that are scanned and compared **separately, never against each other**. **Pool A** (primary) = **Storage 1TB** plus **every A drive** (1A, 2A, 3A, and future "Storage NA …"). **Pool B** (backups) = **every B drive** (1B, 2B, 3B, and future "Storage NB …"), each a backup of the matching A drive. Storage 1B is currently labelled **"Storage 1B 4TB (2)"** by mistake and may be renamed. Configured as named pools in `~/.config/dpf/pools.toml` (`dpf find --pool A`). |
 | Cameras (added 2026-10-25) | The main duplicate sources are a **Pentax K-1 Mark II** and a **Sony A7R IV**. |
+| Camera bodies (2026-10-25) | There are **two Sony A7R IV bodies** (EXIF shows two `InternalSerialNumber` values). Their `DSC#####` numbering overlaps, so a filename never identifies a body. |
+| EXIF (2026-10-25) | EXIF-based matching is worth having but slow, so it becomes its own **mode 1b**, separate from the fast mode 1. |
+| Smarter mode 1 (2026-10-25) | The user asked to make mode 1 smarter using numbers from filenames. Filenames carry the camera's file counter, not the body serial, so mode 1 now matches on the camera number or on the name with copy suffixes removed (`DSC00001-2.jpg`, `IMG_1 (1).JPG`, `2023-08-26_DSC01234.ARW`), still requiring the same extension, size and date. |
+| Excel report (2026-10-24) | Wanted a nicer-to-read Excel file. Uses XlsxWriter (optional dependency, installed via apt) and is opened in LibreOffice on this PC and Excel on Windows, so folder cells are `file://` links. |
+| Offline drives (2026-10-25) | The user has more drives than can be connected at once, so drives are scanned in batches and compared later from the index. |
+| Documentation (2026-10-25) | The project must be documented well enough to resume with a different LLM: see `CLAUDE.md` (also `AGENTS.md`). |
 | Report detail (added during Phase 1) | Wanted: a **tree overview** that rolls near-identical trees into headline lines, plus **near-identical folders** noted alongside identical ones. |
 | Speed (added during Phase 1) | **Speed is a priority for all modes.** The machine is a Ryzen 5 3600 (6 cores / 12 threads); use multithreading where the bottleneck allows. |
 | Plan approval | The user said to write the plan into the repo, commit it, and resume implementation in a later session. |
@@ -71,8 +77,8 @@ planning, so later sessions don't lose them. See [PLAN.md](PLAN.md) for the desi
 - Not installed: czkawka, fclones, jdupes.
 - Hardware: 12 cores, 31 GB RAM. The root disk (ext4) has about 78 GB free.
 
-**Data drives:** 5 NTFS (ntfs3) drives, about 30 TB total, mounted under
-`/run/media/adam/`.
+**Data drives (as first seen on 2026-10-24):** 5 NTFS (ntfs3) drives, about 30 TB total, mounted under
+`/run/media/adam/`. More drives were added later (Storage 1B 4TB, Storage 2B 8TB); see the pools in CLAUDE.md.
 
 | Drive | Free space |
 |---|---|
@@ -87,11 +93,6 @@ reports go under `~/.cache/dpf` or a user-chosen `--out`.
 
 ## Next step when resuming
 
-Start **Phase 1** in PLAN.md:
-1. Scaffold the project and add `.claude/agents` definitions with model and effort.
-2. Build the scanner and SQLite index.
-3. Build the mode 1 matcher.
-4. Build sequence/folder grouping.
-5. Build reports and README.
-
-Then stop for review.
+The current status, next steps and open questions are maintained in
+[../CLAUDE.md](../CLAUDE.md) ("Current status" and "Next steps"). This file records only
+requirements and decisions. Add new user decisions to the table above, with their date.

@@ -1,7 +1,9 @@
 # Plan: `dpf` — duplicate photo/video finder for multi-TB archives
 
-> The user's full original requirements and planning decisions are in
-> [ORIGINAL_REQUEST.md](ORIGINAL_REQUEST.md). Read that first when resuming.
+> **This is the design history**: the original plan, the research and the measurements,
+> appended to as work progressed. For the **current status and next steps**, read
+> [../CLAUDE.md](../CLAUDE.md) first. Requirements and decisions are in
+> [ORIGINAL_REQUEST.md](ORIGINAL_REQUEST.md).
 
 ## Context
 The user has ~30 TB of photos/videos spread across 5 NTFS USB drives (`/run/media/adam/Storage *`, mounted via ntfs3; most are 96–100% full, and one has 25 MB free). They want a Linux CLI that finds duplicates and reports them as **grouped sequences/folders**, not file-by-file. It has three modes: 1 = name/date (fast), 2 = full comparison (exact / visual / both, chosen by the user), 3 = mode 1 then automatically mode 2. The tool **only reports** and never modifies files. It should reuse existing tools (rmlint, exiftool) wherever that makes sense.
@@ -185,3 +187,14 @@ only verify the mode 1 candidates (fast), or do a full content scan?
   3. In 180 field comparisons, the heads gave **identical** values to the full files.
   4. Fall back to reading the full file when a needed tag is missing from the head.
 - **Estimate for a first EXIF pass:** about 50 min for Storage 1A (205k files), with drives in parallel. Results are cached in the index by (path, size, mtime), so later runs only read new or changed files.
+
+## Roadmap revision (2026-10-25)
+- **Mode 1b (EXIF)** is a new mode between 1 and 2, kept separate because it is slow on
+  the first pass. Design notes are in "EXIF research" above; the agreed plan is in
+  CLAUDE.md, "Next steps".
+- **Mode 1 gets smarter names.** It matches on the camera file number or a
+  copy-suffix-stripped name, and still requires the same extension, size and mtime.
+  `--exact-names` restores the old behaviour.
+- **Index schema changes now migrate in place.** Unplugged drives cannot be rescanned,
+  so dropping the index would lose data.
+- Phases 2 and 3 are unchanged.
