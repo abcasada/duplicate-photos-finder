@@ -32,7 +32,7 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Reports: text, Excel (`.xlsx`), JSON, CSV | ✅ Done |
 | Drives that aren't plugged in (compared from the index) | ✅ Done |
 | Named drive pools (`--pool A`) | ✅ Done |
-| Smarter mode 1 names (copy suffixes, camera numbers in renamed files) | 🚧 In progress |
+| Smarter mode 1 names (copy suffixes, camera numbers in renamed files) | ✅ Done |
 | Mode 1b: EXIF (camera serial + shutter count) | 📋 Next: researched and benchmarked, not built |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
@@ -44,7 +44,7 @@ Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md
 
 | Mode | What counts as a duplicate | Speed | Status |
 |---|---|---|---|
-| `1` / `name` | Same filename (case-insensitive), same size, modification time within 2 s | Seconds: reads only folder listings | ✅ available |
+| `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; renamed files matched by their camera number), same extension, same size, modification time within 2 s. `--exact-names` requires identical names | Seconds: reads only folder listings | ✅ available |
 | `1b` (planned) | Same camera body serial + shutter count (from EXIF), so renamed or re-downloaded copies are caught and RAW+JPG pairs are recognised as one shot | ~50 min per large drive the first time (reads each file's header), cached afterwards | 📋 next |
 | `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 📋 planned |
 | `3` / `both` | Mode 1 report first, then mode 2 automatically | | 📋 planned |
@@ -106,6 +106,9 @@ dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 --pool B
 
 # Looser matching: ignore size (catches re-saved copies) or dates
 dpf find --mode 1 --ignore-size --pool A
+
+# Stricter matching: identical names only (no copy-mark / camera-number matching)
+dpf find --mode 1 --exact-names --pool A
 
 # Plain paths work too, instead of --pool (not together with it)
 dpf find --mode 1 /run/media/adam/Storage\ 1TB
@@ -225,8 +228,25 @@ Only photos and videos are compared (everything, with `--all-files`). Other file
 instead, and a pair that holds any says so, e.g. `(all photos/videos match, 12 files;
 3 other files not compared)`. Check those files before deleting either side.
 
-Duplicates sitting in the *same* folder (e.g. `IMG_1.JPG` vs `img_1.jpg`) are summarised
-separately.
+Duplicates sitting in the *same* folder (e.g. `IMG_1.JPG` vs `IMG_1 (1).JPG`) are
+summarised separately.
+
+#### How mode 1 compares names
+
+The report header says `matched on similar name+size+mtime ±2s`. "Similar name" means:
+
+- **Case is ignored.**
+- **Copy marks are ignored:** ` (1)`, ` - Copy`, ` - Copy (2)`, ` copy`, `Copy of `, `~2`,
+  plus `-2` / `_1` directly after a camera number (`DSC00001-2.jpg`).
+- **Renamed files match by camera number.** `2023-08-26_DSC01234.ARW` and
+  `DSC01234.ARW` are the same name.
+- **The extension must be the same,** so a RAW never matches its JPG.
+- **Numbers after a space are kept** (`Party 2.jpg` ≠ `Party 3.jpg`), and so is `-2` after
+  ordinary text, because real sequences of identical size and time use those.
+
+Camera file numbers repeat: Sony `DSC` numbering restarts every 10,000 shots and is shared
+by two bodies. That is why size and date must still match. Empty (0-byte) files are never
+matched. `--exact-names` switches back to identical names only.
 
 ## Why another tool? (research summary, Oct 2026)
 
@@ -251,9 +271,9 @@ on name and date without reading file contents.
 
 - **Phase 1** (done): scanner, SQLite index, mode 1, sequence/folder grouping, tree
   overview, text/Excel/JSON/CSV reports, offline drives, drive pools.
-- **Now**: smarter mode 1 names (copy suffixes such as `DSC00001-2.jpg` or
-  `IMG_1 (1).JPG`, and camera numbers inside renamed files). Size and date must still
-  match.
+- **Done since**: smarter mode 1 names (copy suffixes such as `DSC00001-2.jpg` or
+  `IMG_1 (1).JPG`, and camera numbers inside renamed files; size and date must still
+  match), and runs that stay whole across RAW+JPG siblings.
 - **Next, mode 1b (EXIF)**: shot identity from the camera body serial and shutter count.
   The author's Sony A7R IV bodies and Pentax K-1 Mark II both record these, but not
   sub-second times. Uses a fast exiftool pipeline that reads only the first 512 KB of

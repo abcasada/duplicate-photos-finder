@@ -88,8 +88,9 @@ Data flows **scan → index → match → group → report**.
 |---|---|
 | `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `find`, `drives` (`--forget`), `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
 | `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing) and `drop_nested`. |
-| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots`, `files` (dir, name, name_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`. |
-| `src/dpf/match_name.py` | Mode 1 matcher. Buckets come from `Index.name_buckets` (same name key, and same size unless `--ignore-size`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance. |
+| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots`, `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`. |
+| `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped, camera-number tokens, extension kept). It is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
+| `src/dpf/match_name.py` | Mode 1 matcher. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance. |
 | `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). |
 | `src/dpf/report.py` | `report.txt` (`format_text`), `report.json`, `files.csv`, and shared label/format helpers (`pair_label`, `tree_label`, `run_lines`, `floor_percent`, `human_bytes` (decimal units), root-status lines). |
 | `src/dpf/xlsx_report.py` | `report.xlsx` (optional, XlsxWriter). Sheets: Summary, Trees, Folder pairs, Sequences, Same folder, Files. Sizes are stored as bytes with a GB display format, percentages are floored, relations are colour-coded, and folders are `file://` links (stopping at Excel's link limits). |
@@ -117,11 +118,22 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
 - **Index contents:** 6 drives (1TB, 1A, 2A, 3A, 2B, 3B). **Storage 1B has never been
   scanned.**
 
-**In progress:** *smarter mode 1 names.* Match on the camera file number, or on the name
-with copy suffixes removed (`DSC00001-2.jpg`, `IMG_1 (1).JPG`, `2023-08-26_DSC01234.ARW`),
-while still requiring the same extension, size and mtime. Adds a `match_key` column with
-an in-place migration, and `--exact-names` for the old behaviour. Check `git log` and
-`src/dpf/names.py` to see whether it has landed.
+- **Smarter mode 1 names (`src/dpf/names.py`):** the match key is the camera file number,
+  or the name with copy marks stripped (`DSC00001-2.jpg`, `IMG_1 (1).JPG`,
+  `2023-08-26_DSC01234.ARW`). Extension, size and mtime must still match.
+  - `--exact-names` restores the old rule.
+  - 0-byte files are never matched.
+  - The rules and their false-match reasoning are in the `names.py` docstring and
+    `tests/test_names.py`. For example, ` 2` after a space and `-N` after plain text are
+    kept, because real BMP sequences of identical size and time matched otherwise.
+  - Real gain: pool A +27 new groups and 23 groups with added copies (+4 GB), pool B +2.
+    Renamed-*and-rewritten* copies (Lightroom) differ in size, so they need mode 1b or 2.
+- **Runs stay whole across same-shot siblings:** an unmatched `X.JPG` next to a matched
+  `X.ARW` no longer splits a run (`grouping._beside_sibling`). Runs: pool A 7,373 → 4,698,
+  pool B 1,081 → 292.
+- **Index schema v3** (`match_key` column) migrated in place on the real index on
+  2026-10-25. A pre-migration copy is at `~/.cache/dpf/index.v2-backup-20261025.db`;
+  delete it once v3 has proven fine.
 
 ## Next steps (agreed with the user)
 
@@ -152,7 +164,6 @@ an in-place migration, and `--exact-names` for the old behaviour. Check `git log
      (fast) or do a full content scan?
 
 Known limitations (documented, not fixed):
-- RAW+JPG runs fragment when only one extension matched.
 - A file in N folders yields up to N(N-1)/2 folder pairs.
 - Small trees take tree-overview slots.
 - Hardlinks are not merged.

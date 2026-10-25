@@ -198,3 +198,6 @@ only verify the mode 1 candidates (fast), or do a full content scan?
 - **Index schema changes now migrate in place.** Unplugged drives cannot be rescanned,
   so dropping the index would lose data.
 - Phases 2 and 3 are unchanged.
+- **2026-10-25: smarter names landed.** The mode 1 key is `names.match_key` plus size plus
+  mtime. The index is at schema v3 (migrated in place). The RAW+JPG run-splitting
+  limitation is fixed.
