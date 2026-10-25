@@ -43,6 +43,14 @@ SKIP_DIRS = frozenset(
     }
 )
 
+# OS-generated files that say nothing about a folder's content; never indexed or counted.
+JUNK_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini", ".ds_store", "icon\r"})
+
+
+def is_junk(name: str) -> bool:
+    """AppleDouble "._*" files and OS clutter such as Thumbs.db and .DS_Store."""
+    return name.startswith("._") or name.casefold() in JUNK_FILES
+
 
 def classify(name: str) -> str | None:
     """Return IMAGE, VIDEO, or None for a filename, based on its extension."""

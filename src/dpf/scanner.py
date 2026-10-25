@@ -99,7 +99,7 @@ def walk(
                                 continue
                             subdirs.append(entry.path)
                             continue
-                        if name.startswith("._"):
+                        if media.is_junk(name):
                             continue
                         if not entry.is_file(follow_symlinks=False):
                             other += 1
