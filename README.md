@@ -33,7 +33,9 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 
 ## Install / run
 
-Python 3.11+ with no third-party dependencies.
+Python 3.11+ with no third-party dependencies. The optional Excel report needs
+XlsxWriter (`sudo apt install python3-xlsxwriter`, or `pipx install '.[xlsx]'`); without
+it dpf skips `report.xlsx` and says so.
 
 ```sh
 git clone https://github.com/abcasada/duplicate-photos-finder.git
@@ -68,9 +70,14 @@ dpf find --mode 1 --ignore-size /run/media/adam/Storage\ 3B*
 dpf scan /run/media/adam/Storage\ 1TB
 ```
 
-Each `find` writes three files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out DIR`):
+Each `find` writes these files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out DIR`):
 
 - `report.txt` — the grouped report (also printed to the terminal)
+- `report.xlsx` — the same as a workbook for Excel or LibreOffice: summary, tree overview,
+  every folder pair, sequences, same-folder duplicates and every duplicate file, on
+  sortable, filterable sheets with colour-coded relations and clickable folder links.
+  Sizes and percentages are real numbers (percentages rounded down, as in the text).
+  Needs XlsxWriter; `--no-xlsx` skips it
 - `report.json` — the same, structured, for scripting
 - `files.csv` — every duplicate file, one row each, for when you need per-file detail
 

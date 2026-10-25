@@ -1,13 +1,17 @@
 import contextlib
+import importlib.util
 import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from dpf.cli import main
+
+HAVE_XLSXWRITER = importlib.util.find_spec("xlsxwriter") is not None
 
 
 class CliTest(unittest.TestCase):
@@ -45,6 +49,38 @@ class CliTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
         with open(os.path.join(self.out, "report.json")) as fh:
             self.assertEqual(len(json.load(fh)["pairs"]), 1)
+
+    @unittest.skipUnless(HAVE_XLSXWRITER, "XlsxWriter is not installed")
+    def test_xlsx_written(self):
+        code, out, err = self.run_cli("find", "-q", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        xlsx = os.path.join(self.out, "report.xlsx")
+        self.assertTrue(os.path.getsize(xlsx) > 0)
+        self.assertIn(f"XLSX: {xlsx}", out)
+        self.assertEqual(err, "")
+        with open(os.path.join(self.out, "report.json")) as fh:
+            self.assertEqual(json.load(fh)["summary"]["xlsx_path"], xlsx)
+
+    def test_no_xlsx_flag(self):
+        xlsx = os.path.join(self.out, "report.xlsx")
+        os.makedirs(self.out)
+        open(xlsx, "wb").close()  # stale workbook from an earlier run
+        code, out, err = self.run_cli("find", "-q", "--no-xlsx", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(xlsx))
+        self.assertNotIn("XLSX:", out)
+        self.assertEqual(err, "")
+
+    def test_xlsx_skipped_without_xlsxwriter(self):
+        with mock.patch.dict(sys.modules, {"xlsxwriter": None}):
+            code, out, err = self.run_cli("find", "-q", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("all photos/videos match", out)
+        self.assertNotIn("XLSX:", out)
+        self.assertEqual(err, "dpf: report.xlsx skipped (install python3-xlsxwriter)\n")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "report.xlsx")))
+        for name in ("report.txt", "report.json", "files.csv"):
+            self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
 
     def test_no_scan_requires_index(self):
         code, _, err = self.run_cli("find", "-q", "--no-scan", "-o", self.out, self.drives)

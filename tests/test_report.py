@@ -109,7 +109,10 @@ class TextReportTest(unittest.TestCase):
         self.assertIn("Same-folder duplicates: 1 group, 1.0 kB redundant, in 1 folder", text)
         self.assertIn("       1 group     1.0 kB  /drives/one/Phone", text)
         self.assertIn("CSV:  /tmp/r.csv", text)
+        self.assertNotIn("XLSX:", text)
         self.assertNotIn("IMG_0120", text)  # never every file
+        text = format_text(self.result, {**SUMMARY, "xlsx_path": "/tmp/r.xlsx"})
+        self.assertIn("Per-file detail:\n  XLSX: /tmp/r.xlsx", text)
 
     def test_single_file_run_and_max_runs(self):
         records = imgs("/a", range(0, 40)) + imgs("/b", range(0, 40, 2))

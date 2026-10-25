@@ -38,6 +38,7 @@ src/dpf/
   match_name.py mode 1 matcher
   grouping.py   duplicate groups -> folder-pair runs (the core value)
   report.py     text report (stdout + saved file), JSON, CSV (full per-file detail lives in CSV/JSON)
+  xlsx_report.py report.xlsx workbook (optional XlsxWriter; skipped with a hint when missing)
   media.py      extension sets: JPEG/PNG/HEIC/AVIF/WebP/TIFF/RAW (CR2/CR3/NEF/ARW/DNG/RAF/ORF/RW2), MP4/MOV/AVI/MKV/MTS/3GP...
 tests/          unittest; fixtures are built in temp dirs (os.utime for mtimes)
 ```

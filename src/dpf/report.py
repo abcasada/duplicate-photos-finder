@@ -15,6 +15,7 @@ from dpf.grouping import (
     IDENTICAL,
     IDENTICAL_TREE,
     NEAR_IDENTICAL,
+    PARTIAL,
     TREE_A_MOSTLY_IN_B,
     TREE_B_MOSTLY_IN_A,
     TREE_NEAR,
@@ -46,8 +47,24 @@ def human_bytes(n: int) -> str:
     raise AssertionError("unreachable")
 
 
-def _plural(n: int, word: str) -> str:
+PAIR_LABELS = {
+    IDENTICAL_TREE: "matching tree",
+    IDENTICAL: "all photos/videos match",
+    A_IN_B: "A is fully contained in B",
+    B_IN_A: "B is fully contained in A",
+    NEAR_IDENTICAL: "near-identical",
+    PARTIAL: "partial overlap",
+}
+
+
+def plural(n: int, word: str) -> str:
     return f"{n:,} {word}" if n == 1 else f"{n:,} {word}s"
+
+
+
+def floor_percent(part: int, whole: int) -> int:
+    """Whole percent, rounded down so that 100 always means every file (0 if `whole` is 0)."""
+    return part * 100 // whole if whole > 0 else 0
 
 
 def _percent(part: int, whole: int) -> str:
@@ -55,10 +72,10 @@ def _percent(part: int, whole: int) -> str:
         return "0%"
     if 0 < part < whole and part * 100 < whole:
         return "<1%"
-    return f"{part * 100 // whole}%"
+    return f"{floor_percent(part, whole)}%"
 
 
-def _duration(seconds: float) -> str:
+def duration(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.1f} s"
     s = round(seconds)
@@ -71,46 +88,58 @@ def _coverage(matched_a: int, total_a: int, matched_b: int, total_b: int) -> str
     return f"{_percent(matched_a, total_a)} / {_percent(matched_b, total_b)}"
 
 
+def contained_and_near(p: FolderPair, near: float = DEFAULT_NEAR) -> bool:
+    """True if one side is fully contained and the other, not complete, is near-matched."""
+    if p.relation == A_IN_B:
+        return p.matched_b < p.total_b and is_near(p.matched_b, p.total_b, near)
+    if p.relation == B_IN_A:
+        return p.matched_a < p.total_a and is_near(p.matched_a, p.total_a, near)
+    return False
+
+
+def pair_label(p: FolderPair, near: float = DEFAULT_NEAR) -> str:
+    """Short relation label without counts, e.g. "A is fully contained in B; near-identical"."""
+    label = PAIR_LABELS.get(p.relation, p.relation)
+    return label + "; near-identical" if contained_and_near(p, near) else label
+
+
 def _describe(p: FolderPair, near: float = DEFAULT_NEAR) -> str:
     """Relation label. File contents are not compared in mode 1, so never "identical"."""
     only_a, only_b = p.total_a - p.matched_a, p.total_b - p.matched_b
     cover = _coverage(p.matched_a, p.total_a, p.matched_b, p.total_b)
+    text = PAIR_LABELS.get(p.relation, p.relation)
     if p.relation == IDENTICAL_TREE:
-        text = f"matching tree: {_plural(p.folders, 'folder')}, {_plural(p.matched_a, 'file')}"
+        text += f": {plural(p.folders, 'folder')}, {plural(p.matched_a, 'file')}"
     elif p.relation == IDENTICAL:
-        text = f"all photos/videos match, {_plural(p.matched_a, 'file')}"
-    elif p.relation == A_IN_B:
-        text = "A is fully contained in B"
-        if only_b > 0 and is_near(p.matched_b, p.total_b, near):
-            text += f"; near-identical: {cover}, {_plural(only_b, 'file')} only in B"
-    elif p.relation == B_IN_A:
-        text = "B is fully contained in A"
-        if only_a > 0 and is_near(p.matched_a, p.total_a, near):
-            text += f"; near-identical: {cover}, {_plural(only_a, 'file')} only in A"
+        text += f", {plural(p.matched_a, 'file')}"
     elif p.relation == NEAR_IDENTICAL:
-        text = f"near-identical: {cover}; {_plural(only_a, 'file')} only in A, {only_b:,} only in B"
-    else:
-        text = "partial overlap"
+        text += f": {cover}; {plural(only_a, 'file')} only in A, {only_b:,} only in B"
+    elif contained_and_near(p, near):
+        only = (only_b, "B") if p.relation == A_IN_B else (only_a, "A")
+        text += f"; near-identical: {cover}, {plural(only[0], 'file')} only in {only[1]}"
     if p.unindexed:
-        text += f"; {_plural(p.unindexed, 'other file')} not compared"
+        text += f"; {plural(p.unindexed, 'other file')} not compared"
     return text
 
 
-def _describe_tree(t: TreePair) -> str:
+def tree_label(t: TreePair) -> str:
+    """Tree pair relation label without counts, e.g. "A largely within B"."""
     if t.relation == TREE_NEAR:
-        label = "near-identical trees"
-    elif t.relation == TREE_A_MOSTLY_IN_B:
-        label = "A within B" if t.matched_a == t.total_a else "A largely within B"
-    elif t.relation == TREE_B_MOSTLY_IN_A:
-        label = "B within A" if t.matched_b == t.total_b else "B largely within A"
-    else:
-        label = "overlapping trees"
+        return "near-identical trees"
+    if t.relation == TREE_A_MOSTLY_IN_B:
+        return "A within B" if t.matched_a == t.total_a else "A largely within B"
+    if t.relation == TREE_B_MOSTLY_IN_A:
+        return "B within A" if t.matched_b == t.total_b else "B largely within A"
+    return "overlapping trees"
+
+
+def _describe_tree(t: TreePair) -> str:
     text = (
-        f"{label}: {_coverage(t.matched_a, t.total_a, t.matched_b, t.total_b)}, "
-        f"{_plural(t.folders, 'folder pair')}, {_plural(t.matched_a, 'file')}"
+        f"{tree_label(t)}: {_coverage(t.matched_a, t.total_a, t.matched_b, t.total_b)}, "
+        f"{plural(t.folders, 'folder pair')}, {plural(t.matched_a, 'file')}"
     )
     if t.unindexed:
-        text += f"; {_plural(t.unindexed, 'other file')} not compared"
+        text += f"; {plural(t.unindexed, 'other file')} not compared"
     return text
 
 
@@ -125,25 +154,33 @@ def _span(first: str, last: str) -> str:
     return first if first == last else f"{first} … {last}"
 
 
-def _run_lines(runs: tuple[Run, ...], max_runs: int) -> list[str]:
+def run_lines(
+    runs: tuple[Run, ...], max_runs: int, *, indent: str = _INDENT, align: bool = True
+) -> list[str]:
+    """One line per run, up to `max_runs`, then an "… and N more runs" line.
+
+    `align` pads names and counts into columns (for monospaced text).
+    """
     shown = runs[:max_runs]
     if not shown:
         return []
     labels = [_span(r.a_first, r.a_last) for r in shown]
-    label_w = max(len(s) for s in labels)
-    count_w = max(len(f"{r.count:,}") for r in shown)
+    label_w = max(len(s) for s in labels) if align else 0
+    count_w = max(len(f"{r.count:,}") for r in shown) if align else 0
     lines = []
     for r, label in zip(shown, labels):
-        unit = "file " if r.count == 1 else "files"
-        line = f"{_INDENT}{label:<{label_w}}  {r.count:>{count_w},} {unit}"
+        unit = "file" if r.count == 1 else "files"
+        if align:
+            unit = unit.ljust(5)
+        line = f"{indent}{label:<{label_w}}  {r.count:>{count_w},} {unit}"
         if not r.same_names:
             line += f"  → in B: {_span(r.b_first, r.b_last)}"
         lines.append(line.rstrip())
     rest = runs[max_runs:]
     if rest:
         files = sum(r.count for r in rest)
-        more = _plural(len(rest), "more run")
-        lines.append(f"{_INDENT}… and {more} ({_plural(files, 'file')})")
+        more = plural(len(rest), "more run")
+        lines.append(f"{indent}… and {more} ({plural(files, 'file')})")
     return lines
 
 
@@ -156,7 +193,7 @@ def _pair_block(
         head += f"  (in {tree})"
     if p.relation in (IDENTICAL, IDENTICAL_TREE):
         return [head]
-    lines = [head, *_run_lines(p.runs, max_runs)]
+    lines = [head, *run_lines(p.runs, max_runs)]
     lines.append(_covers(p.matched_a, p.total_a, p.matched_b, p.total_b))
     return lines
 
@@ -167,7 +204,7 @@ def _tree_overview(trees: list[TreePair], top: int, near: float) -> tuple[list[s
     if not shown:
         return [], {}
     out = [
-        f"Tree overview: {_plural(len(trees), 'tree pair')} holding several folder pairs "
+        f"Tree overview: {plural(len(trees), 'tree pair')} holding several folder pairs "
         "(largest first)",
         "  Folders are grouped by the trees they sit in, matched at the same relative path.",
         "  A / B % = share of all photos/videos indexed under each tree that matched;",
@@ -175,26 +212,27 @@ def _tree_overview(trees: list[TreePair], top: int, near: float) -> tuple[list[s
         "  deleting: other files and unmatched subfolders are not listed here.",
         "",
     ]
-    tags: dict[tuple[str, str], str] = {}
     num_w = len(f"[T{len(shown)}]")
     for n, t in enumerate(shown, 1):
-        label = f"T{n}"
-        num = f"[{label}]".ljust(num_w)
+        num = f"[T{n}]".ljust(num_w)
         out.append(
             f"{num}  {human_bytes(t.bytes):>8}  {t.dir_a}  ↔  {t.dir_b}   ({_describe_tree(t)})"
         )
         out.append(_covers(t.matched_a, t.total_a, t.matched_b, t.total_b))
         out.append("")
-        for key in t.members:
-            tags[key] = label
     if len(trees) > len(shown):
-        more = _plural(len(trees) - len(shown), "more tree pair")
+        more = plural(len(trees) - len(shown), "more tree pair")
         out.append(f"… {more} not shown (tree top {top})")
         out.append("")
-    return out, tags
+    return out, tree_tags(shown)
 
 
-def _same_folder_stats(groups: list[DuplicateGroup]) -> tuple[int, list[tuple[str, int, int, int]]]:
+def tree_tags(trees: Iterable[TreePair]) -> dict[tuple[str, str], int]:
+    """(dir_a, dir_b) of each member folder pair -> 1-based number of its tree (T1, T2…)."""
+    return {key: n for n, t in enumerate(trees, 1) for key in t.members}
+
+
+def same_folder_stats(groups: list[DuplicateGroup]) -> tuple[int, list[tuple[str, int, int, int]]]:
     """(redundant bytes, [(dir, groups, extra copies, redundant bytes)] by group count)."""
     per_dir: dict[str, list[int]] = {}
     total = 0
@@ -234,19 +272,19 @@ def format_text(
     for i, root in enumerate(roots):
         out.append(f"{'Roots:' if i == 0 else '':<13}{root}")
     out.append(
-        f"Scanned:     {_plural(summary.get('files', 0), 'file')}, "
+        f"Scanned:     {plural(summary.get('files', 0), 'file')}, "
         f"{human_bytes(summary.get('bytes', 0))}"
     )
     out.append(
-        f"Duplicates:  {_plural(result.groups, 'group')}; could free "
+        f"Duplicates:  {plural(result.groups, 'group')}; could free "
         f"~{human_bytes(result.redundant_bytes)} by keeping one copy of each"
     )
     if result.capped_groups:
         out.append(
-            f"             {_plural(result.capped_groups, 'group')} spread over very many "
+            f"             {plural(result.capped_groups, 'group')} spread over very many "
             "folders were paired only with their first folder"
         )
-    out.append(f"Elapsed:     {_duration(summary.get('elapsed', 0.0))}")
+    out.append(f"Elapsed:     {duration(summary.get('elapsed', 0.0))}")
     out.append("")
 
     overview, tags = _tree_overview(result.trees, tree_top, result.near)
@@ -266,7 +304,7 @@ def format_text(
         num_w = len(f"[{len(shown)}]")
         for n, p in enumerate(shown, 1):
             tag = tags.get((p.dir_a, p.dir_b))
-            block = _pair_block(n, num_w, p, max_runs, result.near, tag)
+            block = _pair_block(n, num_w, p, max_runs, result.near, tag and f"T{tag}")
             if len(block) > 1 and out[-1] != "":
                 out.append("")
             out.extend(block)
@@ -276,35 +314,38 @@ def format_text(
             out.append("")
         omitted = len(eligible) - len(shown)
         if omitted:
-            out.append(f"… {_plural(omitted, 'more folder pair')} not shown (top {top})")
+            out.append(f"… {plural(omitted, 'more folder pair')} not shown (top {top})")
         if hidden_small:
             out.append(
-                f"{_plural(hidden_small, 'folder pair')} with fewer than "
-                f"{_plural(min_files, 'matched file')} hidden"
+                f"{plural(hidden_small, 'folder pair')} with fewer than "
+                f"{plural(min_files, 'matched file')} hidden"
             )
         if omitted or hidden_small:
             out.append("")
 
     if result.same_folder:
-        total, ranked = _same_folder_stats(result.same_folder)
+        total, ranked = same_folder_stats(result.same_folder)
         out.append(
-            f"Same-folder duplicates: {_plural(len(result.same_folder), 'group')}, "
-            f"{human_bytes(total)} redundant, in {_plural(len(ranked), 'folder')}"
+            f"Same-folder duplicates: {plural(len(result.same_folder), 'group')}, "
+            f"{human_bytes(total)} redundant, in {plural(len(ranked), 'folder')}"
         )
         for d, n_groups, extra, nbytes in ranked[:_SAME_FOLDER_TOP]:
             unit = "group " if n_groups == 1 else "groups"
             out.append(f"  {n_groups:>6,} {unit}  {human_bytes(nbytes):>8}  {d}")
         if len(ranked) > _SAME_FOLDER_TOP:
-            out.append(f"  … and {_plural(len(ranked) - _SAME_FOLDER_TOP, 'more folder')}")
+            out.append(f"  … and {plural(len(ranked) - _SAME_FOLDER_TOP, 'more folder')}")
         out.append("")
 
     csv_path, json_path = summary.get("csv_path"), summary.get("json_path")
-    if csv_path or json_path:
+    xlsx_path = summary.get("xlsx_path")
+    if csv_path or json_path or xlsx_path:
         out.append("Per-file detail:")
         if csv_path:
             out.append(f"  CSV:  {csv_path}")
         if json_path:
             out.append(f"  JSON: {json_path}")
+        if xlsx_path:
+            out.append(f"  XLSX: {xlsx_path}")
     else:
         out.append("Per-file detail is in the CSV/JSON reports.")
     return "\n".join(out) + "\n"

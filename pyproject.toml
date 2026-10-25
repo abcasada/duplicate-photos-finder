@@ -12,6 +12,9 @@ license = "MIT"
 authors = [{ name = "Adam Casada" }]
 dependencies = []
 
+[project.optional-dependencies]
+xlsx = ["XlsxWriter>=3"]
+
 [project.scripts]
 dpf = "dpf.cli:main"
 

@@ -9,7 +9,8 @@ import time
 
 from dpf import __version__
 from dpf.index import Index, default_db_path
-from dpf.grouping import DEFAULT_NEAR
+from dpf.grouping import DEFAULT_NEAR, GroupingResult
+from dpf.models import DuplicateGroup
 from dpf.report import TREE_TOP, format_text, human_bytes, write_csv, write_json
 
 MODES = {"1": "name", "name": "name", "2": "content", "content": "content", "3": "both", "both": "both"}
@@ -79,6 +80,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--tree-top", type=int, default=TREE_TOP, metavar="N",
         help=f"tree pairs shown in the tree overview; 0 hides it (default: {TREE_TOP})",
     )  # fmt: skip
+    f.add_argument(
+        "--no-xlsx", action="store_true", help="don't write report.xlsx (needs XlsxWriter)"
+    )
     f.add_argument(
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
@@ -227,6 +231,11 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         "csv_path": csv_path,
         "json_path": json_path,
     }
+    xlsx_path = os.path.join(out, "report.xlsx")
+    if not args.no_xlsx and _write_xlsx(result, groups, summary, xlsx_path):
+        summary["xlsx_path"] = xlsx_path
+    elif os.path.exists(xlsx_path):
+        os.remove(xlsx_path)  # a stale workbook from an earlier run into the same --out
     write_json(result, summary, json_path)
     text = format_text(
         result, summary,
@@ -238,6 +247,22 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     if not args.quiet:
         print(f"report saved to {text_path}", file=sys.stderr)
     return 0
+
+
+def _write_xlsx(
+    result: GroupingResult, groups: list[DuplicateGroup], summary: dict, path: str
+) -> bool:
+    """Write report.xlsx; False (with a hint) when the optional XlsxWriter is missing."""
+    from dpf.xlsx_report import write_xlsx
+
+    try:
+        write_xlsx(result, groups, summary, path)
+    except ModuleNotFoundError as e:
+        if e.name != "xlsxwriter":
+            raise
+        print("dpf: report.xlsx skipped (install python3-xlsxwriter)", file=sys.stderr)
+        return False
+    return True
 
 
 def _basis(args: argparse.Namespace) -> str:
