@@ -160,3 +160,27 @@ Additions beyond the original Phase 1 scope, all requested or approved by the us
 
 **Next: Phase 2 (mode 2).** Open decision: when mode 3 hands off to mode 2, should mode 2
 only verify the mode 1 candidates (fast), or do a full content scan?
+
+## EXIF research (2026-10-25, measured on Storage 2B)
+**What the main cameras write.** Read with exiftool 13.50 from real files:
+
+| Camera | Body ID | Shot counter | Capture time | Notes |
+|---|---|---|---|---|
+| Sony A7R IV (`ILCE-7RM4A`, DSC*.ARW/JPG) | `InternalSerialNumber` (Sony MakerNotes). **Two distinct values seen**: 1,835 vs 19 files in a sample | `ShutterCount` | `DateTimeOriginal` + `OffsetTimeOriginal`, **no sub-seconds** | RAW+JPG of one shot share counter and time |
+| Pentax K-1 Mark II (IMGQ*.DNG/JPG) | `SerialNumber` (Pentax MakerNotes) | `ShutterCount` | `DateTimeOriginal`, **no sub-seconds**, no offset | |
+| Pentax K-50 (IMGP*) | `SerialNumber` | `ShutterCount` | `DateTimeOriginal` | |
+| Sony video (C####.MP4) | none | none | QuickTime `CreateDate` (UTC) | Key on CreateDate + Duration + size/dimensions |
+
+- **Capture time alone is not unique.** In a 1,891-photo sample, 646 shared a capture second with another photo from the same body, because of bursts and RAW+JPG pairs. The shot identity is **(Model, body serial, ShutterCount)**, with capture time as a cross-check.
+- **Filenames are not unique either:** DSC numbering wraps every 10,000 shots and differs per body.
+
+**Speed (cold HDD, USB, ntfs3).**
+- Plain `exiftool -fast` manages 30–48 files/s per drive, whatever the number of processes. About 4 seeks per file: 0.7 MB in 4 read requests, because ARW metadata is spread through the file.
+- `-fast2` is no faster and loses the MakerNotes (serial, shutter count), so use `-fast`.
+- exiftool's CPU cost is about 22 ms per ARW per process, so 45 files/s warm on one process and 231 files/s on 6.
+- **The best pipeline:**
+  1. Python reads the first 512 KB of each file in folder order, with 4 reader threads per HDD: 70 files/s.
+  2. A pool of exiftool `-stay_open` processes parses those in-memory copies, at 231 files/s on 6 processes.
+  3. In 180 field comparisons, the heads gave **identical** values to the full files.
+  4. Fall back to reading the full file when a needed tag is missing from the head.
+- **Estimate for a first EXIF pass:** about 50 min for Storage 1A (205k files), with drives in parallel. Results are cached in the index by (path, size, mtime), so later runs only read new or changed files.
