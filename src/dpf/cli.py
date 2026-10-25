@@ -26,6 +26,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--version", action="version", version=f"dpf {__version__}")
     p.add_argument("--db", default=None, help=f"index database (default: {default_db_path()})")
+    p.add_argument(
+        "--allow-same-drive", action="store_true",
+        help="allow the index/reports on a drive being scanned (never inside a scanned folder)",
+    )  # fmt: skip
     sub = p.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
@@ -121,12 +125,37 @@ def _default_out_dir(mode: str) -> str:
     return os.path.join(base, "reports", time.strftime("%Y%m%d-%H%M%S") + f"-{mode}")
 
 
-def _check_out_dir(out: str, roots: list[str]) -> None:
-    """Refuse to write reports onto a drive being scanned."""
-    real = os.path.realpath(out)
+def _device(path: str) -> int:
+    """st_dev of `path`, or of its nearest existing ancestor if it doesn't exist yet."""
+    path = os.path.realpath(path)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    return os.stat(path).st_dev
+
+
+def _check_output_location(
+    path: str, roots: list[str], what: str, *, allow_same_drive: bool = False
+) -> None:
+    """Refuse to write `path` inside a scanned root or onto a scanned drive.
+
+    Scanned drives may be nearly full and must stay untouched. The drive holding the
+    home directory is exempt so scanning e.g. ~/Pictures can still use ~/.cache.
+    """
+    real = os.path.realpath(path)
     for root in roots:
         if real == root or real.startswith(root.rstrip("/") + "/"):
-            raise SystemExit(f"dpf: refusing to write reports inside scanned path {root}")
+            raise SystemExit(f"dpf: refusing to write {what} inside scanned path {root}")
+    if allow_same_drive:
+        return
+    dev = _device(real)
+    if dev == _device(os.path.expanduser("~")):
+        return
+    for root in roots:
+        if _device(root) == dev:
+            raise SystemExit(
+                f"dpf: refusing to write {what} onto the drive holding {root} "
+                "(use --allow-same-drive to override)"
+            )
 
 
 def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
@@ -139,7 +168,7 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         return 2
 
     out = args.out or _default_out_dir(mode)
-    _check_out_dir(out, roots)
+    _check_output_location(out, roots, "reports", allow_same_drive=args.allow_same_drive)
 
     started = time.monotonic()
     if args.no_scan:
@@ -203,6 +232,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as e:
         print(f"dpf: {e}", file=sys.stderr)
         return 1
+    _check_output_location(
+        args.db or default_db_path(), roots, "the index", allow_same_drive=args.allow_same_drive
+    )
     try:
         with Index(args.db) as idx:
             if args.command == "scan":
