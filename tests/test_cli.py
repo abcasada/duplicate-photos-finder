@@ -3,6 +3,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -22,6 +23,9 @@ class CliFixture(unittest.TestCase):
         self.drives = os.path.join(self.tmp, "drives")
         self.db = os.path.join(self.tmp, "index.db")
         self.out = os.path.join(self.tmp, "report")
+        config = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": os.path.join(self.tmp, "config")})
+        config.start()
+        self.addCleanup(config.stop)
         src = os.path.join(self.drives, "one", "DCIM")
         dst = os.path.join(self.drives, "two", "Backup")
         os.makedirs(src)
@@ -340,6 +344,182 @@ class OfflineRootsTest(CliFixture):
         code, _, err = self.run_cli("drives", "--forget", backup)
         self.assertEqual(code, 1)
         self.assertIn(f"{backup} lies inside indexed {self.two}", err)
+
+
+
+class PoolsCliTest(CliFixture):
+    """Pools A (1A, 2A) and B (1B) over drives mounted under `media`."""
+
+    def setUp(self):
+        super().setUp()
+        self.media = os.path.realpath(os.path.join(self.tmp, "media"))
+        names = ("Storage 1A 4TB", "Storage 2A 8TB", "Storage 1B 4TB (2)")
+        self.a1, self.a2, self.b1 = (os.path.join(self.media, n) for n in names)
+        for drive in (self.a1, self.a2, self.b1):
+            shutil.copytree(os.path.join(self.drives, "one"), os.path.join(drive, "DCIM"))
+        self.pools_file = os.path.join(self.tmp, "pools.toml")
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+        )
+
+    def write_pools(self, *lines):
+        with open(self.pools_file, "w") as fh:
+            fh.write("[pools]\n" + "\n".join(lines) + "\n")
+
+    def run_cli(self, *args):
+        return super().run_cli("--pools-file", self.pools_file, *args)
+
+    def unplug(self, path):
+        os.rename(path, os.path.join(self.tmp, "unplugged-" + os.path.basename(path)))
+
+    def report_json(self):
+        with open(os.path.join(self.out, "report.json")) as fh:
+            return json.load(fh)
+
+    def test_find_pool_with_member_offline(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
+        self.unplug(self.a2)
+        code, out, err = self.run_cli("find", "--pool", "a", "-o", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"using index for {self.a2} (not connected", err)
+        self.assertIn(f"indexed {self.a1}: 10 files", err)
+        self.assertNotIn(self.b1, out + err)
+        self.assertIn("\nPool:        A\nRoots:", out)
+        self.assertIn("(matching tree: 1 folder, 10 files)", out)
+        summary = self.report_json()["summary"]
+        self.assertEqual(summary["pool"], "A")
+        self.assertEqual(summary["roots"], [self.a1, self.a2])
+        self.assertEqual([s["connected"] for s in summary["root_status"]], [True, False])
+
+    def test_find_pool_drops_nested_and_duplicate_members(self):
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *", "{self.a1}/DCIM", "{self.a2}/"]',
+        )  # fmt: skip
+        self.assertEqual(self.run_cli("scan", "-q", self.a2)[0], 0)
+        self.assertEqual(self.run_cli("scan", "-q", os.path.join(self.a2, "DCIM"))[0], 0)
+        self.unplug(self.a2)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.report_json()["summary"]["roots"], [self.a1, self.a2])
+
+    def test_find_pool_literal_never_scanned(self):
+        never = os.path.join(self.media, "Storage 1TB")
+        self.write_pools(f'A = ["{never}", "{self.media}/Storage [0-9]A *"]')
+        code, _, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 1)
+        self.assertEqual(err, f"dpf: {never} is not connected and has never been scanned\n")
+
+    def test_scan_pool_skips_offline_members(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a2)[0], 0)
+        self.unplug(self.a2)
+        code, out, err = self.run_cli("scan", "--pool", "A")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"skipping {self.a2} (pool A, not connected)", err)
+        self.assertIn(f"indexed {self.a1}: 10 files", err)
+        self.assertNotIn(self.b1, err)
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "A"), (0, "", ""))
+
+    def test_scan_pool_none_connected(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        self.unplug(self.b1)
+        code, _, err = self.run_cli("scan", "-q", "--pool", "B")
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "dpf: no drives in pool B are connected\n")
+
+    def test_pool_and_paths_are_exclusive(self):
+        for args in (("find", "--pool", "A", self.a1), ("scan", "--pool", "A", self.a1),
+                     ("find",), ("scan", "-q")):  # fmt: skip
+            with self.subTest(args), self.assertRaises(SystemExit) as cm:
+                self.run_cli(*args)
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_pool_errors(self):
+        code, _, err = self.run_cli("find", "--pool", "C")
+        self.assertEqual((code, err), (1, "dpf: unknown pool C; defined pools: A, B\n"))
+        self.write_pools(f'A = ["{self.media}/Nothing *"]')
+        code, _, err = self.run_cli("scan", "--pool", "A")
+        self.assertEqual(code, 1)
+        self.assertIn("pool A matches no connected or indexed drive", err)
+        self.assertIn(f"  {self.media}/Nothing *", err)
+        os.remove(self.pools_file)
+        code, _, err = self.run_cli("find", "--pool", "A")
+        self.assertEqual(code, 1)
+        self.assertIn(f"dpf: no pools file at {self.pools_file}", err)
+        self.assertIn("[pools]\nA = [", err)
+        self.assertFalse(os.path.exists(self.db))
+
+    def test_default_pools_file(self):
+        config = os.path.join(os.environ["XDG_CONFIG_HOME"], "dpf")
+        os.makedirs(config)
+        shutil.copy(self.pools_file, os.path.join(config, "pools.toml"))
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["--db", self.db, "pools"]), 0)
+        self.assertIn(f"Pools from {config}/pools.toml", stdout.getvalue())
+
+    def test_pools_listing(self):
+        never = os.path.join(self.media, "Storage 1TB")
+        self.write_pools(
+            f'A = ["{never}", "{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+            f'Empty = ["{self.media}/Nothing *"]',
+        )
+        self.assertEqual(self.run_cli("scan", "-q", self.a2)[0], 0)
+        self.unplug(self.a2)
+        code, out, err = self.run_cli("pools")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[0], f"Pools from {self.pools_file}")
+        self.assertEqual(lines[2:5], [
+            "Pool A",
+            f"  patterns:  {never}",
+            f"             {self.media}/Storage [0-9]A *",
+        ])  # fmt: skip
+        self.assertRegex(lines[6], r"^  Drive / folder\s+Connected\s+Files\s+Size\s+Last scanned$")
+        self.assertRegex(lines[7], rf"^  {self.a1}\s+yes\s+-\s+-\s+never scanned$")
+        self.assertRegex(lines[8], rf"^  {never}\s+no\s+-\s+-\s+never scanned$")
+        self.assertRegex(lines[9], rf"^  {self.a2}\s+no\s+10\s+55 B\s+\d{{4}}-\d\d-\d\d \d\d:\d\d$")
+        self.assertIn(f"Pool B\n  patterns:  {self.media}/Storage [0-9]B *\n", out)
+        self.assertRegex(out, rf"\n  {re.escape(self.b1)}\s+yes\s+-\s+-\s+never scanned\n")
+        self.assertTrue(out.endswith(
+            f"Pool Empty\n  patterns:  {self.media}/Nothing *\n"
+            "  (no connected or indexed drive matches)\n"
+        ))  # fmt: skip
+
+    def test_pools_without_index(self):
+        code, out, _ = self.run_cli("pools")
+        self.assertEqual(code, 0)
+        self.assertRegex(out, rf"\n  {self.a1}\s+yes\s+-\s+-\s+never scanned\n")
+        self.assertFalse(os.path.exists(self.db))
+        os.remove(self.pools_file)
+        code, _, err = self.run_cli("pools")
+        self.assertEqual(code, 1)
+        self.assertIn("no pools file at", err)
+
+    def test_drives_pool_column(self):
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+            f'Old = ["{self.a2}"]',
+        )
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.a2, self.b1, self.drives)[0], 0)
+        code, out, err = self.run_cli("drives")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"\s+Connected\s+Pool$")
+        rows = {line.split("  ")[0]: re.split(r"\s\s+", line)[-1] for line in lines[1:5]}
+        self.assertEqual(rows, {
+            os.path.realpath(self.drives): "-",
+            self.a1: "A",
+            self.a2: "A, Old",
+            self.b1: "B",
+        })  # fmt: skip
+        os.remove(self.pools_file)
+        code, out, err = self.run_cli("drives")
+        self.assertEqual(code, 0)
+        self.assertIn("dpf: warning: no pools file at", err)
+        self.assertRegex(out.splitlines()[0], r"Connected$")
 
 
 if __name__ == "__main__":

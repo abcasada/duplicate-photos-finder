@@ -55,7 +55,8 @@ planning, so later sessions don't lose them. See [PLAN.md](PLAN.md) for the desi
 | What counts as a duplicate in mode 2? | **Offer all three options**: exact + visually similar, exact only, or visually similar only (`--compare exact\|visual\|both`). |
 | What should the tool do with duplicates? | **Report only.** It never touches files and generates no delete scripts. |
 | Git author | **Adam Casada**, `40399292+abcasada@users.noreply.github.com` (set repo-locally). |
-| Drive sets (added during Phase 1) | The **B** drive (Storage 3B) is the **backup of the A drives** (1A, 2A, 3A). Don't look for duplicates *between* A and B, only within A and within B. **Storage 1TB** is grouped **with the A drives** (the user first said to leave it out, then changed this). |
+| Drive sets (added during Phase 1, revised 2026-10-25) | Two **pools** that are scanned and compared **separately, never against each other**. **Pool A** (primary) = **Storage 1TB** plus **every A drive** (1A, 2A, 3A, and future "Storage NA …"). **Pool B** (backups) = **every B drive** (1B, 2B, 3B, and future "Storage NB …"), each a backup of the matching A drive. Storage 1B is currently labelled **"Storage 1B 4TB (2)"** by mistake and may be renamed. Configured as named pools in `~/.config/dpf/pools.toml` (`dpf find --pool A`). |
+| Cameras (added 2026-10-25) | The main duplicate sources are a **Pentax K-1 Mark II** and a **Sony A7R IV**. |
 | Report detail (added during Phase 1) | Wanted: a **tree overview** that rolls near-identical trees into headline lines, plus **near-identical folders** noted alongside identical ones. |
 | Speed (added during Phase 1) | **Speed is a priority for all modes.** The machine is a Ryzen 5 3600 (6 cores / 12 threads); use multithreading where the bottleneck allows. |
 | Plan approval | The user said to write the plan into the repo, commit it, and resume implementation in a later session. |

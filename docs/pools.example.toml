@@ -1,0 +1,15 @@
+# dpf drive pools. Copy to ~/.config/dpf/pools.toml (or $XDG_CONFIG_HOME/dpf/pools.toml),
+# or point dpf at another file with `dpf --pools-file PATH ...`.
+#
+# A pool is a set of drives that are compared with each other and never with another
+# pool: `dpf find --pool A`, `dpf scan --pool B`, `dpf pools`.
+#
+# Each pool is a list of paths or glob patterns (fnmatch-style * ? [..]). A pattern
+# matches the drives mounted now and the drives in the index, so unplugged drives that
+# were scanned before still count. Pool names are case-insensitive.
+[pools]
+# Primary drives: the 1TB SSD plus every "Storage <N>A ..." drive.
+A = ["/run/media/adam/Storage 1TB", "/run/media/adam/Storage [0-9]A *"]
+# Backups: every "Storage <N>B ..." drive, each a backup of the matching A drive
+# (this also matches "Storage 1B 4TB (2)").
+B = ["/run/media/adam/Storage [0-9]B *"]

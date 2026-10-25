@@ -309,6 +309,8 @@ def format_text(
     """
     out: list[str] = ["dpf duplicate report", ""]
     out.append(f"Mode:        {summary.get('mode', '?')}; matched on {summary.get('basis', '?')}")
+    if summary.get("pool"):
+        out.append(f"Pool:        {summary['pool']}")
     for i, line in enumerate(root_lines(summary)):
         out.append(f"{'Roots:' if i == 0 else '':<13}{line}")
     if any_offline(summary):

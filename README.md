@@ -46,32 +46,59 @@ cd duplicate-photos-finder
 
 ## Usage
 
-Only the paths you pass are compared against each other. To keep a backup drive out of
-the comparison, run separate reports — e.g. duplicates within the primary drives, then
-within the backup drive (the second run can reuse the index):
+Only the drives you pass are compared against each other. To keep backup drives out of
+the comparison, define **drive pools** and run one report per pool.
+
+### Drive pools
+
+Pools live in `~/.config/dpf/pools.toml` (or `$XDG_CONFIG_HOME/dpf/pools.toml`; any other
+file with `dpf --pools-file PATH …`). Each pool is a list of paths or glob patterns
+(`*`, `?`, `[..]`); pool names are case-insensitive:
+
+```toml
+[pools]
+# Primary drives: the 1TB SSD plus every "Storage <N>A ..." drive
+A = ["/run/media/adam/Storage 1TB", "/run/media/adam/Storage [0-9]A *"]
+# Backups: every "Storage <N>B ..." drive
+B = ["/run/media/adam/Storage [0-9]B *"]
+```
+
+A pattern matches both the drives mounted now and the drives in the index, so a pool
+includes unplugged drives that were scanned before, and new drives such as
+`Storage 4A 8TB` join their pool without editing the file. A plain path (no pattern) is
+always part of the pool, so a drive that is neither connected nor scanned is reported
+rather than silently left out. See [docs/pools.example.toml](docs/pools.example.toml).
 
 ```sh
-# Duplicates within the primary ("A") drives, including the 1TB working SSD
-dpf find --mode 1 /run/media/adam/Storage\ {1TB,1A,2A,3A}*
+# Which drives each pool stands for, connected or not, and when each was last scanned
+dpf pools
 
-# Duplicates within the backup ("B") drive
-dpf find --mode 1 /run/media/adam/Storage\ 3B*
+# Duplicates within the primary drives, then within the backups (never between them)
+dpf find --mode 1 --pool A
+dpf find --mode 1 --pool B
+
+# Index the connected drives of a pool; unplugged members are skipped (and listed)
+dpf scan --pool B
 
 # Re-run the report with different settings without rescanning
-dpf find --mode 1 --no-scan --top 50 --min-files 10 /run/media/adam/Storage\ 3B*
+dpf find --mode 1 --no-scan --top 50 --min-files 10 --pool B
 
 # Stricter "near-identical" (99% of each side), longer tree overview
-dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 /run/media/adam/Storage\ 3B*
+dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 --pool B
 
 # Looser matching: ignore size (catches re-saved copies) or dates
-dpf find --mode 1 --ignore-size /run/media/adam/Storage\ 3B*
+dpf find --mode 1 --ignore-size --pool A
 
-# Just build/refresh the index
-dpf scan /run/media/adam/Storage\ 1TB
+# Plain paths work too, instead of --pool (not together with it)
+dpf find --mode 1 /run/media/adam/Storage\ 1TB
 
-# What's in the index, and which of those drives are plugged in
+# What's in the index, which drives are plugged in, and which pool each belongs to
 dpf drives
 ```
+
+A report run with `--pool` names the pool in its header. `dpf drives` shows each drive's
+pool in a Pool column; a drive matching several pools lists them all, which means the
+patterns overlap and should be fixed.
 
 ### More drives than you can connect at once
 
@@ -79,29 +106,32 @@ The index keeps every drive you have scanned, so drives can be scanned a few at 
 and compared together afterwards:
 
 ```sh
-# Batch 1: plug in two drives, index them, unplug them
-dpf scan /run/media/adam/Storage\ 1A* /run/media/adam/Storage\ 2A*
-# Batch 2: the next ones
-dpf scan /run/media/adam/Storage\ 3A* /run/media/adam/Storage\ 1TB
+# Batch 1: plug in some drives of pool A, index them, unplug them
+dpf scan --pool A
+# Batch 2: plug in the rest and index those
+dpf scan --pool A
 
-# Compare all of them. Connected drives are rescanned, unplugged ones come from the index
-dpf find --mode 1 /run/media/adam/Storage\ {1TB,1A,2A,3A}*
+# Compare the whole pool. Connected drives are rescanned, unplugged ones come from the index
+dpf find --mode 1 --pool A
 ```
 
-Shell globs only match drives that are mounted, so spell out the paths of unplugged drives
-(`"/run/media/adam/Storage 2A 8TB"`), or copy them from `dpf drives`. For each one `find`
-prints `using index for … (not connected; last scanned …)`, and the report header shows
-per drive whether it was *scanned now* or taken *from index*, with the date of that scan.
-Folder links in the report point at the drive's mount path, so they only open once it is
-plugged in again. `--no-scan` takes every drive from the index, connected or not. A path
-that is neither connected nor in the index is an error, and `dpf scan` refuses paths that
-are not connected.
+For each unplugged drive `find` prints `using index for … (not connected; last scanned …)`,
+and the report header shows per drive whether it was *scanned now* or taken *from index*,
+with the date of that scan. Folder links in the report point at the drive's mount path, so
+they only open once it is plugged in again. `--no-scan` takes every drive from the index,
+connected or not.
+
+With plain paths instead of a pool, shell globs only match drives that are mounted, so
+spell out the paths of unplugged drives (`"/run/media/adam/Storage 2A 8TB"`), or copy them
+from `dpf drives`. A path that is neither connected nor in the index is an error, and
+`dpf scan PATH` refuses paths that are not connected (`dpf scan --pool` skips them).
 
 Drives are identified by their **mount path**, which on most desktops comes from the drive
 label (`/run/media/<user>/<label>`). A drive mounted at a different path, e.g. after
 relabelling it, counts as a different drive: scan it under its new path, then remove the
 old entry with `dpf drives --forget "/run/media/adam/Old label"`. `--forget` only edits the
-index (never the drive) and needs a path exactly as `dpf drives` lists it.
+index (never the drive) and needs a path exactly as `dpf drives` lists it. Until then a
+pool pattern matches both the old and the new path, so `dpf pools` lists the drive twice.
 
 Each `find` writes these files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out DIR`):
 

@@ -133,6 +133,13 @@ class XlsxReportTest(unittest.TestCase):
         wb = self.write(build()[0])
         self.assertNotIn(OFFLINE_NOTE, wb.strings)
         self.assertIn("/drives/two", wb.strings)
+        self.assertNotIn("Pool", wb.strings)
+
+    def test_summary_pool(self):
+        cells = self.write(build()[0], summary={**SUMMARY, "pool": "B"}).cells("Summary")
+        rows = [k for k, v in cells.items() if v == "Pool"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(cells["B" + rows[0][1:]], "B")
 
     def test_trees_and_tags(self):
         wb = self.write(build_trees())

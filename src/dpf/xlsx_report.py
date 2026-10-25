@@ -397,6 +397,8 @@ def _summary(ws, fmt: _Formats, result: GroupingResult, summary: dict, tables) -
     row += 2
     line("Mode", str(summary.get("mode", "?")))
     line("Matched on", str(summary.get("basis", "?")))
+    if summary.get("pool"):
+        line("Pool", str(summary["pool"]))
     for i, root in enumerate(root_lines(summary, align=False)):
         line("Roots" if i == 0 else "", root)
     if any_offline(summary):

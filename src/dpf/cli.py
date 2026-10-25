@@ -1,4 +1,4 @@
-"""Command-line interface: `dpf scan`, `dpf find` and `dpf drives`."""
+"""Command-line interface: `dpf scan`, `dpf find`, `dpf drives` and `dpf pools`."""
 
 from __future__ import annotations
 
@@ -12,6 +12,16 @@ from dpf import __version__
 from dpf.index import Index, default_db_path
 from dpf.grouping import DEFAULT_NEAR, GroupingResult
 from dpf.models import DuplicateGroup, RootStats
+from dpf.pools import (
+    Pool,
+    PoolError,
+    Pools,
+    default_pools_path,
+    get_pool,
+    load_pools,
+    pool_paths,
+    pools_of,
+)
 from dpf.report import (
     FROM_INDEX,
     SCANNED_NOW,
@@ -42,16 +52,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allow-same-drive", action="store_true",
         help="allow the index/reports on a drive being scanned (never inside a scanned folder)",
     )  # fmt: skip
+    p.add_argument(
+        "--pools-file", default=None, metavar="PATH",
+        help=f"drive pool definitions (default: {default_pools_path()})",
+    )  # fmt: skip
     sub = p.add_subparsers(dest="command", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("roots", nargs="+", metavar="PATH", help="folders or drive mount points")
+    common.add_argument("roots", nargs="*", metavar="PATH", help="folders or drive mount points")
+    common.add_argument(
+        "--pool", metavar="NAME",
+        help="use the drives of this pool (see `dpf pools`) instead of PATHs",
+    )  # fmt: skip
     common.add_argument(
         "--all-files", action="store_true", help="index every file, not just photos/videos"
     )
     common.add_argument("-q", "--quiet", action="store_true", help="no progress output")
 
-    sub.add_parser("scan", parents=[common], help="index files under PATHs (read-only)")
+    sub.add_parser(
+        "scan", parents=[common], help="index files under PATHs (read-only)",
+        description="Index the files under PATHs, or under the connected drives of --pool.",
+    )  # fmt: skip
 
     d = sub.add_parser(
         "drives", help="list the drives/folders in the index", description="List every "
@@ -65,8 +86,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     f = sub.add_parser(
         "find", parents=[common], help="scan PATHs and report duplicates",
-        description="Scan the connected PATHs and report duplicates. PATHs that are not "
-        "connected (e.g. unplugged drives) are taken from the index.",
+        description="Scan the connected PATHs (or --pool drives) and report duplicates. "
+        "PATHs that are not connected (e.g. unplugged drives) are taken from the index.",
     )  # fmt: skip
     f.add_argument(
         "-m", "--mode", default="1", choices=sorted(MODES),
@@ -110,6 +131,11 @@ def _build_parser() -> argparse.ArgumentParser:
     f.add_argument(
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
+    )  # fmt: skip
+    sub.add_parser(
+        "pools", help="list the drive pools and their drives",
+        description="List each pool from the pools file with its patterns and the drives "
+        "they match, connected or only in the index.",
     )  # fmt: skip
     return p
 
@@ -269,6 +295,7 @@ def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namesp
     summary = {
         "mode": MODE_TITLES[mode],
         "basis": _basis(args),
+        **({"pool": args.pool} if args.pool else {}),
         "roots": roots,
         "root_status": _root_status(idx, roots, offline, scanned),
         "files": files,
@@ -322,20 +349,17 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
     if not known:
         print("nothing indexed yet; run `dpf scan PATH`")
         return 0
-    rows = [("Drive / folder", "Files", "Size", "Unreadable", "Last scanned", "Connected")]
+    pools = _pools_for_drives(args.pools_file)
+    header = ("Drive / folder", "Files", "Size", "Unreadable", "Last scanned", "Connected")
+    rows = [header + (("Pool",) if pools else ())]
     for r in known:
         files, nbytes = idx.totals([r.root])
-        rows.append((
+        row = (
             r.root, f"{files:,}", human_bytes(nbytes), f"{r.errors:,}",
             scan_date(r.scanned_at), "yes" if os.path.isdir(r.root) else "no",
-        ))  # fmt: skip
-    widths = [max(len(row[c]) for row in rows) for c in range(len(rows[0]))]
-    for row in rows:
-        cells = [
-            cell.ljust(w) if c in (0, 4, 5) else cell.rjust(w)
-            for c, (cell, w) in enumerate(zip(row, widths))
-        ]
-        print("  ".join(cells).rstrip())
+        )  # fmt: skip
+        rows.append(row + ((", ".join(pools_of(pools, r.root)) or "-",) if pools else ()))
+    _print_table(rows, left=(0, 4, 5, 6))
     from dpf.scanner import drop_nested
 
     files, nbytes = idx.totals(drop_nested(r.root for r in known))
@@ -345,6 +369,104 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         f"{files:,} files, {human_bytes(nbytes)} in total"
     )
     return 0
+
+
+def _pools_for_drives(path: str | None) -> Pools:
+    """Pools for the `drives` Pool column; none (and no column) without a pools file."""
+    if path is None and not os.path.exists(default_pools_path()):
+        return {}
+    try:
+        return load_pools(path)
+    except PoolError as e:
+        print(f"dpf: warning: {e}", file=sys.stderr)
+        return {}
+
+
+def _print_table(rows: list[tuple[str, ...]], left: Collection[int], indent: str = "") -> None:
+    """Print aligned columns; columns in `left` are left-aligned, the rest right-aligned."""
+    widths = [max(len(row[c]) for row in rows) for c in range(len(rows[0]))]
+    for row in rows:
+        cells = [
+            cell.ljust(w) if c in left else cell.rjust(w)
+            for c, (cell, w) in enumerate(zip(row, widths))
+        ]
+        print((indent + "  ".join(cells)).rstrip())
+
+
+def _pools(args: argparse.Namespace) -> int:
+    """`dpf pools`: each pool with its patterns and the drives they match."""
+    try:
+        pools = load_pools(args.pools_file)
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+    db = args.db or default_db_path()
+    idx = Index(db) if os.path.exists(db) else None
+    try:
+        print(f"Pools from {args.pools_file or default_pools_path()}")
+        for pool in pools.values():
+            print(f"\nPool {pool.name}")
+            for i, pattern in enumerate(pool.patterns):
+                print(f"  {'patterns:' if i == 0 else '':<11}{pattern}")
+            members = _pool_members(pool, idx)
+            if not members:
+                print("  (no connected or indexed drive matches)")
+                continue
+            rows = [("Drive / folder", "Connected", "Files", "Size", "Last scanned")]
+            for root, connected in members:
+                stats = idx and idx.containing_root(root)
+                files, nbytes = idx.totals([root]) if idx else (0, 0)
+                state = "yes" if connected else "no"
+                if stats or files:
+                    when = scan_date(stats and stats.scanned_at)
+                    rows.append((root, state, f"{files:,}", human_bytes(nbytes), when))
+                else:
+                    rows.append((root, state, "-", "-", "never scanned"))
+            print()
+            _print_table(rows, left=(0, 1, 4), indent="  ")
+    finally:
+        if idx is not None:
+            idx.close()
+    return 0
+
+
+def _pool_members(pool: Pool, idx: Index | None) -> list[tuple[str, bool]]:
+    """(root, connected) for each drive a pool resolves to, nested roots dropped."""
+    from dpf.scanner import drop_nested
+
+    try:
+        paths = pool_paths(pool, [r.root for r in idx.roots()] if idx else [])
+    except PoolError:
+        return []
+    online, missing = [], []
+    for p in paths:
+        real = os.path.realpath(p)
+        if os.path.isdir(real):
+            online.append(real)
+        else:
+            missing.append(_offline_or_abs(idx, p))
+    roots = drop_nested(online + missing)
+    return [(r, r in online) for r in roots]
+
+
+def _offline_or_abs(idx: Index | None, path: str) -> str:
+    if idx is not None:
+        try:
+            return _offline_root(idx, path)
+        except ValueError:
+            pass
+    return os.path.abspath(path)
+
+
+def _resolve_pool(args: argparse.Namespace) -> tuple[Pool, list[str]]:
+    """The pool named by --pool and the paths it stands for (see pools.pool_paths)."""
+    pool = get_pool(load_pools(args.pools_file), args.pool)
+    db = args.db or default_db_path()
+    indexed: list[str] = []
+    if os.path.exists(db):
+        with Index(db) as idx:
+            indexed = [r.root for r in idx.roots()]
+    return pool, pool_paths(pool, indexed)
 
 
 def _forget(idx: Index, known: list[RootStats], paths: list[str]) -> int:
@@ -421,7 +543,10 @@ def _offline_root(idx: Index, path: str) -> str:
 def main(argv: list[str] | None = None) -> int:
     from dpf.scanner import drop_nested, split_roots
 
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "pools":
+        return _pools(args)
     if args.command == "drives":
         db = args.db or default_db_path()
         if not os.path.exists(db):
@@ -432,14 +557,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         with Index(db) as idx:
             return _drives(idx, args)
+    if args.pool and args.roots:
+        parser.error(f"{args.command}: give either PATHs or --pool, not both")
+    if not args.pool and not args.roots:
+        parser.error(f"{args.command}: give PATHs or --pool NAME")
+    paths = args.roots
+    if args.pool:
+        try:
+            pool, paths = _resolve_pool(args)
+        except PoolError as e:
+            print(f"dpf: {e}", file=sys.stderr)
+            return 1
+        args.pool = pool.name
     try:
-        online, missing = split_roots(args.roots)
+        online, missing = split_roots(paths)
     except ValueError as e:
         print(f"dpf: {e}", file=sys.stderr)
         return 1
     if args.command == "scan" and missing:
-        print(f"dpf: {missing[0]} is not connected; nothing to scan", file=sys.stderr)
-        return 1
+        if not args.pool:
+            print(f"dpf: {missing[0]} is not connected; nothing to scan", file=sys.stderr)
+            return 1
+        if not online:
+            print(f"dpf: no drives in pool {args.pool} are connected", file=sys.stderr)
+            return 1
+        if not args.quiet:
+            absent = [os.path.abspath(p) for p in missing]
+            for p in drop_nested(online + absent):
+                if p not in online:
+                    print(f"skipping {p} (pool {args.pool}, not connected)", file=sys.stderr)
+        missing = []
     _check_output_location(
         args.db or default_db_path(), online + [os.path.abspath(p) for p in missing],
         "the index", allow_same_drive=args.allow_same_drive,

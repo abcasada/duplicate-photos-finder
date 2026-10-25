@@ -32,10 +32,11 @@ Repo `/home/adam/apps/duplicate-photos-finder` is empty (local branch `master`, 
 
 ```
 src/dpf/
-  cli.py        argparse: dpf scan|find; --mode {1,name,2,content,3,both}; --compare {exact,visual,both} (phase 2)
+  cli.py        argparse: dpf scan|find|drives|pools; --pool NAME; --mode {1,name,2,content,3,both}; --compare {exact,visual,both} (phase 2)
   scanner.py    parallel os.scandir walk, one thread per root/device; media-extension filter (--all-files to disable)
   index.py      SQLite inventory at ~/.cache/dpf/index.db (root disk; drives are full and must not be written)
   match_name.py mode 1 matcher
+  pools.py      named drive pools (~/.config/dpf/pools.toml, tomllib): glob patterns over mounted + indexed roots
   grouping.py   duplicate groups -> folder-pair runs (the core value)
   report.py     text report (stdout + saved file), JSON, CSV (full per-file detail lives in CSV/JSON)
   xlsx_report.py report.xlsx workbook (optional XlsxWriter; skipped with a hint when missing)
