@@ -1,4 +1,8 @@
-"""Mode 1: duplicates by case-insensitive name, size and modification time."""
+"""Mode 1: duplicates by name, size and modification time.
+
+Names match when equal up to case, copy marks and renaming around a camera file number
+(names.match_key), or with `exact_names` only up to case.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +12,11 @@ from dpf.index import Index
 from dpf.models import DuplicateGroup, FileRecord
 
 
-def _basis(ignore_size: bool, ignore_mtime: bool) -> str:
-    parts = ["name"]
+def basis(
+    *, exact_names: bool = False, ignore_size: bool = False, ignore_mtime: bool = False
+) -> str:
+    """How groups were matched, e.g. "similar name+size+mtime" or "name+size"."""
+    parts = ["name" if exact_names else "similar name"]
     if not ignore_size:
         parts.append("size")
     if not ignore_mtime:
@@ -40,11 +47,12 @@ def find_name_duplicates(
     mtime_tolerance: float = 2.0,
     ignore_size: bool = False,
     ignore_mtime: bool = False,
+    exact_names: bool = False,
 ) -> Iterator[DuplicateGroup]:
     """Yield groups of indexed files under `roots` that look like copies by metadata."""
-    basis = _basis(ignore_size, ignore_mtime)
-    for bucket in index.name_buckets(roots, by_size=not ignore_size):
+    how = basis(exact_names=exact_names, ignore_size=ignore_size, ignore_mtime=ignore_mtime)
+    for bucket in index.name_buckets(roots, by_size=not ignore_size, exact_names=exact_names):
         clusters = [bucket] if ignore_mtime else _mtime_clusters(bucket, mtime_tolerance)
         for cluster in clusters:
             if len(cluster) >= 2:
-                yield DuplicateGroup(tuple(sorted(cluster, key=lambda f: f.path)), basis)
+                yield DuplicateGroup(tuple(sorted(cluster, key=lambda f: f.path)), how)

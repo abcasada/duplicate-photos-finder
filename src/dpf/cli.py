@@ -91,8 +91,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     f.add_argument(
         "-m", "--mode", default="1", choices=sorted(MODES),
-        help="1/name: name+size+date (fast, metadata only); 2/content: compare file contents; "
-        "3/both: mode 1 then mode 2 (default: 1)",
+        help="1/name: similar name+size+date (fast, metadata only); 2/content: compare file "
+        "contents; 3/both: mode 1 then mode 2 (default: 1)",
     )  # fmt: skip
     f.add_argument(
         "--compare", choices=["exact", "visual", "both"], default="exact",
@@ -107,6 +107,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     f.add_argument("--ignore-size", action="store_true", help="mode 1: don't require equal size")
     f.add_argument("--ignore-mtime", action="store_true", help="mode 1: don't compare dates")
+    f.add_argument(
+        "--exact-names", action="store_true",
+        help="mode 1: names must be equal (ignoring case); by default copy marks such as "
+        "' (1)' or ' - Copy' and text around a camera file number (DSC01234) are ignored",
+    )  # fmt: skip
     f.add_argument("--top", type=int, default=None, metavar="N", help="show only N folder pairs")
     f.add_argument(
         "--min-files", type=int, default=1, metavar="N",
@@ -279,6 +284,7 @@ def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namesp
             mtime_tolerance=args.mtime_tolerance,
             ignore_size=args.ignore_size,
             ignore_mtime=args.ignore_mtime,
+            exact_names=args.exact_names,
         )
     )  # fmt: skip
     result = group_duplicates(
@@ -520,12 +526,12 @@ def _write_xlsx(
 
 
 def _basis(args: argparse.Namespace) -> str:
-    parts = ["name"]
-    if not args.ignore_size:
-        parts.append("size")
-    if args.ignore_mtime:
-        return "+".join(parts)
-    return "+".join(parts + ["mtime"]) + f" ±{args.mtime_tolerance:g}s"
+    from dpf.match_name import basis
+
+    text = basis(
+        exact_names=args.exact_names, ignore_size=args.ignore_size, ignore_mtime=args.ignore_mtime
+    )
+    return text if args.ignore_mtime else f"{text} ±{args.mtime_tolerance:g}s"
 
 
 def _offline_root(idx: Index, path: str) -> str:

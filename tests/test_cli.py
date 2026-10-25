@@ -52,9 +52,32 @@ class CliTest(CliFixture):
         code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
         self.assertEqual(code, 0)
         self.assertIn("all photos/videos match, 10 files", out)
-        self.assertIn("name+size+mtime ±2s", out)
+        self.assertIn("matched on similar name+size+mtime ±2s", out)
         for name in ("report.txt", "report.json", "files.csv"):
             self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
+        with open(os.path.join(self.out, "report.json")) as fh:
+            self.assertEqual(len(json.load(fh)["pairs"]), 1)
+
+    def test_similar_names_and_exact_names_flag(self):
+        copies = os.path.join(self.drives, "three", "Copies")
+        os.makedirs(copies)
+        for i in range(1, 11):
+            path = os.path.join(copies, f"IMG_{i} (1).JPG")
+            with open(path, "wb") as fh:
+                fh.write(b"x" * i)
+            os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
+        code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("one/DCIM  ↔  ", out)
+        self.assertIn("three/Copies   (all photos/videos match, 10 files)", out)
+        with open(os.path.join(self.out, "report.json")) as fh:
+            self.assertEqual(len(json.load(fh)["pairs"]), 3)
+        code, out, _ = self.run_cli(
+            "find", "-q", "--no-scan", "--exact-names", "-o", self.out, self.drives
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("matched on name+size+mtime ±2s", out)
+        self.assertNotIn("Copies", out)
         with open(os.path.join(self.out, "report.json")) as fh:
             self.assertEqual(len(json.load(fh)["pairs"]), 1)
 

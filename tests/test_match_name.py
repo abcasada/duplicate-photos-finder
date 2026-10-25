@@ -1,7 +1,7 @@
 import unittest
 
 from dpf.index import Index
-from dpf.match_name import find_name_duplicates
+from dpf.match_name import basis, find_name_duplicates
 from dpf.models import FileRecord
 
 T = 1_600_000_000.0
@@ -27,7 +27,7 @@ class MatchNameTest(unittest.TestCase):
 
     def test_exact_tolerance_matches(self):
         got = self.groups([rec("/r/a", "x.jpg"), rec("/r/b", "x.jpg", mtime=T + 2.0)])
-        self.assertEqual(got, [("name+size+mtime", ["/r/a/x.jpg", "/r/b/x.jpg"])])
+        self.assertEqual(got, [("similar name+size+mtime", ["/r/a/x.jpg", "/r/b/x.jpg"])])
 
     def test_just_over_tolerance_splits(self):
         got = self.groups([rec("/r/a", "x.jpg"), rec("/r/b", "x.jpg", mtime=T + 2.01)])
@@ -55,14 +55,15 @@ class MatchNameTest(unittest.TestCase):
 
     def test_case_insensitive_names(self):
         got = self.groups([rec("/r/a", "IMG_0001.JPG"), rec("/r/b", "img_0001.jpg")])
-        self.assertEqual(got, [("name+size+mtime", ["/r/a/IMG_0001.JPG", "/r/b/img_0001.jpg"])])
+        paths = ["/r/a/IMG_0001.JPG", "/r/b/img_0001.jpg"]
+        self.assertEqual(got, [("similar name+size+mtime", paths)])
 
     def test_size_must_match_unless_ignored(self):
         records = [rec("/r/a", "x.jpg", size=1), rec("/r/b", "x.jpg", size=2)]
         self.assertEqual(self.groups(records), [])
         self.assertEqual(
             self.groups(records, ignore_size=True),
-            [("name+mtime", ["/r/a/x.jpg", "/r/b/x.jpg"])],
+            [("similar name+mtime", ["/r/a/x.jpg", "/r/b/x.jpg"])],
         )
 
     def test_ignore_mtime(self):
@@ -70,7 +71,7 @@ class MatchNameTest(unittest.TestCase):
         self.assertEqual(self.groups(records), [])
         self.assertEqual(
             self.groups(records, ignore_mtime=True),
-            [("name+size", ["/r/a/x.jpg", "/r/b/x.jpg"])],
+            [("similar name+size", ["/r/a/x.jpg", "/r/b/x.jpg"])],
         )
 
     def test_ignore_both(self):
@@ -81,8 +82,45 @@ class MatchNameTest(unittest.TestCase):
         ]
         self.assertEqual(
             self.groups(records, ignore_size=True, ignore_mtime=True),
-            [("name", ["/r/a/x.jpg", "/r/b/X.JPG"])],
+            [("similar name", ["/r/a/x.jpg", "/r/b/X.JPG"])],
         )
+
+    def test_similar_names_match(self):
+        records = [
+            rec("/r/a", "DSC01234.ARW"),
+            rec("/r/b", "DSC01234 (1).ARW", mtime=T + 1),
+            rec("/r/c", "2023-08-26_DSC01234.ARW"),
+            rec("/r/d", "Copy of DSC01234.ARW"),
+        ]
+        got = self.groups(records)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0][0], "similar name+size+mtime")
+        self.assertEqual(len(got[0][1]), 4)
+
+    def test_exact_names(self):
+        records = [rec("/r/a", "x.jpg"), rec("/r/b", "X.JPG"), rec("/r/c", "x (1).jpg")]
+        self.assertEqual(
+            self.groups(records, exact_names=True),
+            [("name+size+mtime", ["/r/a/x.jpg", "/r/b/X.JPG"])],
+        )
+
+    def test_similar_names_still_need_size_and_mtime(self):
+        records = [
+            rec("/r/a", "DSC01234.ARW"),
+            rec("/r/b", "Show DSC01234.ARW", size=101),  # same counter, another photo
+            rec("/r/c", "DSC01234 (1).ARW", mtime=T + 60),
+        ]
+        self.assertEqual(self.groups(records), [])
+
+    def test_similar_names_never_cross_extensions(self):
+        records = [rec("/r/a", "DSC01234.ARW"), rec("/r/b", "DSC01234.JPG")]
+        self.assertEqual(self.groups(records), [])
+
+    def test_basis(self):
+        self.assertEqual(basis(), "similar name+size+mtime")
+        self.assertEqual(basis(exact_names=True), "name+size+mtime")
+        self.assertEqual(basis(ignore_size=True), "similar name+mtime")
+        self.assertEqual(basis(exact_names=True, ignore_size=True, ignore_mtime=True), "name")
 
     def test_respects_roots(self):
         self.idx.replace_root("/r1", [rec("/r1", "x.jpg")])

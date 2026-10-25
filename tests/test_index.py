@@ -1,6 +1,8 @@
 import os
+import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from dpf.index import Index
 from dpf.models import FileRecord
@@ -57,6 +59,35 @@ class IndexTest(unittest.TestCase):
         loose = list(self.idx.name_buckets(["/r"], by_size=False))
         self.assertEqual(len(loose), 1)
         self.assertEqual(len(loose[0]), 3)
+
+    def test_name_buckets_similar_and_exact_names(self):
+        self.idx.replace_root(
+            "/r",
+            [
+                rec("/r/a", "DSC01234.ARW"),
+                rec("/r/b", "DSC01234 (1).ARW"),
+                rec("/r/c", "2023-08-26_DSC01234.ARW"),
+                rec("/r/d", "DSC01234.JPG"),
+                rec("/r/e", "DSC01234-2.ARW", 999),
+            ],
+        )
+        (bucket,) = self.idx.name_buckets(["/r"])
+        self.assertEqual({f.dir for f in bucket}, {"/r/a", "/r/b", "/r/c"})
+        self.assertEqual(list(self.idx.name_buckets(["/r"], exact_names=True)), [])
+        (loose,) = self.idx.name_buckets(["/r"], by_size=False)
+        self.assertEqual(len(loose), 4)
+
+    def test_match_key_stored_for_staged_records(self):
+        self.idx.begin_root("/r")
+        self.idx.add_records([rec("/r/a", "x (1).jpg"), rec("/r/b", "x.jpg")])
+        self.idx.finish_root("/r")
+        keys = self.idx.conn.execute("SELECT DISTINCT match_key FROM files").fetchall()
+        self.assertEqual(keys, [("x.jpg",)])
+
+    def test_name_buckets_skip_empty_files(self):
+        self.idx.replace_root("/r", [rec("/r/a", "x.jpg", 0), rec("/r/b", "x.jpg", 0)])
+        self.assertEqual(list(self.idx.name_buckets(["/r"])), [])
+        self.assertEqual(list(self.idx.name_buckets(["/r"], by_size=False)), [])
 
     def test_name_buckets_respect_roots(self):
         self.idx.replace_root("/r1", [rec("/r1", "a.jpg")])
@@ -184,6 +215,72 @@ class IndexFileTest(unittest.TestCase):
         with Index(idx.path) as idx:
             self.assertEqual(idx.totals(["/a"])[0], 1)
 
+    def test_migrates_version_2_in_place(self):
+        path = os.path.join(self.tmp.name, "index.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(_V2_SCHEMA)
+        conn.executemany(
+            "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("/m/A/x", "DSC01234.ARW", "dsc01234.arw", 100, 1.0, "image"),
+                ("/m/A/y", "DSC01234 (1).ARW", "dsc01234 (1).arw", 100, 1.5, "image"),
+                ("/m/B", "Copy of IMG_0001.jpg", "copy of img_0001.jpg", 7, 2.0, "image"),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO staging VALUES ('/m/C', 'a - Copy.jpg', 'a - copy.jpg', 1, 1.0, 'image')"
+        )
+        conn.execute("INSERT INTO dirs VALUES ('/m/A/x', 2, 1)")
+        conn.execute("INSERT INTO roots VALUES ('/m/A', 2, 200, 0, 123.0)")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+
+        with Index(path) as idx:
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(idx.totals(["/m"]), (3, 207))
+            self.assertEqual(idx.root_stats("/m/A").scanned_at, 123.0)
+            self.assertEqual(idx.dir_extras("/m/A/x"), (2, 1))
+            keys = dict(idx.conn.execute("SELECT name, match_key FROM files"))
+            self.assertEqual(
+                keys,
+                {
+                    "DSC01234.ARW": "dsc01234.arw",
+                    "DSC01234 (1).ARW": "dsc01234.arw",
+                    "Copy of IMG_0001.jpg": "img_0001.jpg",
+                },
+            )
+            staged = idx.conn.execute("SELECT match_key FROM staging").fetchall()
+            self.assertEqual(staged, [("a.jpg",)])
+            indexes = {r[1] for r in idx.conn.execute("PRAGMA index_list(files)")}
+            self.assertIn("files_match_size", indexes)
+            (bucket,) = idx.name_buckets(["/m"])
+            self.assertEqual(len(bucket), 2)
+            idx.finish_root("/m/C")
+            idx.replace_root("/m/D", [rec("/m/D", "x (2).jpg")])
+            self.assertEqual(idx.totals(["/m"])[0], 5)
+        with Index(path) as idx:  # reopening is a no-op
+            self.assertEqual(idx.totals(["/m"])[0], 5)
+
+    def test_failed_migration_leaves_version_2_untouched(self):
+        path = os.path.join(self.tmp.name, "index.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(_V2_SCHEMA)
+        conn.execute("INSERT INTO files VALUES ('/a', 'x.jpg', 'x.jpg', 1, 1.0, 'image')")
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        conn.close()
+        with mock.patch.object(Index, "_refill_match_keys", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                Index(path)
+        conn = sqlite3.connect(path)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(files)")}
+        self.assertNotIn("match_key", columns)
+        conn.close()
+        with Index(path) as idx:
+            self.assertEqual(idx.totals(["/a"])[0], 1)
+
     def test_older_inventory_dropped(self):
         path = os.path.join(self.tmp.name, "index.db")
         with Index(path) as idx:
@@ -192,6 +289,27 @@ class IndexFileTest(unittest.TestCase):
         with Index(path) as idx:
             self.assertEqual(idx.totals(["/a"])[0], 0)
             self.assertIsNone(idx.root_stats("/a"))
+
+
+# The schema of user_version 2, before the match_key column.
+_V2_SCHEMA = """
+CREATE TABLE roots (
+    path TEXT PRIMARY KEY, files INTEGER NOT NULL, bytes INTEGER NOT NULL,
+    errors INTEGER NOT NULL, scanned_at REAL NOT NULL
+);
+CREATE TABLE files (
+    dir TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, size INTEGER NOT NULL,
+    mtime REAL NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
+CREATE INDEX files_name_size ON files (name_key, size);
+CREATE TABLE staging (
+    dir TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, size INTEGER NOT NULL,
+    mtime REAL NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
+CREATE TABLE dirs (
+    dir TEXT PRIMARY KEY, other INTEGER NOT NULL, errors INTEGER NOT NULL
+) WITHOUT ROWID;
+"""
 
 
 if __name__ == "__main__":

@@ -18,8 +18,9 @@ import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 
 from dpf.models import FileRecord, RootStats
+from dpf.names import match_key
 
-_SCHEMA = """
+_TABLES = """
 CREATE TABLE IF NOT EXISTS roots (
     path       TEXT PRIMARY KEY,
     files      INTEGER NOT NULL,
@@ -28,22 +29,23 @@ CREATE TABLE IF NOT EXISTS roots (
     scanned_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS files (
-    dir      TEXT NOT NULL,
-    name     TEXT NOT NULL,
-    name_key TEXT NOT NULL,
-    size     INTEGER NOT NULL,
-    mtime    REAL NOT NULL,
-    kind     TEXT NOT NULL,
+    dir       TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    name_key  TEXT NOT NULL,
+    size      INTEGER NOT NULL,
+    mtime     REAL NOT NULL,
+    kind      TEXT NOT NULL,
+    match_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (dir, name)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS files_name_size ON files (name_key, size);
 CREATE TABLE IF NOT EXISTS staging (
-    dir      TEXT NOT NULL,
-    name     TEXT NOT NULL,
-    name_key TEXT NOT NULL,
-    size     INTEGER NOT NULL,
-    mtime    REAL NOT NULL,
-    kind     TEXT NOT NULL,
+    dir       TEXT NOT NULL,
+    name      TEXT NOT NULL,
+    name_key  TEXT NOT NULL,
+    size      INTEGER NOT NULL,
+    mtime     REAL NOT NULL,
+    kind      TEXT NOT NULL,
+    match_key TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (dir, name)
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS dirs (
@@ -53,9 +55,23 @@ CREATE TABLE IF NOT EXISTS dirs (
 ) WITHOUT ROWID;
 """
 
-# Bumped when stored data from older versions can no longer be trusted; older
-# inventories are dropped (they are only a cache) and must be rescanned.
-_VERSION = 2
+# Created after _migrate, since they may name columns that older databases lack.
+_INDEXES = """
+CREATE INDEX IF NOT EXISTS files_name_size ON files (name_key, size);
+CREATE INDEX IF NOT EXISTS files_match_size ON files (match_key, size);
+"""
+
+_COLUMNS = "dir, name, name_key, size, mtime, kind, match_key"
+
+# Schema history (PRAGMA user_version):
+#   1  files, staging, roots
+#   2  dirs table (older inventories never recorded non-media content: dropped)
+#   3  match_key column (names.match_key), added and filled in place
+# Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
+# bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
+# are not connected cannot be rescanned, so the index may be their only record.
+# Changing names.match_key also needs a version bump and a _refill_match_keys step.
+_VERSION = 3
 
 _BATCH = 10_000
 
@@ -100,7 +116,7 @@ def _within(path: str, root: str) -> bool:
 
 
 def _row(r: FileRecord) -> tuple:
-    return (r.dir, r.name, name_key(r.name), r.size, r.mtime, r.kind)
+    return (r.dir, r.name, name_key(r.name), r.size, r.mtime, r.kind, match_key(r.name))
 
 
 def _record(row: sqlite3.Row | tuple) -> FileRecord:
@@ -116,14 +132,62 @@ class Index:
         self.conn = sqlite3.connect(self.path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.executescript(_SCHEMA)
-        (version,) = self.conn.execute("PRAGMA user_version").fetchone()
-        if version < _VERSION:
-            # Scans from before the dirs table never recorded non-media content.
-            with self.conn:
+        try:
+            self.conn.executescript(_TABLES)
+            self._migrate()
+            self.conn.executescript(_INDEXES)
+        except BaseException:
+            self.conn.close()
+            raise
+
+    def _migrate(self) -> None:
+        """Bring an older database up to _VERSION in place, in one transaction."""
+        if self._version() >= _VERSION:
+            return
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            version = self._version()  # another process may have migrated meanwhile
+            if version < 2:
+                # Scans from before the dirs table never recorded non-media content.
                 for table in ("files", "staging", "dirs", "roots"):
                     self.conn.execute(f"DELETE FROM {table}")
+            if version < 3:
+                for table in ("files", "staging"):
+                    columns = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+                    if "match_key" not in columns:
+                        self.conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN match_key TEXT NOT NULL DEFAULT ''"
+                        )
+                    self._refill_match_keys(table)
+            if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
+            self.conn.commit()
+        except BaseException:
+            self.conn.rollback()
+            raise
+
+    def _version(self) -> int:
+        return self.conn.execute("PRAGMA user_version").fetchone()[0]
+
+    def _refill_match_keys(self, table: str) -> None:
+        """Recompute match_key for every row of `table`, a batch at a time in key order.
+
+        Runs inside the caller's transaction.
+        """
+        last: tuple[str, str] = ("", "")
+        while True:
+            rows = self.conn.execute(
+                f"SELECT dir, name FROM {table} WHERE (dir, name) > (?, ?) "
+                "ORDER BY dir, name LIMIT ?",
+                (*last, _BATCH),
+            ).fetchall()
+            if not rows:
+                return
+            self.conn.executemany(
+                f"UPDATE {table} SET match_key = ? WHERE dir = ? AND name = ?",
+                [(match_key(n), d, n) for d, n in rows],
+            )
+            last = rows[-1]
 
     def close(self) -> None:
         self.conn.close()
@@ -156,7 +220,7 @@ class Index:
             it = iter(records)
             while batch := list(itertools.islice(it, _BATCH)):
                 self.conn.executemany(
-                    "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
+                    f"INSERT OR REPLACE INTO files ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [_row(r) for r in batch],
                 )
                 files += len(batch)
@@ -180,7 +244,7 @@ class Index:
         """Stage records for roots opened with begin_root."""
         with self.conn:
             self.conn.executemany(
-                "INSERT OR REPLACE INTO staging VALUES (?, ?, ?, ?, ?, ?)",
+                f"INSERT OR REPLACE INTO staging ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (_row(r) for r in records),
             )
 
@@ -199,7 +263,10 @@ class Index:
             ).fetchone()
             self.conn.execute(f"DELETE FROM files WHERE {where}", params)
             self._replace_dirs(where, params, dir_stats)
-            self.conn.execute(f"INSERT INTO files SELECT * FROM staging WHERE {where}", params)
+            self.conn.execute(
+                f"INSERT INTO files ({_COLUMNS}) SELECT {_COLUMNS} FROM staging WHERE {where}",
+                params,
+            )
             self.conn.execute(f"DELETE FROM staging WHERE {where}", params)
             stats = RootStats(root, files, total, time.time(), errors)
             self._set_root(stats)
@@ -275,19 +342,22 @@ class Index:
         return count, total
 
     def name_buckets(
-        self, roots: Sequence[str], *, by_size: bool = True
+        self, roots: Sequence[str], *, by_size: bool = True, exact_names: bool = False
     ) -> Iterator[list[FileRecord]]:
-        """Yield lists of files sharing a case-insensitive name (and size, if by_size).
+        """Yield lists of files sharing a name key (and size, if by_size).
 
-        Only buckets with two or more files are yielded. Streams from SQLite, so memory
-        use is bounded by the largest bucket rather than the inventory size.
+        The key is names.match_key (names equal up to copy marks or renaming around a
+        camera file number), or with `exact_names` the case-insensitive name. Only
+        buckets with two or more files are yielded. Streams from SQLite, so memory use
+        is bounded by the largest bucket rather than the inventory size.
         """
         where, params = _prefix_clause(roots)
-        keys = "name_key, size" if by_size else "name_key"
+        column = "name_key" if exact_names else "match_key"
+        keys = f"{column}, size" if by_size else column
         sql = f"""
-            WITH files_in AS (SELECT * FROM files WHERE {where}),
+            WITH files_in AS (SELECT * FROM files WHERE {where} AND size > 0),
                  dup AS (SELECT {keys} FROM files_in GROUP BY {keys} HAVING count(*) > 1)
-            SELECT dir, name, size, mtime, kind, name_key
+            SELECT dir, name, size, mtime, kind, {column}
             FROM files_in JOIN dup USING ({keys})
             ORDER BY {keys}, dir, name
         """
