@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS files (
     PRIMARY KEY (dir, name)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS files_name_size ON files (name_key, size);
+CREATE TABLE IF NOT EXISTS staging (
+    dir      TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    name_key TEXT NOT NULL,
+    size     INTEGER NOT NULL,
+    mtime    REAL NOT NULL,
+    kind     TEXT NOT NULL,
+    PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
 """
 
 _BATCH = 10_000
@@ -63,6 +72,10 @@ def _prefix_clause(roots: Sequence[str]) -> tuple[str, list[str]]:
         parts.append("(dir = ? OR (dir >= ? AND dir < ?))")
         params += [root, root + "/", root + "0"]
     return "(" + " OR ".join(parts) + ")", params
+
+
+def _row(r: FileRecord) -> tuple:
+    return (r.dir, r.name, name_key(r.name), r.size, r.mtime, r.kind)
 
 
 def _record(row: sqlite3.Row | tuple) -> FileRecord:
@@ -103,10 +116,47 @@ class Index:
             while batch := list(itertools.islice(it, _BATCH)):
                 self.conn.executemany(
                     "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
-                    [(r.dir, r.name, name_key(r.name), r.size, r.mtime, r.kind) for r in batch],
+                    [_row(r) for r in batch],
                 )
                 files += len(batch)
                 total += sum(r.size for r in batch)
+            stats = RootStats(root, files, total, time.time(), errors)
+            self.conn.execute(
+                "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",
+                (root, files, total, errors, stats.scanned_at),
+            )
+        return stats
+
+    # Streaming replacement: records for several roots may arrive interleaved. They
+    # accumulate in `staging` (committed per batch), and finish_root swaps them into
+    # `files` in one short transaction, so an interrupted scan leaves the root's
+    # previous contents intact.
+
+    def begin_root(self, root: str) -> None:
+        """Start a streaming rescan of `root`, discarding leftovers of an aborted one."""
+        where, params = _prefix_clause([root])
+        with self.conn:
+            self.conn.execute(f"DELETE FROM staging WHERE {where}", params)
+
+    def add_records(self, records: Iterable[FileRecord]) -> None:
+        """Stage records for roots opened with begin_root."""
+        with self.conn:
+            self.conn.executemany(
+                "INSERT OR REPLACE INTO staging VALUES (?, ?, ?, ?, ?, ?)",
+                (_row(r) for r in records),
+            )
+
+    def finish_root(self, root: str, errors: int = 0) -> RootStats:
+        """Replace everything indexed under `root` with its staged records."""
+        root = root.rstrip("/") or "/"
+        where, params = _prefix_clause([root])
+        with self.conn:
+            files, total = self.conn.execute(
+                f"SELECT count(*), coalesce(sum(size), 0) FROM staging WHERE {where}", params
+            ).fetchone()
+            self.conn.execute(f"DELETE FROM files WHERE {where}", params)
+            self.conn.execute(f"INSERT INTO files SELECT * FROM staging WHERE {where}", params)
+            self.conn.execute(f"DELETE FROM staging WHERE {where}", params)
             stats = RootStats(root, files, total, time.time(), errors)
             self.conn.execute(
                 "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",

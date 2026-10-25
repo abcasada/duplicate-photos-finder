@@ -69,6 +69,39 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(self.idx.subdirs("/r"), ["/r/a", "/r/b"])
         self.assertEqual(self.idx.subdirs("/r/a"), ["/r/a/deep"])
 
+    def test_streaming_interleaved_roots(self):
+        self.idx.replace_root("/a", [rec("/a", "stale.jpg")])
+        self.idx.replace_root("/b", [rec("/b", "keep.jpg")])
+        self.idx.begin_root("/a")
+        self.idx.begin_root("/c")
+        self.idx.add_records([rec("/a", "1.jpg", 10)])
+        self.idx.add_records([rec("/c/x", "2.jpg", 20)])
+        self.idx.add_records([rec("/a/s", "3.jpg", 30)])
+        # nothing visible until finish_root
+        self.assertEqual([f.name for f in self.idx.list_dir("/a")], ["stale.jpg"])
+        stats = self.idx.finish_root("/a/", errors=2)
+        self.assertEqual((stats.root, stats.files, stats.bytes, stats.errors), ("/a", 2, 40, 2))
+        self.assertEqual([f.name for f in self.idx.list_dir("/a")], ["1.jpg"])
+        self.assertEqual(self.idx.root_stats("/a").errors, 2)
+        self.assertEqual(self.idx.totals(["/c"]), (0, 0))
+        self.idx.finish_root("/c")
+        self.assertEqual(self.idx.totals(["/c"]), (1, 20))
+        self.assertEqual(self.idx.totals(["/b"]), (1, 100))
+
+    def test_begin_root_discards_aborted_staging(self):
+        self.idx.begin_root("/a")
+        self.idx.add_records([rec("/a", "aborted.jpg")])
+        self.idx.begin_root("/a")
+        self.idx.add_records([rec("/a", "new.jpg")])
+        self.assertEqual(self.idx.finish_root("/a").files, 1)
+        self.assertEqual([f.name for f in self.idx.list_dir("/a")], ["new.jpg"])
+
+    def test_finish_root_with_nothing_staged_empties_root(self):
+        self.idx.replace_root("/a", [rec("/a", "gone.jpg")])
+        self.idx.begin_root("/a")
+        self.assertEqual(self.idx.finish_root("/a").files, 0)
+        self.assertEqual(self.idx.totals(["/a"]), (0, 0))
+
 
 if __name__ == "__main__":
     unittest.main()
