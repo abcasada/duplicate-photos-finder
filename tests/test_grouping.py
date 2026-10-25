@@ -589,5 +589,95 @@ class ScannedTreeTest(unittest.TestCase):
         self.assertEqual(self.idx.dir_extras(self.p("d1/Photos/Trip/noperm")), (0, 1))
 
 
+class SimilarNamesTest(unittest.TestCase):
+    """Mode 1 with similar names: copies that differ by a suffix still read as runs."""
+
+    def setUp(self):
+        self.idx = Index(":memory:")
+
+    def tearDown(self):
+        self.idx.close()
+
+    def result(self, records):
+        from dpf.match_name import find_name_duplicates
+
+        self.idx.replace_root("/m", records)
+        groups = list(find_name_duplicates(self.idx, ["/m"]))
+        return group_duplicates(
+            groups, self.idx.list_dir, self.idx.subdirs, self.idx.dir_extras, roots=["/m"]
+        )
+
+    def test_suffixed_copies_form_one_run(self):
+        from dpf.report import run_lines
+
+        a = [rec("/m/A", f"DSC0000{i}.JPG", 100 + i) for i in range(1, 6)]
+        b = [rec("/m/B", f"DSC0000{i} (1).JPG", 100 + i) for i in range(1, 6)]
+        res = self.result(a + b)
+        (pair,) = res.pairs
+        self.assertEqual((pair.dir_a, pair.dir_b, pair.relation), ("/m/A", "/m/B", IDENTICAL))
+        self.assertEqual(res.same_folder, [])
+        partial = self.result(a + b[:4])
+        self.assertEqual(
+            run_lines(partial.pairs[0].runs, 8, indent=""),
+            ["DSC00001.JPG … DSC00004.JPG  4 files  "
+             "→ in B: DSC00001 (1).JPG … DSC00004 (1).JPG"],
+        )  # fmt: skip
+
+    def test_renamed_copies_keep_order(self):
+        from dpf.report import run_lines
+
+        a = [rec("/m/A", f"DSC0000{i}.ARW", 100 + i) for i in range(1, 4)]
+        b = [rec("/m/B", f"2023-08-26_DSC0000{i}.ARW", 100 + i) for i in range(1, 4)]
+        a.append(rec("/m/A", "DSC00009.ARW", 1))
+        (pair,) = self.result(a + b).pairs
+        self.assertEqual(pair.relation, B_IN_A)
+        self.assertEqual(
+            run_lines(pair.runs, 8, indent=""),
+            ["DSC00001.ARW … DSC00003.ARW  3 files  → in B: 2023-08-26_DSC00001.ARW … "
+             "2023-08-26_DSC00003.ARW"],
+        )  # fmt: skip
+
+    def test_unmatched_siblings_do_not_split_runs(self):
+        from dpf.report import run_lines
+
+        a, b = [], []
+        for i in range(1, 5):
+            a.append(rec("/m/A", f"IMGQ594{i} (2).DNG", 100 + i))
+            a.append(rec("/m/A", f"IMGQ594{i}.DNG", 200 + i))  # another shot, same counter
+            b.append(rec("/m/B", f"IMGQ594{i}.DNG", 100 + i))
+        (pair,) = self.result(a + b).pairs
+        self.assertEqual(
+            run_lines(pair.runs, 8, indent=""),
+            ["IMGQ5941 (2).DNG … IMGQ5944 (2).DNG  4 files  "
+             "→ in B: IMGQ5941.DNG … IMGQ5944.DNG"],
+        )  # fmt: skip
+        self.assertEqual((pair.matched_a, pair.total_a, pair.relation), (4, 8, B_IN_A))
+
+    def test_raw_jpg_siblings_do_not_split_runs(self):
+        a = [rec("/m/A", f"DSC0000{i}.{ext}", i * 10 + n) for i in range(1, 5)
+             for n, ext in enumerate(("ARW", "JPG"))]  # fmt: skip
+        b = [r for r in a if r.name.endswith(".ARW")]
+        b = [rec("/m/B", r.name, r.size) for r in b]
+        a.append(rec("/m/A", "DSC00005.ARW", 999))
+        a.append(rec("/m/A", "DSC00006.ARW", 999))
+        b.append(rec("/m/B", "DSC00006.ARW", 999))
+        (pair,) = self.result(a + b).pairs
+        self.assertEqual(
+            [(r.a_first, r.a_last, r.count) for r in pair.runs],
+            [("DSC00001.ARW", "DSC00004.ARW", 4), ("DSC00006.ARW", "DSC00006.ARW", 1)],
+        )
+        jpg_first = [rec("/m/A", "X1.JPG", 1), rec("/m/A", "X2.ARW", 5), rec("/m/A", "X2.JPG", 2)]
+        jpg_first += [rec("/m/B", "X1.JPG", 1), rec("/m/B", "X2.JPG", 2)]
+        (pair,) = self.result(jpg_first).pairs
+        self.assertEqual([(r.a_first, r.a_last) for r in pair.runs], [("X1.JPG", "X2.JPG")])
+
+    def test_copy_in_same_folder(self):
+        res = self.result([rec("/m/A", "DSC0001.JPG"), rec("/m/A", "DSC0001 (1).JPG")])
+        self.assertEqual(res.pairs, [])
+        (group,) = res.same_folder
+        self.assertEqual([f.name for f in group.files], ["DSC0001 (1).JPG", "DSC0001.JPG"])
+        self.assertEqual(group.basis, "similar name+size+mtime")
+
+
 if __name__ == "__main__":
     unittest.main()

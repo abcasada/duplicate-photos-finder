@@ -4,7 +4,8 @@ Every two folders that share copies become one FolderPair. Its matches are folde
 runs of consecutive files (natural order of folder A), so a copied sequence reads as
 "IMG_0100 … IMG_0450 (351 files)" instead of 351 lines. Sibling trees whose folders all
 match are rolled up into a single pair. Names may differ between the two sides
-(content-based modes), so matching never relies on equal names.
+(content-based modes, or similar names in mode 1), so matching never relies on equal
+names.
 
 Only indexed files are compared. Entries the scanner did not index (non-media files,
 symlinks, unreadable entries) are counted per pair as `unindexed`, and a tree is only
@@ -26,6 +27,7 @@ from dataclasses import dataclass, field
 from itertools import combinations
 
 from dpf.models import DuplicateGroup, FileRecord
+from dpf.names import match_stem
 
 IDENTICAL_TREE = "identical_tree"
 IDENTICAL = "identical"
@@ -57,7 +59,11 @@ def natural_key(name: str) -> tuple[str | int, ...]:
 
 @dataclass(frozen=True, slots=True)
 class Run:
-    """Consecutive files of folder A (natural order) that all have a copy in folder B."""
+    """Consecutive files of folder A (natural order) that all have a copy in folder B.
+
+    An unmatched file whose name stem equals a matched neighbour's (a RAW+JPG sibling)
+    is passed over rather than ending the run; `count` and `bytes` cover matches only.
+    """
 
     a_first: str
     a_last: str
@@ -236,10 +242,10 @@ def _build_pair(
     runs: list[Run] = []
     cur: list | None = None  # [a_first, a_last, b_first, b_last, count, bytes, same, b_key]
     matched = nbytes = 0
-    for a_key, _, rec in listing:
+    for i, (a_key, _, rec) in enumerate(listing):
         other = a_map.get(rec.name)
         if other is None:
-            if cur is not None:
+            if cur is not None and not _beside_sibling(listing, a_map, i):
                 runs.append(Run(*cur[:7]))
                 cur = None
             continue
@@ -276,6 +282,23 @@ def _build_pair(
     return FolderPair(
         a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation, 1, unindexed
     )
+
+
+def _beside_sibling(
+    listing: list[tuple[tuple[str | int, ...], str, FileRecord]], a_map: dict[str, str], i: int
+) -> bool:
+    """True if unmatched listing[i] sits next to a matched file with the same name stem.
+
+    Such siblings (the JPG of a matched RAW, or "X.DNG" beside a matched "X (2).DNG")
+    do not break a run.
+    """
+    stem = match_stem(listing[i][1])
+    for j in (i - 1, i + 1):
+        if 0 <= j < len(listing):
+            name = listing[j][1]
+            if name in a_map and match_stem(name) == stem:
+                return True
+    return False
 
 
 def _key(x: str, y: str) -> tuple[str, str]:
