@@ -44,18 +44,25 @@ cd duplicate-photos-finder
 
 ## Usage
 
+Only the paths you pass are compared against each other. To keep a backup drive out of
+the comparison, run separate reports — e.g. duplicates within the primary drives, then
+within the backup drive (the second run can reuse the index):
+
 ```sh
-# Scan all drives and report name/date duplicates
-dpf find --mode 1 /run/media/adam/*
+# Duplicates within the primary ("A") drives
+dpf find --mode 1 /run/media/adam/Storage\ {1A,2A,3A}*
+
+# Duplicates within the backup ("B") drive
+dpf find --mode 1 /run/media/adam/Storage\ 3B*
 
 # Re-run the report with different settings without rescanning
-dpf find --mode 1 --no-scan --top 50 --min-files 10 /run/media/adam/*
+dpf find --mode 1 --no-scan --top 50 --min-files 10 /run/media/adam/Storage\ 3B*
 
 # Stricter "near-identical" (99% of each side), longer tree overview
-dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 /run/media/adam/*
+dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 /run/media/adam/Storage\ 3B*
 
 # Looser matching: ignore size (catches re-saved copies) or dates
-dpf find --mode 1 --ignore-size /run/media/adam/*
+dpf find --mode 1 --ignore-size /run/media/adam/Storage\ 3B*
 
 # Just build/refresh the index
 dpf scan /run/media/adam/Storage\ 1TB
