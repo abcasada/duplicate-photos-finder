@@ -4,7 +4,7 @@ Find duplicate photos and videos across many drives and many terabytes, and repo
 as **folder-level sequences** instead of millions of individual file lines:
 
 ```
-[1]  518.7 GB  /run/media/adam/Storage 3A 8TB/Photography/2025/2025-10-11 New England  ↔  /run/media/adam/Storage 3B 8TB/Photography backups/2025/2025-10-11 New England   (identical tree: 4 folders, 5,184 files)
+[1]  518.7 GB  /run/media/adam/Storage 3A 8TB/Photography/2025/2025-10-11 New England  ↔  /run/media/adam/Storage 3B 8TB/Photography backups/2025/2025-10-11 New England   (matching tree: 4 folders, 5,184 files)
 
 [2]  169.0 GB  /run/media/adam/Storage 3B 8TB/Photography backups/Aircraft/2024-07-13 Airshow  ↔  /run/media/adam/Storage 3B 8TB/_Dumps BU/Dump on 2025-03-13/8/DCIM/101MSDCF   (B is fully contained in A)
        DSC01215.ARW … DSC09706.ARW  1,608 files
@@ -66,15 +66,24 @@ Each `find` writes three files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or
 
 ### Reading the report
 
-Folder pairs are sorted by how many bytes they share. Each pair is labelled:
+Folder pairs are sorted by how many bytes they share. Mode 1 compares names, sizes and
+dates, not file contents, so the labels say "match" rather than "identical":
 
-- **identical tree** — two folder hierarchies with exactly the same contents (rolled up
-  into one line instead of one line per subfolder)
-- **identical folders** — every file in A is in B and vice versa
+- **matching tree** — two folder hierarchies whose photos/videos all match, folder by
+  folder, with the same subfolders on both sides (rolled up into one line instead of one
+  line per subfolder). A tree is never rolled up past the paths you scanned, and never
+  when any folder in it holds files that were not compared.
+- **all photos/videos match** — every photo/video directly in A is in B and vice versa
+  (subfolders are compared as their own pairs)
 - **A is fully contained in B** (or the reverse) — e.g. a camera dump that was later
   copied into a larger, sorted folder
 - **partial** — some overlap; the shared files are listed as runs of consecutive names
   (`IMG_0100 … IMG_0450`), in natural sort order
+
+Only photos and videos are compared (everything, with `--all-files`). Other files such as
+`.xmp` sidecars, `.psd` edits or notes, symlinks, and anything unreadable are counted
+instead, and a pair that holds any says so, e.g. `(all photos/videos match, 12 files;
+3 other files not compared)`. Check those files before deleting either side.
 
 Duplicates sitting in the *same* folder (e.g. `IMG_1.JPG` vs `img_1.jpg`) are summarised
 separately.

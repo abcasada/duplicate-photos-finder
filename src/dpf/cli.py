@@ -186,7 +186,7 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
             ignore_mtime=args.ignore_mtime,
         )
     )  # fmt: skip
-    result = group_duplicates(groups, idx.list_dir, idx.subdirs)
+    result = group_duplicates(groups, idx.list_dir, idx.subdirs, idx.dir_extras, roots=roots)
     files, nbytes = idx.totals(roots)
 
     os.makedirs(out, exist_ok=True)

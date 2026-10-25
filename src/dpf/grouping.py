@@ -2,9 +2,14 @@
 
 Every two folders that share copies become one FolderPair. Its matches are folded into
 runs of consecutive files (natural order of folder A), so a copied sequence reads as
-"IMG_0100 … IMG_0450 (351 files)" instead of 351 lines. Sibling trees whose folders are
-all identical are rolled up into a single pair. Names may differ between the two sides
+"IMG_0100 … IMG_0450 (351 files)" instead of 351 lines. Sibling trees whose folders all
+match are rolled up into a single pair. Names may differ between the two sides
 (content-based modes), so matching never relies on equal names.
+
+Only indexed files are compared. Entries the scanner did not index (non-media files,
+symlinks, unreadable entries) are counted per pair as `unindexed`, and a tree is only
+rolled up when it holds none, lies wholly inside the scanned roots, and has the same
+subfolders on both sides.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ from __future__ import annotations
 import os
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from itertools import combinations
 
@@ -64,6 +69,7 @@ class FolderPair:
     bytes: int
     relation: str  # IDENTICAL_TREE, IDENTICAL, A_IN_B, B_IN_A or PARTIAL
     folders: int = 1
+    unindexed: int = 0  # entries on either side that were not indexed, so not compared
 
 
 @dataclass(slots=True)
@@ -79,14 +85,18 @@ def group_duplicates(
     groups: Iterable[DuplicateGroup],
     list_dir: Callable[[str], list[FileRecord]],
     subdirs: Callable[[str], list[str]],
+    dir_extras: Callable[[str], tuple[int, int]],
     *,
+    roots: Sequence[str],
     max_dirs_per_group: int = 16,
 ) -> GroupingResult:
     """Turn duplicate groups into folder pairs sorted by duplicated bytes, largest first.
 
-    `list_dir` and `subdirs` are normally Index.list_dir and Index.subdirs. Each
-    directory is listed at most once. A group spread over more than
-    `max_dirs_per_group` folders pairs every folder only with the first one.
+    `list_dir`, `subdirs` and `dir_extras` are normally the Index methods of the same
+    names. `roots` are the scanned roots: trees are never rolled up past them, since
+    folders outside were not scanned and only look empty. Each directory is listed at
+    most once. A group spread over more than `max_dirs_per_group` folders pairs every
+    folder only with the first one.
     """
     # (dir_a, dir_b) -> (A name -> matching B name, matched B names)
     matches: dict[tuple[str, str], tuple[dict[str, str], set[str]]] = {}
@@ -121,11 +131,18 @@ def group_duplicates(
             b_set.update(b_names)
 
     counts: dict[str, int] = {}
+    extras: dict[str, int] = {}
 
     def dir_count(d: str) -> int:
         n = counts.get(d)
         if n is None:
             n = counts[d] = len(list_dir(d))
+        return n
+
+    def unindexed(d: str) -> int:
+        n = extras.get(d)
+        if n is None:
+            n = extras[d] = sum(dir_extras(d))
         return n
 
     partners: defaultdict[str, list[str]] = defaultdict(list)
@@ -139,9 +156,11 @@ def group_duplicates(
         counts[a] = len(listing)
         for b in bs:
             a_map, b_set = matches.pop((a, b))
-            pairs[(a, b)] = _build_pair(a, b, listing, a_map, b_set, dir_count(b))
+            pairs[(a, b)] = _build_pair(
+                a, b, listing, a_map, b_set, dir_count(b), unindexed(a) + unindexed(b)
+            )
 
-    _roll_up(pairs, dir_count, subdirs)
+    _roll_up(pairs, dir_count, unindexed, subdirs, roots)
     ordered = sorted(pairs.values(), key=lambda p: (-p.bytes, p.dir_a, p.dir_b))
     return GroupingResult(ordered, same_folder, count, redundant, capped)
 
@@ -163,6 +182,7 @@ def _build_pair(
     a_map: dict[str, str],
     b_set: set[str],
     total_b: int,
+    unindexed: int,
 ) -> FolderPair:
     runs: list[Run] = []
     cur: list | None = None  # [a_first, a_last, b_first, b_last, count, bytes, same, b_key]
@@ -202,11 +222,17 @@ def _build_pair(
         relation = B_IN_A
     else:
         relation = PARTIAL
-    return FolderPair(a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation)
+    return FolderPair(
+        a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation, 1, unindexed
+    )
 
 
 def _key(x: str, y: str) -> tuple[str, str]:
     return (x, y) if x < y else (y, x)
+
+
+def _within(path: str, root: str) -> bool:
+    return root == "/" or path == root or path.startswith(root + "/")
 
 
 def _related(x: str, y: str) -> bool:
@@ -225,12 +251,26 @@ class _Tree:
 def _roll_up(
     pairs: dict[tuple[str, str], FolderPair],
     dir_count: Callable[[str], int],
+    unindexed: Callable[[str], int],
     subdirs: Callable[[str], list[str]],
+    roots: Sequence[str],
 ) -> None:
-    """Replace identical folder pairs that make up identical trees by one tree pair."""
-    identical = {k: p for k, p in pairs.items() if p.relation == IDENTICAL}
+    """Replace identical folder pairs that make up matching trees by one tree pair.
+
+    Every folder of both trees must be an identical pair with nothing unindexed, or
+    hold no files and nothing unindexed on either side, and both trees must lie
+    inside the scanned roots.
+    """
+    identical = {
+        k: p for k, p in pairs.items() if p.relation == IDENTICAL and p.unindexed == 0
+    }
     if not identical:
         return
+    scanned = [r.rstrip("/") or "/" for r in roots]
+
+    def inside(d: str) -> bool:
+        return any(_within(d, r) for r in scanned)
+
     memo: dict[tuple[str, str], _Tree | None] = {}
     child_cache: dict[str, dict[str, str]] = {}
 
@@ -245,10 +285,10 @@ def _roll_up(
         if k in memo:
             return memo[k]
         memo[k] = None
-        if _related(x, y):
+        if _related(x, y) or not (inside(x) and inside(y)):
             return None
         own = identical.get(k)
-        if own is None and (dir_count(x) or dir_count(y)):
+        if own is None and (dir_count(x) or dir_count(y) or unindexed(x) or unindexed(y)):
             return None
         cx, cy = children(x), children(y)
         if cx.keys() != cy.keys() or (own is None and not cx):

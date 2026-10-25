@@ -39,7 +39,7 @@ class CliTest(unittest.TestCase):
     def test_find_mode1_end_to_end(self):
         code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
         self.assertEqual(code, 0)
-        self.assertIn("identical folders, 10 files", out)
+        self.assertIn("all photos/videos match, 10 files", out)
         self.assertIn("name+size+mtime ±2s", out)
         for name in ("report.txt", "report.json", "files.csv"):
             self.assertTrue(os.path.exists(os.path.join(self.out, name)), name)
@@ -55,7 +55,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
         code, out, _ = self.run_cli("find", "-q", "--no-scan", "-o", self.out, self.drives)
         self.assertEqual(code, 0)
-        self.assertIn("identical folders", out)
+        self.assertIn("all photos/videos match", out)
 
     def test_refuses_report_inside_scanned_path(self):
         with self.assertRaises(SystemExit):

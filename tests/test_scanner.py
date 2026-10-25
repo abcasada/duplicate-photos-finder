@@ -104,6 +104,33 @@ class WalkTest(TempTree):
         self.assertEqual(len(errors), 1)
         self.assertTrue(errors[0].startswith(self.p("locked") + ": "), errors[0])
 
+    def test_dir_stats_count_unindexed_entries(self):
+        touch(self.p("a.jpg"))
+        touch(self.p("a.xmp"))
+        touch(self.p("._a.jpg"))
+        touch(self.p("$RECYCLE.BIN", "junk.txt"))
+        touch(self.p("edits", "a.psd"))
+        touch(self.p("edits", "b.psd"))
+        touch(self.p("clean", "b.jpg"))
+        os.symlink(self.p("a.jpg"), self.p("link.jpg"))
+        stats = {}
+        list(walk(self.root, dir_stats=stats))
+        self.assertEqual(stats, {self.root: (2, 0), self.p("edits"): (2, 0)})
+        stats = {}
+        list(walk(self.root, all_files=True, dir_stats=stats))
+        self.assertEqual(stats, {self.root: (1, 0)})
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read chmod 000 directories")
+    def test_dir_stats_unreadable_dir_under_its_own_path(self):
+        touch(self.p("locked", "b.jpg"))
+        os.chmod(self.p("locked"), 0)
+        try:
+            stats = {}
+            list(walk(self.root, dir_stats=stats))
+        finally:
+            os.chmod(self.p("locked"), 0o755)
+        self.assertEqual(stats, {self.p("locked"): (0, 1)})
+
     def test_unreadable_root_recorded(self):
         errors = []
         self.assertEqual(list(walk(self.p("missing"), errors=errors)), [])
@@ -116,9 +143,12 @@ class WalkTest(TempTree):
         except (OSError, UnicodeError):
             self.skipTest("filesystem rejects non-UTF-8 names")
         touch(self.p("good.jpg"))
-        errors = []
-        self.assertEqual([r.name for r in walk(self.root, errors=errors)], ["good.jpg"])
+        errors, stats = [], {}
+        self.assertEqual(
+            [r.name for r in walk(self.root, errors=errors, dir_stats=stats)], ["good.jpg"]
+        )
         self.assertEqual(len(errors), 1)
+        self.assertEqual(stats, {self.root: (0, 1)})
 
 
 class ScanRootsTest(TempTree):
@@ -155,6 +185,18 @@ class ScanRootsTest(TempTree):
         self.assertEqual(rows, [(self.p("other"), "x.jpg"), (self.p("r"), "new.jpg"),
                                 (self.p("r", "sub"), "keep.jpg")])
 
+    def test_dir_stats_stored_and_replaced_on_rescan(self):
+        touch(self.p("r", "a.jpg"))
+        touch(self.p("r", "a.xmp"))
+        touch(self.p("r", "edits", "a.psd"))
+        scan_roots(self.idx, [self.p("r")])
+        self.assertEqual(self.idx.dir_extras(self.p("r")), (1, 0))
+        self.assertEqual(self.idx.subdirs(self.p("r")), [self.p("r", "edits")])
+        os.remove(self.p("r", "a.xmp"))
+        scan_roots(self.idx, [self.p("r")])
+        self.assertEqual(self.idx.dir_extras(self.p("r")), (0, 0))
+        self.assertEqual(self.idx.dir_extras(self.p("r", "edits")), (1, 0))
+
     def test_errors_counted(self):
         touch(self.p("r", "a.jpg"))
         errors = []
@@ -163,6 +205,7 @@ class ScanRootsTest(TempTree):
         self.assertEqual(stats[0].errors, 1)
         self.assertEqual(self.idx.root_stats(self.p("r")).errors, 1)
         self.assertEqual(errors, [self.p("r") + ": Permission denied"])
+        self.assertEqual(self.idx.dir_extras(self.p("r")), (0, 1))
 
     def test_one_thread_per_device(self):
         for r in ("r1", "r2", "r3"):

@@ -58,49 +58,73 @@ def _error(errors: list[str] | None, path: str, exc: OSError) -> None:
         errors.append(f"{path}: {exc.strerror or exc}")
 
 
+DirStats = dict[str, tuple[int, int]]
+
+
 def walk(
-    root: str, *, all_files: bool = False, errors: list[str] | None = None
+    root: str,
+    *,
+    all_files: bool = False,
+    errors: list[str] | None = None,
+    dir_stats: DirStats | None = None,
 ) -> Iterator[FileRecord]:
     """Yield media files under `root` without following symlinks.
 
-    Unreadable directories and files are reported to `errors` and skipped.
+    Unreadable directories and files are reported to `errors` and skipped. If given,
+    `dir_stats` maps each directory holding entries that were not indexed to
+    (other, errors): `other` counts non-media files (unless all_files), symlinks and
+    special files; `errors` counts unreadable or undecodable entries. A directory that
+    cannot be listed is recorded under its own path. AppleDouble "._*" files and
+    media.SKIP_DIRS are ignored entirely.
     """
     stack = [os.path.abspath(root)]
     while stack:
         dir = stack.pop()
         subdirs = []
+        other = errs = 0
         try:
             with os.scandir(dir) as it:
                 for entry in it:
                     name = entry.name
                     try:
                         if entry.is_symlink():
+                            other += 1
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             if name in media.SKIP_DIRS:
                                 continue
                             if not _encodable(name):
+                                errs += 1
                                 _error(errors, entry.path, OSError("undecodable name"))
                                 continue
                             subdirs.append(entry.path)
                             continue
-                        if not entry.is_file(follow_symlinks=False) or name.startswith("._"):
+                        if name.startswith("._"):
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            other += 1
                             continue
                         kind = media.classify(name)
                         if kind is None:
                             if not all_files:
+                                other += 1
                                 continue
                             kind = media.OTHER
                         if not _encodable(name):
+                            errs += 1
                             _error(errors, entry.path, OSError("undecodable name"))
                             continue
                         st = entry.stat(follow_symlinks=False)
                     except OSError as e:
+                        errs += 1
                         _error(errors, entry.path, e)
                         continue
                     yield FileRecord(dir, name, st.st_size, st.st_mtime, kind)
         except OSError as e:
+            errs += 1
             _error(errors, dir, e)
+        if dir_stats is not None and (other or errs):
+            dir_stats[dir] = (other, errs)
         stack.extend(sorted(subdirs, reverse=True))
 
 
@@ -124,16 +148,17 @@ def _device_worker(
     try:
         for root in roots:
             errors: list[str] = []
+            dir_stats: DirStats = {}
             batch: list[FileRecord] = []
             sent = time.monotonic()
-            for rec in walk(root, all_files=all_files, errors=errors):
+            for rec in walk(root, all_files=all_files, errors=errors, dir_stats=dir_stats):
                 batch.append(rec)
                 if len(batch) >= BATCH_SIZE or time.monotonic() - sent >= BATCH_SECONDS:
                     put(("batch", root, batch))
                     batch, sent = [], time.monotonic()
             if batch:
                 put(("batch", root, batch))
-            put(("end", root, errors))
+            put(("end", root, (errors, dir_stats)))
         put(("done", None, None))
     except _Stopped:
         pass
@@ -155,7 +180,8 @@ def scan_roots(
     """Scan `roots` (as from normalize_roots) into `index`, replacing what each held.
 
     Roots on the same device are walked sequentially by one thread; devices are walked
-    in parallel. Error messages are appended to `errors` if given. Returns stats in
+    in parallel. Error messages are appended to `errors` if given; per-directory counts
+    of entries not indexed (see walk) are stored with the root. Returns stats in
     the order of `roots`. A root whose scan is interrupted keeps its previous contents.
     """
     roots = [os.path.abspath(r) for r in roots]
@@ -195,9 +221,10 @@ def scan_roots(
                     reported[root] = now
                     progress(root, c[0], c[1])
             elif kind == "end":
-                stats[root] = index.finish_root(root, len(payload))
+                root_errors, dir_stats = payload
+                stats[root] = index.finish_root(root, len(root_errors), dir_stats)
                 if errors is not None:
-                    errors.extend(payload)
+                    errors.extend(root_errors)
                 if progress:
                     progress(root, *counts[root])
             elif kind == "done":

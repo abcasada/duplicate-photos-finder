@@ -42,7 +42,11 @@ def build():
     groups.append(DuplicateGroup(tuple(phone), "sha256"))
     idx = Index(":memory:")
     idx.replace_root("/drives", records + edits + renamed + phone)
-    return group_duplicates(groups, idx.list_dir, idx.subdirs), groups
+    return group(groups, idx, ["/drives"]), groups
+
+
+def group(groups, idx, roots=("/",)):
+    return group_duplicates(groups, idx.list_dir, idx.subdirs, idx.dir_extras, roots=roots)
 
 
 class HumanBytesTest(unittest.TestCase):
@@ -76,7 +80,7 @@ class TextReportTest(unittest.TestCase):
         self.assertIn("covers 75% of A (45/60), 90% of B (45/50)", text)
         self.assertIn(
             "/drives/one/Photos/2019/Hawaii  ↔  /drives/two/Backup/Hawaii"
-            "   (identical folders, 12 files)",
+            "   (all photos/videos match, 12 files)",
             text,
         )
         self.assertIn(
@@ -93,7 +97,7 @@ class TextReportTest(unittest.TestCase):
         records = imgs("/a", range(0, 40)) + imgs("/b", range(0, 40, 2))
         idx = Index(":memory:")
         idx.replace_root("/", records)
-        result = group_duplicates(by_name(records), idx.list_dir, idx.subdirs)
+        result = group(by_name(records), idx)
         text = format_text(result, SUMMARY, max_runs=3)
         self.assertIn("       IMG_0000.JPG  1 file\n", text)
         self.assertIn("… and 17 more runs (17 files)", text)
@@ -116,15 +120,15 @@ class TextReportTest(unittest.TestCase):
         records.append(rec("/y/Copy/keep.jpg", "k.jpg"))
         idx = Index(":memory:")
         idx.replace_root("/", records)
-        result = group_duplicates(by_name(records), idx.list_dir, idx.subdirs)
+        result = group(by_name(records), idx)
         text = format_text(result, SUMMARY)
         self.assertIn(
-            "[1]    6.0 MB  /x/Photos  ↔  /y/Copy/Photos   (identical tree: 2 folders, 6 files)",
+            "[1]    6.0 MB  /x/Photos  ↔  /y/Copy/Photos   (matching tree: 2 folders, 6 files)",
             text,
         )
 
     def test_no_duplicates(self):
-        result = group_duplicates([], lambda d: [], lambda d: [])
+        result = group_duplicates([], lambda d: [], lambda d: [], lambda d: (0, 0), roots=["/"])
         text = format_text(result, {**SUMMARY, "elapsed": 3725.0})
         self.assertIn("No duplicates shared between folders.", text)
         self.assertIn("Elapsed:     1h 02m 05s", text)

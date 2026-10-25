@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 from dpf.index import Index
@@ -101,6 +103,54 @@ class IndexTest(unittest.TestCase):
         self.idx.begin_root("/a")
         self.assertEqual(self.idx.finish_root("/a").files, 0)
         self.assertEqual(self.idx.totals(["/a"]), (0, 0))
+
+    def test_dir_extras_and_subdirs_from_dirs_table(self):
+        self.idx.replace_root(
+            "/r", [rec("/r/a", "1.jpg")], dir_stats={"/r/edits": (2, 0), "/r/a": (1, 1)}
+        )
+        self.assertEqual(self.idx.dir_extras("/r/edits"), (2, 0))
+        self.assertEqual(self.idx.dir_extras("/r/a/"), (1, 1))
+        self.assertEqual(self.idx.dir_extras("/r"), (0, 0))
+        self.assertEqual(self.idx.subdirs("/r"), ["/r/a", "/r/edits"])
+
+    def test_dirs_replaced_per_root(self):
+        self.idx.replace_root("/a", [], dir_stats={"/a/x": (1, 0), "/a/y": (0, 1)})
+        self.idx.replace_root("/b", [], dir_stats={"/b": (3, 0)})
+        self.idx.begin_root("/a")
+        self.idx.finish_root("/a", dir_stats={"/a/z": (0, 2)})
+        self.assertEqual(self.idx.dir_extras("/a/x"), (0, 0))
+        self.assertEqual(self.idx.dir_extras("/a/z"), (0, 2))
+        self.assertEqual(self.idx.subdirs("/a"), ["/a/z"])
+        self.idx.replace_root("/a", [])
+        self.assertEqual(self.idx.subdirs("/a"), [])
+        self.assertEqual(self.idx.dir_extras("/b"), (3, 0))
+
+
+class IndexFileTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_bare_filename(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp.name)
+        try:
+            with Index("index.db") as idx:
+                idx.replace_root("/a", [rec("/a", "x.jpg")])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(idx.path, os.path.join(os.path.realpath(self.tmp.name), "index.db"))
+        with Index(idx.path) as idx:
+            self.assertEqual(idx.totals(["/a"])[0], 1)
+
+    def test_older_inventory_dropped(self):
+        path = os.path.join(self.tmp.name, "index.db")
+        with Index(path) as idx:
+            idx.replace_root("/a", [rec("/a", "x.jpg")])
+            idx.conn.execute("PRAGMA user_version = 1")
+        with Index(path) as idx:
+            self.assertEqual(idx.totals(["/a"])[0], 0)
+            self.assertIsNone(idx.root_stats("/a"))
 
 
 if __name__ == "__main__":

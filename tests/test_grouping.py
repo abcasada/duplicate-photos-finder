@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from collections import defaultdict
 
@@ -12,6 +14,8 @@ from dpf.grouping import (
 )
 from dpf.index import Index
 from dpf.models import DuplicateGroup, FileRecord
+from dpf.scanner import normalize_roots, scan_roots
+from tests.test_scanner import touch
 
 
 def rec(dir, name, size=100, mtime=1_000_000.0, kind="image"):
@@ -31,19 +35,21 @@ def by_name(records):
 
 
 class Fixture:
-    def __init__(self, records):
+    def __init__(self, records, dir_stats=None):
         self.records = list(records)
         self.idx = Index(":memory:")
-        self.idx.replace_root("/", self.records)
+        self.idx.replace_root("/", self.records, dir_stats=dir_stats)
         self.list_calls = defaultdict(int)
 
     def list_dir(self, d):
         self.list_calls[d] += 1
         return self.idx.list_dir(d)
 
-    def run(self, groups=None, **kw):
+    def run(self, groups=None, roots=("/",), **kw):
         groups = by_name(self.records) if groups is None else groups
-        return group_duplicates(groups, self.list_dir, self.idx.subdirs, **kw)
+        return group_duplicates(
+            groups, self.list_dir, self.idx.subdirs, self.idx.dir_extras, roots=roots, **kw
+        )
 
 
 def pair_map(result):
@@ -272,6 +278,121 @@ class TreeRollUpTest(unittest.TestCase):
             (p.dir_a, p.dir_b, p.relation, p.folders),
             ("/m/a", "/m/a b", IDENTICAL_TREE, 1),
         )
+
+    def test_not_rolled_up_past_scanned_roots(self):
+        # Only the two 2019 folders were scanned; their parents just look empty.
+        files = imgs("/d1/Photos/2019/Trip", range(3)) + imgs("/d2/Photos/2019/Trip", range(3))
+        (p,) = Fixture(files).run(roots=["/d1/Photos/2019", "/d2/Photos/2019"]).pairs
+        self.assertEqual(
+            (p.dir_a, p.dir_b, p.relation),
+            ("/d1/Photos/2019", "/d2/Photos/2019", IDENTICAL_TREE),
+        )
+        (p,) = Fixture(files).run(roots=["/d1/Photos/2019", "/d2"]).pairs
+        self.assertEqual((p.dir_a, p.dir_b), ("/d1/Photos/2019", "/d2/Photos/2019"))
+
+    def test_unindexed_entries_block_roll_up(self):
+        files = self.tree("/d1/Photos") + self.tree("/d2/Photos")
+        res = Fixture(files, {"/d1/Photos/2019/Paris": (2, 1)}).run()
+        kinds = {p.dir_a: (p.relation, p.unindexed) for p in res.pairs}
+        self.assertEqual(kinds["/d1/Photos/2019/Paris"], (IDENTICAL, 3))
+        self.assertEqual(kinds["/d1/Photos/2019/Hawaii"], (IDENTICAL, 0))
+        self.assertEqual(kinds["/d1/Photos/2020"], (IDENTICAL_TREE, 0))
+        self.assertEqual(kinds["/d1/Photos"], (IDENTICAL, 0))
+
+    def test_unindexed_in_fileless_folder_blocks_roll_up(self):
+        files = imgs("/d1/P/a", range(3)) + imgs("/d2/P/a", range(3))
+        res = Fixture(files, {"/d1/P": (1, 0)}).run()
+        self.assertEqual(
+            [(p.dir_a, p.relation) for p in res.pairs], [("/d1/P/a", IDENTICAL)]
+        )
+
+
+class ScannedTreeTest(unittest.TestCase):
+    """End to end from real directories: scanner -> index -> grouping."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = os.path.realpath(self._tmp.name)
+        self.idx = Index(":memory:")
+
+    def tearDown(self):
+        self.idx.close()
+        self._tmp.cleanup()
+
+    def p(self, rel):
+        return os.path.join(self.base, rel)
+
+    def photos(self, rel, n=3):
+        for i in range(n):
+            touch(self.p(f"{rel}/IMG_{i}.JPG"), b"x" * (i + 1), mtime=1_600_000_000 + i)
+
+    def pairs(self, *rel_roots):
+        roots = normalize_roots(self.p(r) for r in rel_roots)
+        scan_roots(self.idx, roots)
+        groups = [DuplicateGroup(tuple(b), "name+size") for b in self.idx.name_buckets(roots)]
+        res = group_duplicates(
+            groups, self.idx.list_dir, self.idx.subdirs, self.idx.dir_extras, roots=roots
+        )
+        n = len(self.base) + 1
+        return {(p.dir_a[n:], p.dir_b[n:]): (p.relation, p.unindexed) for p in res.pairs}
+
+    def test_unscanned_sibling_does_not_make_parents_match(self):
+        self.photos("d1/Photos/2019/Trip")
+        self.photos("d1/Photos/2018/Old")  # never scanned
+        self.photos("d2/Photos/2019/Trip")
+        self.assertEqual(
+            self.pairs("d1/Photos/2019", "d2/Photos/2019"),
+            {("d1/Photos/2019", "d2/Photos/2019"): (IDENTICAL_TREE, 0)},
+        )
+
+    def test_full_scan_still_rolls_up(self):
+        self.photos("d1/Photos/2019/Trip")
+        self.photos("d2/Photos/2019/Trip")
+        self.assertEqual(self.pairs("d1", "d2"), {("d1", "d2"): (IDENTICAL_TREE, 0)})
+
+    def test_sidecar_file_not_identical_tree(self):
+        self.photos("d1/Photos/2019/Trip")
+        touch(self.p("d1/Photos/2019/Trip/IMG_0.xmp"))
+        touch(self.p("d1/Photos/2019/Trip/._IMG_0.JPG"))  # AppleDouble is ignored
+        self.photos("d2/Photos/2019/Trip")
+        self.assertEqual(
+            self.pairs("d1", "d2"),
+            {("d1/Photos/2019/Trip", "d2/Photos/2019/Trip"): (IDENTICAL, 1)},
+        )
+
+    def test_subfolder_with_only_non_media_blocks_roll_up(self):
+        self.photos("d1/Photos/Trip")
+        touch(self.p("d1/Photos/Trip/edits/IMG_1.psd"))
+        self.photos("d2/Photos/Trip")
+        self.assertEqual(
+            self.pairs("d1", "d2"),
+            {("d1/Photos/Trip", "d2/Photos/Trip"): (IDENTICAL, 0)},
+        )
+        self.assertEqual(
+            self.idx.subdirs(self.p("d1/Photos/Trip")), [self.p("d1/Photos/Trip/edits")]
+        )
+
+    def test_matching_non_media_subfolders_still_block_roll_up(self):
+        for d in ("d1", "d2"):
+            self.photos(f"{d}/Photos/Trip")
+            touch(self.p(f"{d}/Photos/Trip/edits/IMG_1.psd"))
+        self.assertEqual(
+            self.pairs("d1", "d2"),
+            {("d1/Photos/Trip", "d2/Photos/Trip"): (IDENTICAL, 0)},
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read chmod 000 directories")
+    def test_unreadable_subfolder_blocks_roll_up(self):
+        self.photos("d1/Photos/Trip")
+        self.photos("d1/Photos/Trip/noperm", 1)
+        self.photos("d2/Photos/Trip")
+        os.chmod(self.p("d1/Photos/Trip/noperm"), 0)
+        try:
+            got = self.pairs("d1", "d2")
+        finally:
+            os.chmod(self.p("d1/Photos/Trip/noperm"), 0o755)
+        self.assertEqual(got, {("d1/Photos/Trip", "d2/Photos/Trip"): (IDENTICAL, 0)})
+        self.assertEqual(self.idx.dir_extras(self.p("d1/Photos/Trip/noperm")), (0, 1))
 
 
 if __name__ == "__main__":

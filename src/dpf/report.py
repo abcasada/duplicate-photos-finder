@@ -60,15 +60,20 @@ def _duration(seconds: float) -> str:
 
 
 def _describe(p: FolderPair) -> str:
+    """Relation label. File contents are not compared in mode 1, so never "identical"."""
     if p.relation == IDENTICAL_TREE:
-        return f"identical tree: {_plural(p.folders, 'folder')}, {_plural(p.matched_a, 'file')}"
-    if p.relation == IDENTICAL:
-        return f"identical folders, {_plural(p.matched_a, 'file')}"
-    if p.relation == A_IN_B:
-        return "A is fully contained in B"
-    if p.relation == B_IN_A:
-        return "B is fully contained in A"
-    return "partial overlap"
+        text = f"matching tree: {_plural(p.folders, 'folder')}, {_plural(p.matched_a, 'file')}"
+    elif p.relation == IDENTICAL:
+        text = f"all photos/videos match, {_plural(p.matched_a, 'file')}"
+    elif p.relation == A_IN_B:
+        text = "A is fully contained in B"
+    elif p.relation == B_IN_A:
+        text = "B is fully contained in A"
+    else:
+        text = "partial overlap"
+    if p.unindexed:
+        text += f"; {_plural(p.unindexed, 'other file')} not compared"
+    return text
 
 
 def _span(first: str, last: str) -> str:
