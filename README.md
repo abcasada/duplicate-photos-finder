@@ -49,8 +49,8 @@ the comparison, run separate reports — e.g. duplicates within the primary driv
 within the backup drive (the second run can reuse the index):
 
 ```sh
-# Duplicates within the primary ("A") drives
-dpf find --mode 1 /run/media/adam/Storage\ {1A,2A,3A}*
+# Duplicates within the primary ("A") drives, including the 1TB working SSD
+dpf find --mode 1 /run/media/adam/Storage\ {1TB,1A,2A,3A}*
 
 # Duplicates within the backup ("B") drive
 dpf find --mode 1 /run/media/adam/Storage\ 3B*

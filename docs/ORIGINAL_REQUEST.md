@@ -55,7 +55,7 @@ planning, so later sessions don't lose them. See [PLAN.md](PLAN.md) for the desi
 | What counts as a duplicate in mode 2? | **Offer all three options**: exact + visually similar, exact only, or visually similar only (`--compare exact\|visual\|both`). |
 | What should the tool do with duplicates? | **Report only.** It never touches files and generates no delete scripts. |
 | Git author | **Adam Casada**, `40399292+abcasada@users.noreply.github.com` (set repo-locally). |
-| Drive sets (added during Phase 1) | The **B** drive (Storage 3B) is the **backup of the A drives** (1A, 2A, 3A). Don't look for duplicates *between* A and B, only within A and within B. Leave **Storage 1TB** out entirely. |
+| Drive sets (added during Phase 1) | The **B** drive (Storage 3B) is the **backup of the A drives** (1A, 2A, 3A). Don't look for duplicates *between* A and B, only within A and within B. **Storage 1TB** is grouped **with the A drives** (the user first said to leave it out, then changed this). |
 | Report detail (added during Phase 1) | Wanted: a **tree overview** that rolls near-identical trees into headline lines, plus **near-identical folders** noted alongside identical ones. |
 | Speed (added during Phase 1) | **Speed is a priority for all modes.** The machine is a Ryzen 5 3600 (6 cores / 12 threads); use multithreading where the bottleneck allows. |
 | Plan approval | The user said to write the plan into the repo, commit it, and resume implementation in a later session. |

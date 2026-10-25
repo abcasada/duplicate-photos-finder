@@ -124,3 +124,38 @@ roughly 180 MB/s. The design rules:
 - End-to-end on a synthetic tree in a temp dir: copy runs of files between folders, then check that the report shows the expected runs and percentages.
 - Smoke test on real data, read-only: `python3 -m dpf find --mode 1 "/run/media/adam/Storage 1TB"` (the smallest drive). Check the runtime, the report readability, and that the drive's mtime/atime is untouched apart from normal reads. Then run it across all 5 drives and share the timing and summary.
 - Push to `origin main` and confirm with `gh repo view`.
+
+## Status after Phase 1 (2026-10-24)
+Phase 1 is complete and was verified on the real drives (read-only):
+- **A set** (1TB, 1A, 2A, 3A): 381,143 files, 18.1 TB, 32,403 duplicate groups (~2.6 TB
+  redundant), 2,021 folder pairs and 135 tree pairs. Takes **27 s** end to end.
+- **B set** (3B): 83,104 files, 7.8 TB, 11,342 groups (~1.4 TB redundant), 66 folder pairs.
+  Takes **5 s**.
+
+Additions beyond the original Phase 1 scope, all requested or approved by the user:
+- A tree overview that rolls up near-identical trees.
+- `--near` labelling for near-identical folder pairs.
+- Per-folder tracking of non-media and unreadable files, so dpf never claims a "match"
+  for content it didn't see.
+- Ignoring OS clutter files (Thumbs.db, .DS_Store and similar).
+- A guard that keeps the index and reports off the scanned drives.
+
+**Known limitations / candidates for later:**
+- **RAW+JPG sets split runs.** When only one extension of a pair matched (e.g. the .ARW
+  but not the .JPG), the unmatched sibling breaks the run into many 1-file runs. Fix: let
+  runs skip unmatched files whose name stem matches a matched neighbour.
+- **Repeated pairs.** A file present in N folders yields up to N(N−1)/2 folder pairs, so
+  the same run can appear 2–3 times. The cap is 16 folders per group, after which dirs
+  pair only with the first.
+- **Small trees in the overview.** Tiny, low-coverage tree pairs still take overview slots.
+  Idea: `--tree-min-coverage`.
+- **Not handled:** hardlinks (not merged), and concurrent runs on the same index (they
+  share the staging table).
+- **Custom agent types load only at session start.** In this session the implementer and
+  reviewer ran as `general-purpose` agents on Opus following the `.claude/agents/*.md`
+  rules, inheriting the session's effort level. From the next session on,
+  `subagent_type: implementer|reviewer|lookup` applies the model and effort set in those
+  files.
+
+**Next: Phase 2 (mode 2).** Open decision: when mode 3 hands off to mode 2, should mode 2
+only verify the mode 1 candidates (fast), or do a full content scan?
