@@ -51,6 +51,9 @@ dpf find --mode 1 /run/media/adam/*
 # Re-run the report with different settings without rescanning
 dpf find --mode 1 --no-scan --top 50 --min-files 10 /run/media/adam/*
 
+# Stricter "near-identical" (99% of each side), longer tree overview
+dpf find --mode 1 --no-scan --near 0.99 --tree-top 50 /run/media/adam/*
+
 # Looser matching: ignore size (catches re-saved copies) or dates
 dpf find --mode 1 --ignore-size /run/media/adam/*
 
@@ -66,8 +69,42 @@ Each `find` writes three files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or
 
 ### Reading the report
 
-Folder pairs are sorted by how many bytes they share. Mode 1 compares names, sizes and
-dates, not file contents, so the labels say "match" rather than "identical":
+The report starts with a **tree overview**, then lists every folder pair. Both are
+sorted by how many bytes they share. Mode 1 compares names, sizes and dates, not file
+contents, so the labels say "match" rather than "identical".
+
+#### Tree overview
+
+Two copies of a large tree (say `Photography` and `Photography backups`) that differ in a
+handful of files cannot be rolled up into one "matching tree" line, so they would show
+as dozens of separate folder pairs. The overview groups those pairs by the trees they sit
+in: each folder pair loses the trailing folder names its two sides share (compared
+case-insensitively), so `…/3A/Photography/2025/Trip ↔ …/3B/Photography backups/2025/Trip`
+belongs to `…/3A/Photography ↔ …/3B/Photography backups`. Trees never extend past the
+paths you scanned, and the two sides are never the same folder or nested in each other.
+
+```
+[T1]     3.3 TB  /…/Storage 3A 8TB/Photography  ↔  /…/Storage 3B 8TB/Photography backups   (overlapping trees: 87% / 86%, 88 folder pairs, 36,427 files; 5,372 other files not compared)
+       covers 87% of A (36,427/41,411), 86% of B (36,427/42,174)
+
+[T3]   268.3 GB  /…/Storage 3A 8TB/Videography  ↔  /…/Storage 3B 8TB/Videography backups   (near-identical trees: 100% / 100%, 6 folder pairs, 281 files; 410 other files not compared)
+       covers 100% of A (281/281), 100% of B (281/281)
+```
+
+- The percentages are measured against **every photo/video indexed under each tree**,
+  counting each file once, so folders with no counterpart lower them. A file only counts
+  as matched when its copy sits at the same relative path in the other tree.
+- **near-identical trees**: at least `--near` (default 90%) of each tree matched.
+  **A within B** / **A largely within B**: all, or at least `--near`, of A matched, but
+  less of B (and the reverse). **overlapping trees**: everything else.
+- The overview never says "matching": a tree whose folders all match is shown as a
+  *matching tree* in the folder-pair list instead. Overview lines only count
+  photos/videos; "other files not compared" counts them in the paired folders only.
+  Read the folder pairs (tagged `(in T1)` etc.) before deleting either side.
+- Only trees holding two or more folder pairs are listed (a single pair already has its
+  own line). `--tree-top N` (default 20) limits the overview; `--tree-top 0` hides it.
+
+#### Folder pairs
 
 - **matching tree** — two folder hierarchies whose photos/videos all match, folder by
   folder, with the same subfolders on both sides (rolled up into one line instead of one
@@ -76,9 +113,17 @@ dates, not file contents, so the labels say "match" rather than "identical":
 - **all photos/videos match** — every photo/video directly in A is in B and vice versa
   (subfolders are compared as their own pairs)
 - **A is fully contained in B** (or the reverse) — e.g. a camera dump that was later
-  copied into a larger, sorted folder
-- **partial** — some overlap; the shared files are listed as runs of consecutive names
-  (`IMG_0100 … IMG_0450`), in natural sort order
+  copied into a larger, sorted folder. When B is also at least `--near` matched the
+  label adds it: `(A is fully contained in B; near-identical: 100% / 99%, 4 files only in
+  B)`
+- **near-identical** — neither side is fully contained, but at least `--near` (default
+  0.9) of each side matched: `(near-identical: 99% / 99%; 1 file only in A, 1 only in
+  B)`. `--near 1` turns this label off
+- **partial** — some overlap
+
+Except for matching folders, the shared files are listed as runs of consecutive names
+(`IMG_0100 … IMG_0450`), in natural sort order, followed by the coverage of each side.
+Percentages are rounded down, so 100% always means every file.
 
 Only photos and videos are compared (everything, with `--all-files`). Other files such as
 `.xmp` sidecars, `.psd` edits or notes, symlinks, and anything unreadable are counted

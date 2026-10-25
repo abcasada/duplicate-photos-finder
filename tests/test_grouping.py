@@ -8,9 +8,17 @@ from dpf.grouping import (
     B_IN_A,
     IDENTICAL,
     IDENTICAL_TREE,
+    NEAR_IDENTICAL,
     PARTIAL,
+    TREE_A_MOSTLY_IN_B,
+    TREE_NEAR,
+    TREE_OVERLAP,
+    FolderPair,
     group_duplicates,
+    is_near,
     natural_key,
+    tree_pairs,
+    tree_tops,
 )
 from dpf.index import Index
 from dpf.models import DuplicateGroup, FileRecord
@@ -45,8 +53,10 @@ class Fixture:
         self.list_calls[d] += 1
         return self.idx.list_dir(d)
 
-    def run(self, groups=None, roots=("/",), **kw):
+    def run(self, groups=None, roots=("/",), trees=False, **kw):
         groups = by_name(self.records) if groups is None else groups
+        if trees:
+            kw["tree_totals"] = lambda d: self.idx.totals([d])
         return group_duplicates(
             groups, self.list_dir, self.idx.subdirs, self.idx.dir_extras, roots=roots, **kw
         )
@@ -305,6 +315,190 @@ class TreeRollUpTest(unittest.TestCase):
         self.assertEqual(
             [(p.dir_a, p.relation) for p in res.pairs], [("/d1/P/a", IDENTICAL)]
         )
+
+
+class ClosingTest(unittest.TestCase):
+    def fixture(self, records):
+        fx = Fixture(records)
+        self.addCleanup(fx.idx.close)
+        return fx
+
+
+class NearIdenticalTest(ClosingTest):
+    def pair(self, shared, only_a, only_b, **kw):
+        a = imgs("/a", range(shared + only_a))
+        b = imgs("/b", list(range(shared)) + list(range(1000, 1000 + only_b)))
+        (p,) = self.fixture(a + b).run(**kw).pairs
+        return p
+
+    def test_is_near_boundaries(self):
+        self.assertTrue(is_near(9, 10, 0.9))
+        self.assertFalse(is_near(8, 10, 0.9))
+        self.assertTrue(is_near(27, 30, 0.9))  # 0.9 * 30 is 27.000000000000004 in floats
+        self.assertFalse(is_near(0, 0, 0.9))
+        self.assertTrue(is_near(10, 10, 1.0))
+        self.assertFalse(is_near(9_999, 10_000, 1.0))
+
+    def test_both_sides_at_threshold(self):
+        p = self.pair(9, 1, 1)
+        self.assertEqual(
+            (p.relation, p.matched_a, p.total_a, p.total_b), (NEAR_IDENTICAL, 9, 10, 10)
+        )
+        self.assertEqual(len(p.runs), 1)
+
+    def test_one_side_below_threshold(self):
+        self.assertEqual(self.pair(9, 1, 2).relation, PARTIAL)  # 9/11 of B
+        self.assertEqual(self.pair(9, 2, 1).relation, PARTIAL)
+
+    def test_custom_threshold_and_disabled(self):
+        self.assertEqual(self.pair(8, 2, 2, near=0.8).relation, NEAR_IDENTICAL)
+        self.assertEqual(self.pair(99, 1, 1, near=1.0).relation, PARTIAL)
+
+    def test_contained_stays_contained(self):
+        self.assertEqual(self.pair(19, 0, 1).relation, A_IN_B)
+        self.assertEqual(self.pair(19, 1, 0).relation, B_IN_A)
+
+
+class TreeTopsTest(unittest.TestCase):
+    def test_strips_common_suffix(self):
+        self.assertEqual(
+            tree_tops("/m/3A/Photography/2025/X", "/m/3B/Photography backups/2025/X", ["/m"]),
+            ("/m/3A/Photography", "/m/3B/Photography backups"),
+        )
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            tree_tops("/m/A/Trips/2019/Hawaii", "/m/B/trips/2019/HAWAII", ["/m"]),
+            ("/m/A", "/m/B"),
+        )
+
+    def test_no_common_suffix(self):
+        self.assertEqual(tree_tops("/m/A/x", "/m/B/y", ["/m"]), ("/m/A/x", "/m/B/y"))
+
+    def test_stops_at_scanned_roots(self):
+        roots = ["/m/3A", "/m/3B"]
+        self.assertEqual(tree_tops("/m/3A/P/x", "/m/3B/P/x", roots), ("/m/3A", "/m/3B"))
+        # /m is not scanned: stop at the roots themselves even though "x" would match.
+        self.assertEqual(tree_tops("/m/a/x", "/m/b/x/x", ["/m/a", "/m/b"]), ("/m/a", "/m/b/x"))
+        self.assertEqual(tree_tops("/m/a/x", "/n/x", ["/m/a", "/n/x"]), ("/m/a/x", "/n/x"))
+
+    def test_ancestor_guard(self):
+        self.assertEqual(
+            tree_tops("/m/3A/Photography/2022", "/m/3A/Dumps/foo/Photography/2022", ["/m/3A"]),
+            ("/m/3A/Photography", "/m/3A/Dumps/foo/Photography"),
+        )
+        self.assertEqual(tree_tops("/x/a", "/x/a/a", ["/"]), ("/x/a", "/x/a/a"))
+        self.assertEqual(tree_tops("/x/p/s", "/y/p/s", ["/x/p", "/y"]), ("/x/p", "/y/p"))
+
+    def test_never_same_folder(self):
+        self.assertEqual(tree_tops("/r/a/s", "/r/A/s", ["/r"]), ("/r/a", "/r/A"))
+
+
+class TreePairsTest(ClosingTest):
+    @staticmethod
+    def photos(root, *, skip=(), extra=()):
+        files = []
+        for sub, numbers in (("2019/Hawaii", range(1, 21)), ("2019/Paris", range(21, 41)),
+                             ("2020/Home", range(41, 61))):  # fmt: skip
+            files += [r for r in imgs(f"{root}/{sub}", numbers) if r.name not in skip]
+        files += imgs(f"{root}/2021/x", range(100, 105)) + imgs(f"{root}/2021/y", range(200, 205))
+        return files + [rec(f"{root}/{d}", n) for d, n in extra]
+
+    def test_near_identical_tree(self):
+        a = self.photos("/d1/Photos", extra=[("2022/Solo", "solo.jpg")])
+        b = self.photos(
+            "/d2/Photo backups", skip={"IMG_0030.JPG"}, extra=[("2020/Home", "new.jpg")]
+        )
+        res = self.fixture(a + b).run(trees=True)
+        kinds = {p.dir_a[len("/d1/Photos/"):]: p.relation for p in res.pairs}
+        self.assertEqual(
+            kinds,
+            {"2019/Hawaii": IDENTICAL, "2019/Paris": B_IN_A, "2020/Home": A_IN_B,
+             "2021": IDENTICAL_TREE},
+        )  # fmt: skip
+        (t,) = res.trees
+        self.assertEqual(
+            (t.dir_a, t.dir_b, t.relation), ("/d1/Photos", "/d2/Photo backups", TREE_NEAR)
+        )
+        self.assertEqual(len(t.members), 4)
+        self.assertEqual(t.folders, 5)  # the 2021 matching tree counts its two folders
+        # A: 20 + 19 + 20 + 10 of 71 (Solo unpaired); B: 20 + 19 + 20 + 10 of 70.
+        self.assertEqual((t.matched_a, t.total_a, t.matched_b, t.total_b), (69, 71, 69, 70))
+        self.assertEqual(t.bytes, 69 * 100)
+
+    def test_classification(self):
+        a = self.photos("/d1/Photos", extra=[("Solo", f"s{i}.jpg") for i in range(30)])
+        res = self.fixture(a + self.photos("/d2/Copy")).run(trees=True)
+        (t,) = res.trees
+        self.assertEqual((t.matched_a, t.total_a, t.matched_b, t.total_b), (70, 100, 70, 70))
+        self.assertEqual(t.relation, "b_mostly_in_a")
+        (t,) = self.fixture(a + self.photos("/d2/Copy")).run(trees=True, near=0.6).trees
+        self.assertEqual(t.relation, TREE_NEAR)
+        b = self.photos("/d2/Copy", extra=[("Solo2", f"t{i}.jpg") for i in range(30)])
+        (t,) = self.fixture(a + b).run(trees=True).trees
+        self.assertEqual(t.relation, TREE_OVERLAP)
+
+    def test_single_pair_trees_not_listed(self):
+        res = self.fixture(imgs("/d1/x", range(3)) + imgs("/d2/x", range(3))).run(trees=True)
+        self.assertEqual(len(res.pairs), 1)
+        self.assertEqual(res.trees, [])
+        self.assertEqual(self.fixture(self.photos("/a") + self.photos("/b")).run().trees, [])
+
+    def test_flipped_orientation(self):
+        # "/m/a b/..." < "/m/a/...", but the tree pair is ("/m/a", "/m/a b").
+        a = imgs("/m/a/x", range(10)) + imgs("/m/a/y", range(10, 20))
+        b = imgs("/m/a b/x", range(8)) + imgs("/m/a b/y", range(10, 20))
+        res = self.fixture(a + b).run(trees=True)
+        self.assertEqual({p.dir_a for p in res.pairs}, {"/m/a b/x", "/m/a b/y"})
+        (t,) = res.trees
+        self.assertEqual((t.dir_a, t.dir_b), ("/m/a", "/m/a b"))
+        self.assertEqual((t.matched_a, t.total_a, t.matched_b, t.total_b), (18, 20, 18, 18))
+        self.assertEqual(t.relation, TREE_NEAR)
+
+    def test_files_counted_once(self):
+        def fp(a, b, matched_a, matched_b, relation=PARTIAL, folders=1):
+            return FolderPair(a, b, (), matched_a, 99, matched_b, 99, matched_a, relation, folders)
+
+        pairs = [
+            fp("/a/T", "/b/T", 10, 10, IDENTICAL_TREE, 3),
+            fp("/a/T/s", "/b/T/s", 5, 5),  # inside the matching tree: already counted
+            fp("/a/U", "/b/U", 4, 4),
+            fp("/a/U", "/b/u", 3, 4),  # same A folder twice: count its larger entry
+        ]
+        totals = {"/a": (14, 0), "/b": (30, 0)}
+        (t,) = tree_pairs(pairs, ["/"], totals.__getitem__)
+        self.assertEqual((t.matched_a, t.total_a, t.matched_b, t.total_b), (14, 14, 18, 30))
+        self.assertEqual((t.folders, t.bytes), (4, 14))
+        (t,) = tree_pairs(pairs, ["/"], {"/a": (12, 0), "/b": (16, 0)}.__getitem__)
+        self.assertEqual((t.matched_a, t.matched_b), (12, 16))  # never above 100%
+
+    def test_totals_called_once_per_dir(self):
+        calls = []
+        skip = {"IMG_0030.JPG"}
+        q = self.photos("/d2/Q", skip=skip)
+        fx = self.fixture(self.photos("/d1/P") + q + self.photos("/d3/R"))
+
+        def totals(d):
+            calls.append(d)
+            return fx.idx.totals([d])
+
+        trees = tree_pairs(fx.run().pairs, ["/"], totals)
+        # P ≡ R rolls up into one matching tree; P ↔ Q and Q ↔ R share Q's total.
+        self.assertEqual(
+            {(t.dir_a, t.dir_b) for t in trees}, {("/d1/P", "/d2/Q"), ("/d2/Q", "/d3/R")}
+        )
+        self.assertEqual(sorted(calls), ["/d1/P", "/d2/Q", "/d3/R"])
+
+    def test_root_boundary(self):
+        a = self.photos("/d1/Photos", skip={"IMG_0030.JPG"})
+        res = self.fixture(a + self.photos("/d2/Photos")).run(
+            trees=True, roots=["/d1/Photos/2019", "/d1/Photos/2020", "/d2"]
+        )
+        tops = {(t.dir_a, t.dir_b) for t in res.trees}
+        self.assertEqual(tops, {("/d1/Photos/2019", "/d2/Photos/2019")})
+        (t,) = res.trees
+        self.assertEqual(t.relation, TREE_NEAR)
+        self.assertNotEqual(t.relation, TREE_A_MOSTLY_IN_B)
 
 
 class ScannedTreeTest(unittest.TestCase):

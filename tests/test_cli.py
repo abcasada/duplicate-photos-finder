@@ -78,6 +78,32 @@ class CliTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "the index"):
                 main(["--db", os.path.join(self.tmp, "same-drive", "i.db"), "scan", self.drives])
 
+    def test_tree_overview_and_near_flags(self):
+        for d, names in (("one/T/a", "abcde"), ("one/T/b", "fghij"), ("two/U/a", "abcde"),
+                         ("two/U/b", "fghi")):  # fmt: skip
+            os.makedirs(os.path.join(self.drives, d))
+            for n in names:
+                path = os.path.join(self.drives, d, f"{n}.jpg")
+                with open(path, "wb") as fh:
+                    fh.write(b"y")
+                os.utime(path, (1_600_000_000, 1_600_000_000))
+        code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("Tree overview: 1 tree pair", out)
+        self.assertIn("(near-identical trees: 90% / 100%, 2 folder pairs, 9 files)", out)
+        self.assertIn("(in T1)", out)
+        with open(os.path.join(self.out, "report.json")) as fh:
+            self.assertEqual(len(json.load(fh)["trees"]), 1)
+        code, out, _ = self.run_cli(
+            "find", "-q", "--no-scan", "--near", "1", "--tree-top", "0", "-o", self.out, self.drives
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("Tree overview", out)
+        self.assertIn("B is fully contained in A)", out)
+        for bad in ("0", "1.5", "90%"):
+            with self.assertRaises(SystemExit):
+                self.run_cli("find", "-q", "--near", bad, self.drives)
+
     def test_content_mode_not_yet_available(self):
         code, _, err = self.run_cli("find", "-q", "-m", "2", "-o", self.out, self.drives)
         self.assertEqual(code, 2)

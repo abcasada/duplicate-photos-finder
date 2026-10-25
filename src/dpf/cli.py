@@ -9,7 +9,8 @@ import time
 
 from dpf import __version__
 from dpf.index import Index, default_db_path
-from dpf.report import format_text, human_bytes, write_csv, write_json
+from dpf.grouping import DEFAULT_NEAR
+from dpf.report import TREE_TOP, format_text, human_bytes, write_csv, write_json
 
 MODES = {"1": "name", "name": "name", "2": "content", "content": "content", "3": "both", "both": "both"}
 MODE_TITLES = {
@@ -70,10 +71,29 @@ def _build_parser() -> argparse.ArgumentParser:
         help="sequences listed per folder pair before summarising (default: 8)",
     )  # fmt: skip
     f.add_argument(
+        "--near", type=_fraction, default=DEFAULT_NEAR, metavar="FRACTION",
+        help="call folders/trees near-identical when at least this share of each side "
+        f"matched; 1 disables (default: {DEFAULT_NEAR:g})",
+    )  # fmt: skip
+    f.add_argument(
+        "--tree-top", type=int, default=TREE_TOP, metavar="N",
+        help=f"tree pairs shown in the tree overview; 0 hides it (default: {TREE_TOP})",
+    )  # fmt: skip
+    f.add_argument(
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
     )  # fmt: skip
     return p
+
+
+def _fraction(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        value = -1.0
+    if not 0 < value <= 1:
+        raise argparse.ArgumentTypeError(f"expected a fraction in (0, 1], got {text!r}")
+    return value
 
 
 def _progress_printer(quiet: bool):
@@ -186,7 +206,10 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
             ignore_mtime=args.ignore_mtime,
         )
     )  # fmt: skip
-    result = group_duplicates(groups, idx.list_dir, idx.subdirs, idx.dir_extras, roots=roots)
+    result = group_duplicates(
+        groups, idx.list_dir, idx.subdirs, idx.dir_extras,
+        roots=roots, near=args.near, tree_totals=lambda d: idx.totals([d]),
+    )  # fmt: skip
     files, nbytes = idx.totals(roots)
 
     os.makedirs(out, exist_ok=True)
@@ -205,7 +228,10 @@ def _find(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         "json_path": json_path,
     }
     write_json(result, summary, json_path)
-    text = format_text(result, summary, top=args.top, min_files=args.min_files, max_runs=args.max_runs)
+    text = format_text(
+        result, summary,
+        top=args.top, min_files=args.min_files, max_runs=args.max_runs, tree_top=args.tree_top,
+    )  # fmt: skip
     with open(text_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     print(text, end="" if text.endswith("\n") else "\n")

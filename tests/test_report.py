@@ -45,8 +45,26 @@ def build():
     return group(groups, idx, ["/drives"]), groups
 
 
-def group(groups, idx, roots=("/",)):
-    return group_duplicates(groups, idx.list_dir, idx.subdirs, idx.dir_extras, roots=roots)
+def group(groups, idx, roots=("/",), **kw):
+    return group_duplicates(groups, idx.list_dir, idx.subdirs, idx.dir_extras, roots=roots, **kw)
+
+
+def build_trees():
+    """Two near-identical trees, plus a smaller pair of trees that overlap a little."""
+    records = []
+    for root, skip in (("/d1/Photos", None), ("/d2/Photo backups", "IMG_0030.JPG")):
+        for i, sub in enumerate(("2019/Hawaii", "2019/Paris", "2020/Home")):
+            records += [
+                r for r in imgs(f"{root}/{sub}", range(i * 20, i * 20 + 20), 1_000_000)
+                if r.name != skip
+            ]
+    records += imgs("/d1/Misc/a", range(500, 510)) + imgs("/d2/Old/a", range(500, 503))
+    records += imgs("/d1/Misc/b", range(600, 610)) + imgs("/d2/Old/b", range(600, 603))
+    records += imgs("/d1/Misc/c", range(700, 790))
+    idx = Index(":memory:")
+    idx.replace_root("/", records)
+    with idx:
+        return group(by_name(records), idx, tree_totals=lambda d: idx.totals([d]))
 
 
 class HumanBytesTest(unittest.TestCase):
@@ -127,6 +145,62 @@ class TextReportTest(unittest.TestCase):
             text,
         )
 
+    def test_near_identical_labels(self):
+        records = imgs("/a", range(20)) + imgs("/b", list(range(19)) + [900])
+        records += imgs("/c", range(100, 120)) + imgs("/d", range(100, 119))
+        idx = Index(":memory:")
+        self.addCleanup(idx.close)
+        idx.replace_root("/", records)
+        text = format_text(group(by_name(records), idx), SUMMARY)
+        self.assertIn(
+            "/a  ↔  /b   (near-identical: 95% / 95%; 1 file only in A, 1 only in B)", text
+        )
+        self.assertIn("IMG_0000.JPG … IMG_0018.JPG  19 files", text)
+        self.assertIn(
+            "/c  ↔  /d   (B is fully contained in A; near-identical: 95% / 100%, "
+            "1 file only in A)",
+            text,
+        )
+        text = format_text(group(by_name(records), idx, near=1.0), SUMMARY)
+        self.assertIn("/a  ↔  /b   (partial overlap)", text)
+        self.assertIn("/c  ↔  /d   (B is fully contained in A)\n", text)
+
+    def test_tree_overview(self):
+        text = format_text(build_trees(), SUMMARY)
+        overview = text[text.index("Tree overview") : text.index("Folder pairs sharing")]
+        self.assertIn("Tree overview: 2 tree pairs holding several folder pairs", overview)
+        self.assertIn("near-identical = at least 90% of both", overview)
+        self.assertIn(
+            "[T1]   59.0 MB  /d1/Photos  ↔  /d2/Photo backups   "
+            "(near-identical trees: 98% / 100%, 3 folder pairs, 59 files)\n"
+            "       covers 98% of A (59/60), 100% of B (59/59)\n",
+            overview,
+        )
+        self.assertIn(
+            "[T2]     600 B  /d1/Misc  ↔  /d2/Old   "
+            "(B within A: 5% / 100%, 2 folder pairs, 6 files)\n"
+            "       covers 5% of A (6/110), 100% of B (6/6)\n",
+            overview,
+        )
+        details = text[text.index("Folder pairs sharing") :]
+        self.assertIn("/d1/Photos/2019/Paris  ↔  /d2/Photo backups/2019/Paris", details)
+        self.assertIn(
+            "(B is fully contained in A; near-identical: 95% / 100%, 1 file only in A)  (in T1)",
+            details,
+        )
+        self.assertIn("/d1/Misc/a  ↔  /d2/Old/a   (B is fully contained in A)  (in T2)", details)
+
+    def test_tree_top(self):
+        result = build_trees()
+        text = format_text(result, SUMMARY, tree_top=1)
+        self.assertIn("[T1]", text)
+        self.assertNotIn("[T2]", text)
+        self.assertNotIn("(in T2)", text)
+        self.assertIn("… 1 more tree pair not shown (tree top 1)", text)
+        text = format_text(result, SUMMARY, tree_top=0)
+        self.assertNotIn("Tree overview", text)
+        self.assertNotIn("(in T", text)
+
     def test_no_duplicates(self):
         result = group_duplicates([], lambda d: [], lambda d: [], lambda d: (0, 0), roots=["/"])
         text = format_text(result, {**SUMMARY, "elapsed": 3725.0})
@@ -159,6 +233,22 @@ class FileOutputTest(unittest.TestCase):
             sorted(f["path"] for f in data["same_folder"][0]["files"]),
             ["/drives/one/Phone/PXL_1 (1).jpg", "/drives/one/Phone/PXL_1.jpg"],
         )
+
+    def test_json_trees(self):
+        result = build_trees()
+        path = os.path.join(self.tmp.name, "t.json")
+        write_json(result, SUMMARY, path)
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertEqual(data["near"], 0.9)
+        t = data["trees"][0]
+        self.assertEqual((t["dir_a"], t["dir_b"]), ("/d1/Photos", "/d2/Photo backups"))
+        self.assertEqual(t["relation"], "near_identical")
+        counts = (t["matched_a"], t["total_a"], t["matched_b"], t["total_b"])
+        self.assertEqual(counts, (59, 60, 59, 59))
+        self.assertEqual((t["folders"], len(t["members"]), t["bytes"]), (3, 3, 59_000_000))
+        self.assertIn(["/d1/Photos/2019/Paris", "/d2/Photo backups/2019/Paris"], t["members"])
+        self.assertEqual(data["trees"][1]["relation"], "b_mostly_in_a")
 
     def test_csv_round_trip(self):
         mtime = 1_700_000_000.0
