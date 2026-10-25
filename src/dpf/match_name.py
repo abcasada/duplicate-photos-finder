@@ -18,11 +18,15 @@ def _basis(ignore_size: bool, ignore_mtime: bool) -> str:
 
 
 def _mtime_clusters(files: list[FileRecord], tolerance: float) -> Iterator[list[FileRecord]]:
-    """Single-linkage clusters: a gap larger than `tolerance` starts a new cluster."""
+    """Split by mtime so every file is within `tolerance` of its cluster's earliest file.
+
+    Anchoring on the earliest file (rather than chaining neighbours) guarantees no two
+    files in a cluster differ by more than the tolerance.
+    """
     files = sorted(files, key=lambda f: f.mtime)
     cluster = [files[0]]
-    for prev, cur in zip(files, files[1:]):
-        if cur.mtime - prev.mtime > tolerance:
+    for cur in files[1:]:
+        if cur.mtime - cluster[0].mtime > tolerance:
             yield cluster
             cluster = []
         cluster.append(cur)

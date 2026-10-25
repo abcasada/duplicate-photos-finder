@@ -38,20 +38,16 @@ class MatchNameTest(unittest.TestCase):
         self.assertEqual(len(self.groups(records, mtime_tolerance=5.0)), 1)
         self.assertEqual(self.groups(records, mtime_tolerance=0.0), [])
 
-    def test_single_linkage_chains(self):
+    def test_clusters_do_not_chain_beyond_tolerance(self):
         records = [
             rec("/r/a", "x.jpg", mtime=T),
             rec("/r/b", "x.jpg", mtime=T + 1.5),
-            rec("/r/c", "x.jpg", mtime=T + 3.0),  # 3 s from a, but chained through b
-            rec("/r/d", "x.jpg", mtime=T + 10.0),
-            rec("/r/e", "x.jpg", mtime=T + 11.0),
-            rec("/r/f", "x.jpg", mtime=T + 20.0),  # alone
+            rec("/r/c", "x.jpg", mtime=T + 3.0),  # within 2 s of b, but 3 s from a
+            rec("/r/d", "x.jpg", mtime=T + 4.0),
+            rec("/r/e", "x.jpg", mtime=T + 20.0),  # alone
         ]
         got = sorted(paths for _, paths in self.groups(records))
-        self.assertEqual(
-            got,
-            [["/r/a/x.jpg", "/r/b/x.jpg", "/r/c/x.jpg"], ["/r/d/x.jpg", "/r/e/x.jpg"]],
-        )
+        self.assertEqual(got, [["/r/a/x.jpg", "/r/b/x.jpg"], ["/r/c/x.jpg", "/r/d/x.jpg"]])
 
     def test_files_sorted_by_path_not_mtime(self):
         records = [rec("/r/z", "x.jpg", mtime=T), rec("/r/a", "x.jpg", mtime=T + 1)]
