@@ -9,6 +9,7 @@ from xml.etree import ElementTree
 
 from dpf.grouping import A_IN_B, NEAR_IDENTICAL, PARTIAL, FolderPair, GroupingResult, Run
 from dpf.models import DuplicateGroup
+from dpf.report import OFFLINE_NOTE
 from dpf.xlsx_report import SHEETS, write_xlsx
 
 from tests.test_grouping import rec
@@ -111,6 +112,27 @@ class XlsxReportTest(unittest.TestCase):
         self.assertEqual(wb.links("Files"), [])
         same = wb.cells("Same folder")
         self.assertEqual((same["A2"], same["B2"], same["D2"]), ("/drives/one/Phone", 1, 1_000))
+
+    def test_summary_root_status(self):
+        status = [
+            {"root": "/drives/one", "status": "scanned now", "connected": True,
+             "scanned_at": 1.0, "files": 1, "bytes": 2},
+            {"root": "/drives/two", "status": "from index", "connected": False,
+             "scanned_at": None, "files": 3, "bytes": 4},
+        ]  # fmt: skip
+        wb = self.write(build()[0], summary={**SUMMARY, "root_status": status})
+        cells = wb.cells("Summary")
+        roots = [k for k, v in cells.items() if v == "Roots"]
+        self.assertEqual(len(roots), 1)
+        row = int(roots[0][1:])
+        self.assertEqual(cells[f"B{row}"], "/drives/one   (scanned now)")
+        self.assertEqual(
+            cells[f"B{row + 1}"], "/drives/two   (from index, date unknown, not connected)"
+        )
+        self.assertEqual(cells[f"B{row + 2}"], OFFLINE_NOTE)
+        wb = self.write(build()[0])
+        self.assertNotIn(OFFLINE_NOTE, wb.strings)
+        self.assertIn("/drives/two", wb.strings)
 
     def test_trees_and_tags(self):
         wb = self.write(build_trees())

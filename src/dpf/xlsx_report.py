@@ -29,12 +29,15 @@ from dpf.grouping import (
 )
 from dpf.models import DuplicateGroup
 from dpf.report import (
+    OFFLINE_NOTE,
     PAIR_LABELS,
+    any_offline,
     duration,
     floor_percent,
     human_bytes,
     pair_label,
     plural,
+    root_lines,
     run_lines,
     same_folder_stats,
     tree_label,
@@ -107,6 +110,7 @@ class _Formats:
         self.tree = add(num_format='"T"0')
         self.date = add(num_format="yyyy-mm-dd hh:mm:ss")
         self.amber = add(num_format="#,##0", bg_color=AMBER, font_color="#9C5700")
+        self.warning = add(font_color="#9C5700", bold=True)
         self.fills = {c: add(bg_color=c) for c in (GREEN, LIGHT_GREEN, LIGHT_BLUE)}
         self.title = add(bold=True, font_size=14)
         self.bold = add(bold=True)
@@ -393,9 +397,10 @@ def _summary(ws, fmt: _Formats, result: GroupingResult, summary: dict, tables) -
     row += 2
     line("Mode", str(summary.get("mode", "?")))
     line("Matched on", str(summary.get("basis", "?")))
-    roots = summary.get("roots") or []
-    for i, root in enumerate(roots):
+    for i, root in enumerate(root_lines(summary, align=False)):
         line("Roots" if i == 0 else "", root)
+    if any_offline(summary):
+        line("", OFFLINE_NOTE, fmt.warning)
     line("Files scanned", summary.get("files", 0))
     line("Total size", summary.get("bytes", 0), fmt.left_size)
     line("Duplicate groups", result.groups)

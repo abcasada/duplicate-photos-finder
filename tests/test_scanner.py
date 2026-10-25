@@ -6,7 +6,7 @@ from unittest import mock
 
 from dpf import scanner
 from dpf.index import Index
-from dpf.scanner import normalize_roots, scan_roots, walk
+from dpf.scanner import drop_nested, normalize_roots, scan_roots, split_roots, walk
 
 
 def touch(path, data=b"", mtime=None):
@@ -49,6 +49,20 @@ class NormalizeRootsTest(TempTree):
             normalize_roots([self.p("missing")])
         with self.assertRaisesRegex(ValueError, "not an existing directory"):
             normalize_roots([self.p("f.jpg")])
+
+    def test_split_roots(self):
+        os.makedirs(self.p("real"))
+        touch(self.p("f.jpg"))
+        os.symlink(self.p("gone"), self.p("dangling"))
+        online, missing = split_roots([self.p("real"), self.p("missing"), self.p("dangling")])
+        self.assertEqual(online, [self.p("real")])
+        self.assertEqual(missing, [self.p("missing"), self.p("dangling")])
+        with self.assertRaisesRegex(ValueError, "not an existing directory"):
+            split_roots([self.p("f.jpg")])
+
+    def test_drop_nested(self):
+        self.assertEqual(drop_nested(["/m/b/c", "/m/a/", "/m/b", "/m/a", "/m/a-x"]),
+                         ["/m/a", "/m/a-x", "/m/b"])  # fmt: skip
 
 
 class WalkTest(TempTree):

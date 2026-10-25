@@ -8,7 +8,14 @@ from datetime import datetime
 from dpf.grouping import group_duplicates
 from dpf.index import Index
 from dpf.models import DuplicateGroup, FileRecord
-from dpf.report import format_text, human_bytes, write_csv, write_json
+from dpf.report import (
+    OFFLINE_NOTE,
+    format_text,
+    human_bytes,
+    root_lines,
+    write_csv,
+    write_json,
+)
 
 from tests.test_grouping import by_name, imgs, rec
 
@@ -203,6 +210,38 @@ class TextReportTest(unittest.TestCase):
         text = format_text(result, SUMMARY, tree_top=0)
         self.assertNotIn("Tree overview", text)
         self.assertNotIn("(in T", text)
+
+    def test_root_status(self):
+        when = datetime(2026, 10, 24, 21, 43).timestamp()
+        status = [
+            {"root": "/drives/one", "status": "scanned now", "connected": True,
+             "scanned_at": when + 60, "files": 1, "bytes": 2},
+            {"root": "/drives/two-long", "status": "from index", "connected": False,
+             "scanned_at": when, "files": 3, "bytes": 4},
+            {"root": "/drives/sub", "status": "from index", "connected": True,
+             "scanned_at": None, "files": 0, "bytes": 0},
+        ]  # fmt: skip
+        text = format_text(self.result, {**SUMMARY, "root_status": status})
+        self.assertIn(
+            "Roots:       /drives/one        (scanned now)\n"
+            "             /drives/two-long   "
+            "(from index, scanned 2026-10-24 21:43, not connected)\n"
+            "             /drives/sub        (from index, date unknown)\n"
+            f"             {OFFLINE_NOTE}\n"
+            "Scanned:",
+            text,
+        )
+        status[1]["connected"] = True
+        text = format_text(self.result, {**SUMMARY, "root_status": status})
+        self.assertNotIn(OFFLINE_NOTE, text)
+        self.assertEqual(
+            root_lines({"root_status": status[:2]}, align=False),
+            [
+                "/drives/one   (scanned now)",
+                "/drives/two-long   (from index, scanned 2026-10-24 21:43)",
+            ],
+        )
+        self.assertEqual(root_lines(SUMMARY), SUMMARY["roots"])
 
     def test_no_duplicates(self):
         result = group_duplicates([], lambda d: [], lambda d: [], lambda d: (0, 0), roots=["/"])

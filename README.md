@@ -68,7 +68,40 @@ dpf find --mode 1 --ignore-size /run/media/adam/Storage\ 3B*
 
 # Just build/refresh the index
 dpf scan /run/media/adam/Storage\ 1TB
+
+# What's in the index, and which of those drives are plugged in
+dpf drives
 ```
+
+### More drives than you can connect at once
+
+The index keeps every drive you have scanned, so drives can be scanned a few at a time
+and compared together afterwards:
+
+```sh
+# Batch 1: plug in two drives, index them, unplug them
+dpf scan /run/media/adam/Storage\ 1A* /run/media/adam/Storage\ 2A*
+# Batch 2: the next ones
+dpf scan /run/media/adam/Storage\ 3A* /run/media/adam/Storage\ 1TB
+
+# Compare all of them. Connected drives are rescanned, unplugged ones come from the index
+dpf find --mode 1 /run/media/adam/Storage\ {1TB,1A,2A,3A}*
+```
+
+Shell globs only match drives that are mounted, so spell out the paths of unplugged drives
+(`"/run/media/adam/Storage 2A 8TB"`), or copy them from `dpf drives`. For each one `find`
+prints `using index for … (not connected; last scanned …)`, and the report header shows
+per drive whether it was *scanned now* or taken *from index*, with the date of that scan.
+Folder links in the report point at the drive's mount path, so they only open once it is
+plugged in again. `--no-scan` takes every drive from the index, connected or not. A path
+that is neither connected nor in the index is an error, and `dpf scan` refuses paths that
+are not connected.
+
+Drives are identified by their **mount path**, which on most desktops comes from the drive
+label (`/run/media/<user>/<label>`). A drive mounted at a different path, e.g. after
+relabelling it, counts as a different drive: scan it under its new path, then remove the
+old entry with `dpf drives --forget "/run/media/adam/Old label"`. `--forget` only edits the
+index (never the drive) and needs a path exactly as `dpf drives` lists it.
 
 Each `find` writes these files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out DIR`):
 

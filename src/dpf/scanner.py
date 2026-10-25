@@ -25,14 +25,34 @@ Progress = Callable[[str, int, int], None]
 
 def normalize_roots(paths: Iterable[str]) -> list[str]:
     """Resolve, validate and dedupe roots, dropping any nested inside another root."""
-    resolved = set()
+    online, missing = split_roots(paths)
+    if missing:
+        raise ValueError(f"not an existing directory: {missing[0]}")
+    return drop_nested(online)
+
+
+def split_roots(paths: Iterable[str]) -> tuple[list[str], list[str]]:
+    """(resolved existing directories, paths that do not exist, as given).
+
+    Raises ValueError for a path that exists but is not a directory. Missing paths may
+    be unplugged drives whose data is still in the index (see Index.indexed).
+    """
+    online, missing = [], []
     for p in paths:
         real = os.path.realpath(p)
-        if not os.path.isdir(real):
+        if os.path.isdir(real):
+            online.append(real)
+        elif os.path.exists(real):
             raise ValueError(f"not an existing directory: {p}")
-        resolved.add(real)
+        else:
+            missing.append(p)
+    return online, missing
+
+
+def drop_nested(paths: Iterable[str]) -> list[str]:
+    """Sorted, deduplicated `paths`, dropping any nested inside another."""
     roots: list[str] = []
-    for r in sorted(resolved):
+    for r in sorted({p.rstrip("/") or "/" for p in paths}):
         if not any(_within(r, kept) for kept in roots):
             roots.append(r)
     return roots

@@ -62,6 +62,47 @@ def plural(n: int, word: str) -> str:
 
 
 
+SCANNED_NOW = "scanned now"
+FROM_INDEX = "from index"
+OFFLINE_NOTE = (
+    "Some drives are not connected: their folder links won't open until they are plugged in."
+)
+
+
+def scan_date(scanned_at: float | None) -> str:
+    """Local "YYYY-MM-DD HH:MM", or "date unknown"."""
+    if scanned_at is None:
+        return "date unknown"
+    return datetime.fromtimestamp(scanned_at).strftime("%Y-%m-%d %H:%M")
+
+
+def root_status_label(entry: dict) -> str:
+    """E.g. "scanned now" or "from index, scanned 2026-10-24 21:43, not connected"."""
+    if entry.get("status") == SCANNED_NOW:
+        return SCANNED_NOW
+    when = entry.get("scanned_at")
+    text = f"{FROM_INDEX}, " + ("date unknown" if when is None else f"scanned {scan_date(when)}")
+    if not entry.get("connected", True):
+        text += ", not connected"
+    return text
+
+
+def root_lines(summary: dict, *, align: bool = True) -> list[str]:
+    """One line per root with where its data came from (summary["root_status"]).
+
+    Falls back to the bare summary["roots"] for summaries without root_status.
+    """
+    status = summary.get("root_status")
+    if not status:
+        return list(summary.get("roots") or [])
+    width = max(len(e["root"]) for e in status) if align else 0
+    return [f"{e['root']:<{width}}   ({root_status_label(e)})" for e in status]
+
+
+def any_offline(summary: dict) -> bool:
+    return any(not e.get("connected", True) for e in summary.get("root_status") or [])
+
+
 def floor_percent(part: int, whole: int) -> int:
     """Whole percent, rounded down so that 100 always means every file (0 if `whole` is 0)."""
     return part * 100 // whole if whole > 0 else 0
@@ -267,10 +308,11 @@ def format_text(
     A tree overview of up to `tree_top` tree pairs precedes the folder pairs.
     """
     out: list[str] = ["dpf duplicate report", ""]
-    roots = summary.get("roots") or []
     out.append(f"Mode:        {summary.get('mode', '?')}; matched on {summary.get('basis', '?')}")
-    for i, root in enumerate(roots):
-        out.append(f"{'Roots:' if i == 0 else '':<13}{root}")
+    for i, line in enumerate(root_lines(summary)):
+        out.append(f"{'Roots:' if i == 0 else '':<13}{line}")
+    if any_offline(summary):
+        out.append(f"{'':<13}{OFFLINE_NOTE}")
     out.append(
         f"Scanned:     {plural(summary.get('files', 0), 'file')}, "
         f"{human_bytes(summary.get('bytes', 0))}"

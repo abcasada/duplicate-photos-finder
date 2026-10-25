@@ -125,6 +125,47 @@ class IndexTest(unittest.TestCase):
         self.assertEqual(self.idx.subdirs("/a"), [])
         self.assertEqual(self.idx.dir_extras("/b"), (3, 0))
 
+    def test_roots_and_containing_root(self):
+        self.idx.replace_root("/m/B", [rec("/m/B", "x.jpg")], errors=3)
+        self.idx.replace_root("/m/A", [rec("/m/A/s", "x.jpg", 7)])
+        self.assertEqual([r.root for r in self.idx.roots()], ["/m/A", "/m/B"])
+        self.assertEqual(self.idx.roots()[1].errors, 3)
+        self.assertEqual(self.idx.containing_root("/m/A/s/deep").root, "/m/A")
+        self.assertEqual(self.idx.containing_root("/m/A/").root, "/m/A")
+        self.assertIsNone(self.idx.containing_root("/m/A-old"))
+        self.assertIsNone(self.idx.containing_root("/m"))
+
+    def test_indexed(self):
+        self.idx.replace_root("/m/A", [rec("/m/A/s", "x.jpg")])
+        self.idx.replace_root("/m/empty", [])
+        for path in ("/m/A", "/m/A/s", "/m/empty", "/m"):
+            self.assertTrue(self.idx.indexed(path), path)
+        for path in ("/m/A/t", "/m/A-old", "/n"):
+            self.assertFalse(self.idx.indexed(path), path)
+
+    def test_rescan_supersedes_nested_roots(self):
+        self.idx.replace_root("/m/A/s", [rec("/m/A/s", "x.jpg")])
+        self.idx.replace_root("/m/A-old", [rec("/m/A-old", "x.jpg")])
+        self.idx.begin_root("/m/A")
+        self.idx.finish_root("/m/A")
+        self.assertEqual([r.root for r in self.idx.roots()], ["/m/A", "/m/A-old"])
+
+    def test_forget_root(self):
+        self.idx.replace_root(
+            "/m/A", [rec("/m/A", "1.jpg"), rec("/m/A/s", "2.jpg")], dir_stats={"/m/A/s": (1, 0)}
+        )
+        self.idx.replace_root("/m/A 2", [rec("/m/A 2", "1.jpg")], dir_stats={"/m/A 2": (1, 0)})
+        self.idx.begin_root("/m/A")
+        self.idx.add_records([rec("/m/A", "staged.jpg")])
+        self.assertEqual(self.idx.forget_root("/m/A/"), 2)
+        self.assertEqual([r.root for r in self.idx.roots()], ["/m/A 2"])
+        self.assertEqual(self.idx.totals(["/m/A"]), (0, 0))
+        self.assertEqual(self.idx.dir_extras("/m/A/s"), (0, 0))
+        self.assertEqual(self.idx.conn.execute("SELECT count(*) FROM staging").fetchone()[0], 0)
+        self.assertEqual(self.idx.totals(["/m/A 2"])[0], 1)
+        self.assertEqual(self.idx.dir_extras("/m/A 2"), (1, 0))
+        self.assertEqual(self.idx.forget_root("/m/A"), 0)
+
 
 class IndexFileTest(unittest.TestCase):
     def setUp(self):

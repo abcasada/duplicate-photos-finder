@@ -89,6 +89,16 @@ def _prefix_clause(roots: Sequence[str]) -> tuple[str, list[str]]:
     return "(" + " OR ".join(parts) + ")", params
 
 
+def _subtree_range(root: str) -> tuple[str, str]:
+    """Bounds of the paths strictly beneath `root` (see _prefix_clause)."""
+    root = root.rstrip("/")
+    return root + "/", root + "0"
+
+
+def _within(path: str, root: str) -> bool:
+    return root == "/" or path == root or path.startswith(root + "/")
+
+
 def _row(r: FileRecord) -> tuple:
     return (r.dir, r.name, name_key(r.name), r.size, r.mtime, r.kind)
 
@@ -152,10 +162,7 @@ class Index:
                 files += len(batch)
                 total += sum(r.size for r in batch)
             stats = RootStats(root, files, total, time.time(), errors)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",
-                (root, files, total, errors, stats.scanned_at),
-            )
+            self._set_root(stats)
         return stats
 
     # Streaming replacement: records for several roots may arrive interleaved. They
@@ -195,11 +202,35 @@ class Index:
             self.conn.execute(f"INSERT INTO files SELECT * FROM staging WHERE {where}", params)
             self.conn.execute(f"DELETE FROM staging WHERE {where}", params)
             stats = RootStats(root, files, total, time.time(), errors)
-            self.conn.execute(
-                "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",
-                (root, files, total, errors, stats.scanned_at),
-            )
+            self._set_root(stats)
         return stats
+
+    def _set_root(self, stats: RootStats) -> None:
+        """Record `stats`; rows of roots nested inside it are superseded by its data."""
+        self.conn.execute(
+            "DELETE FROM roots WHERE path >= ? AND path < ?", _subtree_range(stats.root)
+        )
+        self.conn.execute(
+            "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",
+            (stats.root, stats.files, stats.bytes, stats.errors, stats.scanned_at),
+        )
+
+    def forget_root(self, root: str) -> int:
+        """Remove everything indexed at or under `root` (files, dirs, staging, roots rows).
+
+        Only the index is touched. Returns the number of files removed.
+        """
+        root = root.rstrip("/") or "/"
+        where, params = _prefix_clause([root])
+        with self.conn:
+            removed = self.conn.execute(f"DELETE FROM files WHERE {where}", params).rowcount
+            for table in ("dirs", "staging"):
+                self.conn.execute(f"DELETE FROM {table} WHERE {where}", params)
+            self.conn.execute(
+                "DELETE FROM roots WHERE path = ? OR (path >= ? AND path < ?)",
+                (root, *_subtree_range(root)),
+            )
+        return removed
 
     def _replace_dirs(self, where: str, params: list[str], dir_stats: DirStats | None) -> None:
         self.conn.execute(f"DELETE FROM dirs WHERE {where}", params)
@@ -217,6 +248,23 @@ class Index:
             (root.rstrip("/") or "/",),
         ).fetchone()
         return RootStats(*row) if row else None
+
+    def roots(self) -> list[RootStats]:
+        """Every scanned root, sorted by path."""
+        rows = self.conn.execute(
+            "SELECT path, files, bytes, scanned_at, errors FROM roots ORDER BY path"
+        )
+        return [RootStats(*r) for r in rows]
+
+    def containing_root(self, path: str) -> RootStats | None:
+        """The innermost scanned root that is `path` or contains it."""
+        path = path.rstrip("/") or "/"
+        found = [r for r in self.roots() if _within(path, r.root)]
+        return max(found, key=lambda r: len(r.root)) if found else None
+
+    def indexed(self, path: str) -> bool:
+        """True if `path` was scanned as a root or has indexed files under it."""
+        return self.root_stats(path) is not None or self.totals([path])[0] > 0
 
     def totals(self, roots: Sequence[str]) -> tuple[int, int]:
         """(file count, total bytes) indexed under `roots`."""
