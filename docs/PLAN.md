@@ -97,6 +97,23 @@ Same-folder duplicates: 213 groups (see CSV)
 - Mode 3 runs mode 1, prints that report, then runs mode 2. Whether mode 2 checks only mode-1 candidates or does a full scan will be decided in Phase 2.
 - `--date-source exif` uses exiftool `-stay_open` for capture dates.
 
+## Speed (user priority for all modes; Ryzen 5 3600, 6 cores / 12 threads, 31 GB RAM)
+Measured on 2026-10-24: a full mode 1 scan of all 5 drives found **464,247 media files
+(25.9 TB) in 35.6 s**. Each drive gets its own walker thread, and drives run in parallel; the
+slowest drive was Storage 1A, with 205k files in 35 s. Mode 1 is therefore not a bottleneck.
+Spot benchmarks with 2–8 threads per HDD gave inconsistent gains of up to about 2×, so
+in-device walker threads are deferred.
+
+Mode 2 is I/O-bound: reading every byte would take around 12 h, set by the largest 8 TB HDD at
+roughly 180 MB/s. The design rules:
+1. **Read only possible duplicates.** For exact matching, rmlint hashes only files whose size
+   matches another file, and it reads partial hashes before full ones.
+2. **One sequential reader per HDD, all drives in parallel.** Concurrent reads on one
+   spinning disk destroy throughput. The CPU threads are for hashing and decoding.
+3. **Mode 3 can limit mode 2 to the mode 1 candidates**, as a fast confirmation pass.
+4. **Use persistent caches** (czkawka's hash cache, rmlint JSON / `--replay`) so reruns are
+   cheap.
+
 ## Safety constraints
 - **Never write to the scanned drives.** The index, cache and reports all go under `~/.cache/dpf` or `--out`.
 - No rmlint `--xattr` and no generated delete scripts.
