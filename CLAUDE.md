@@ -102,7 +102,7 @@ Data flows **scan → index → match → group → report**.
 Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
 `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out`).
 
-## Current status (2026-10-25)
+## Current status (2026-10-26)
 
 **Done, on `main`, pushed to github.com/abcasada/duplicate-photos-finder.**
 
@@ -138,10 +138,10 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
   (`; similar names` in the text label, "Names" column in xlsx). Real data (2026-10-26):
   pool A 4,689 → 5,843 runs, with 1,429 previously hidden unmatched files now named in
   37 runs; pool B 293 runs, 789 files named in 9 runs. Group sets did not change.
-- **Index schema v3** (`match_key` column) migrated in place on the real index on
-  2026-10-25. A pre-migration copy is at `~/.cache/dpf/index.v2-backup-20261025.db`;
-  delete it once v3 has proven fine. **Schema v4** recomputes `match_key` (neutral-text
-  rule); the real index migrates in place on the next dpf run.
+- **Index schema v4** (v3 added `match_key`; v4 recomputed it with the neutral-text rule)
+  is migrated in place on the real index (2026-10-26, all 549,217 rows kept). Backups
+  taken before each migration: `~/.cache/dpf/index.v2-backup-20261025.db` and
+  `~/.cache/dpf/index.v3-backup-20261026.db`. Delete them once v4 has proven fine.
 - **Empty or unreadable mount folders:** a root that lists no entries at all, or cannot
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.
