@@ -67,6 +67,12 @@ def _build_parser() -> argparse.ArgumentParser:
     common.add_argument(
         "--all-files", action="store_true", help="index every file, not just photos/videos"
     )
+    common.add_argument(
+        "--allow-empty", action="store_true",
+        help="accept a scan that finds a previously indexed drive/folder completely empty "
+        "(by default its index is kept, since an empty mount folder usually means the "
+        "drive is not mounted)",
+    )  # fmt: skip
     common.add_argument("-q", "--quiet", action="store_true", help="no progress output")
 
     sub.add_parser(
@@ -178,14 +184,25 @@ def _end_progress(quiet: bool) -> None:
         sys.stderr.write("\r\033[K")
 
 
-def _scan(idx: Index, roots: list[str], args: argparse.Namespace) -> list[RootStats]:
+def _scan(
+    idx: Index, roots: list[str], args: argparse.Namespace
+) -> tuple[list[RootStats], dict[str, int]]:
+    """Scan `roots`: (stats of the roots replaced, root -> files kept for empty-looking roots)."""
     from dpf.scanner import scan_roots
 
     errors: list[str] = []
+    kept: dict[str, int] = {}
     stats = scan_roots(
-        idx, roots, all_files=args.all_files, progress=_progress_printer(args.quiet), errors=errors
-    )
+        idx, roots, all_files=args.all_files, progress=_progress_printer(args.quiet),
+        errors=errors, allow_empty=args.allow_empty, kept=kept,
+    )  # fmt: skip
     _end_progress(args.quiet)
+    for root, files in kept.items():
+        print(
+            f"dpf: {root} looks empty now but had {files:,} files when last scanned; keeping "
+            "the index (not mounted, or unreadable?). Use --allow-empty to accept the empty scan.",
+            file=sys.stderr,
+        )  # fmt: skip
     for s in stats:
         if s.files == 0 and s.errors:
             print(f"dpf: warning: could not read {s.root}", file=sys.stderr)
@@ -197,7 +214,7 @@ def _scan(idx: Index, roots: list[str], args: argparse.Namespace) -> list[RootSt
             print(f"  unreadable: {e}", file=sys.stderr)
         if len(errors) > 5:
             print(f"  … and {len(errors) - 5:,} more", file=sys.stderr)
-    return stats
+    return stats, kept
 
 
 def _default_out_dir(mode: str) -> str:
@@ -276,7 +293,9 @@ def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namesp
                 print(f"dpf: nothing indexed under {r}; run without --no-scan", file=sys.stderr)
                 return 1
     elif online:
-        scanned = {s.root: s for s in _scan(idx, online, args)}
+        stats, kept = _scan(idx, online, args)
+        scanned = {s.root: s for s in stats}
+        offline |= kept.keys()  # taken from the index, like an unplugged drive
 
     groups = list(
         find_name_duplicates(
@@ -464,15 +483,30 @@ def _offline_or_abs(idx: Index | None, path: str) -> str:
     return os.path.abspath(path)
 
 
-def _resolve_pool(args: argparse.Namespace) -> tuple[Pool, list[str]]:
-    """The pool named by --pool and the paths it stands for (see pools.pool_paths)."""
-    pool = get_pool(load_pools(args.pools_file), args.pool)
+def _resolve_pool(args: argparse.Namespace) -> tuple[Pools, Pool, list[str]]:
+    """All pools, the pool named by --pool, and the paths it stands for (pools.pool_paths)."""
+    pools = load_pools(args.pools_file)
+    pool = get_pool(pools, args.pool)
     db = args.db or default_db_path()
     indexed: list[str] = []
     if os.path.exists(db):
         with Index(db) as idx:
             indexed = [r.root for r in idx.roots()]
-    return pool, pool_paths(pool, indexed)
+    return pools, pool, pool_paths(pool, indexed)
+
+
+def _check_one_pool(pools: Pools, roots: list[str], args: argparse.Namespace) -> bool:
+    """False (with an error) if a root belongs to several pools: pools are never mixed."""
+    for root in roots:
+        names = pools_of(pools, root)
+        if len(names) > 1:
+            print(
+                f"dpf: {root} matches more than one pool ({', '.join(names)}); fix "
+                f"{args.pools_file or default_pools_path()} so each drive is in one pool",
+                file=sys.stderr,
+            )  # fmt: skip
+            return False
+    return True
 
 
 def _forget(idx: Index, known: list[RootStats], paths: list[str]) -> int:
@@ -568,9 +602,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.pool and not args.roots:
         parser.error(f"{args.command}: give PATHs or --pool NAME")
     paths = args.roots
+    pools: Pools = {}
     if args.pool:
         try:
-            pool, paths = _resolve_pool(args)
+            pools, pool, paths = _resolve_pool(args)
         except PoolError as e:
             print(f"dpf: {e}", file=sys.stderr)
             return 1
@@ -607,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
             roots = drop_nested([*online, *offline])
             offline &= set(roots)
+            if args.pool and not _check_one_pool(pools, roots, args):
+                return 1
             if args.command == "scan":
                 _scan(idx, roots, args)
                 return 0

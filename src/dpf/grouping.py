@@ -61,8 +61,10 @@ def natural_key(name: str) -> tuple[str | int, ...]:
 class Run:
     """Consecutive files of folder A (natural order) that all have a copy in folder B.
 
-    An unmatched file whose name stem equals a matched neighbour's (a RAW+JPG sibling)
-    is passed over rather than ending the run; `count` and `bytes` cover matches only.
+    An unmatched file beside a matched one of the same shot in another format (the JPG
+    of a matched RAW) is passed over rather than ending the run. It lies inside the
+    run's range without a copy, so it is listed in `skipped`; `count` and `bytes` cover
+    matches only. `same_names` is True when every A name equals its B name exactly.
     """
 
     a_first: str
@@ -72,6 +74,7 @@ class Run:
     count: int
     bytes: int
     same_names: bool
+    skipped: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +92,7 @@ class FolderPair:
     relation: str  # IDENTICAL_TREE, IDENTICAL, A_IN_B, B_IN_A, NEAR_IDENTICAL or PARTIAL
     folders: int = 1
     unindexed: int = 0  # entries on either side that were not indexed, so not compared
+    similar_names: bool = False  # some matched files have different names on the two sides
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +152,7 @@ def group_duplicates(
     """
     # (dir_a, dir_b) -> (A name -> matching B name, matched B names)
     matches: dict[tuple[str, str], tuple[dict[str, str], set[str]]] = {}
+    similar: set[tuple[str, str]] = set()  # pairs where some matched names differ
     same_folder: list[DuplicateGroup] = []
     count = redundant = capped = 0
 
@@ -173,6 +178,8 @@ def group_duplicates(
                 entry = matches[(a, b)] = ({}, set())
             a_map, b_set = entry
             b_names = by_dir[b]
+            if len(set(by_dir[a]).union(b_names)) > 1:
+                similar.add((a, b))
             for name in by_dir[a]:
                 if name not in a_map:
                     a_map[name] = _counterpart(name, b_names)
@@ -205,8 +212,9 @@ def group_duplicates(
         for b in bs:
             a_map, b_set = matches.pop((a, b))
             pairs[(a, b)] = _build_pair(
-                a, b, listing, a_map, b_set, dir_count(b), unindexed(a) + unindexed(b), near
-            )
+                a, b, listing, a_map, b_set, dir_count(b), unindexed(a) + unindexed(b), near,
+                (a, b) in similar,
+            )  # fmt: skip
 
     _roll_up(pairs, dir_count, unindexed, subdirs, roots)
     ordered = sorted(pairs.values(), key=lambda p: (-p.bytes, p.dir_a, p.dir_b))
@@ -220,8 +228,10 @@ def is_near(matched: int, total: int, near: float) -> bool:
 
 
 def _counterpart(name: str, b_names: list[str]) -> str:
-    """The B-side copy to show for `name`: one with the same name if there is one."""
+    """The B-side copy to show for `name`: one with the same name (or case) if there is one."""
     if len(b_names) > 1:
+        if name in b_names:
+            return name
         key = name.casefold()
         for other in b_names:
             if other.casefold() == key:
@@ -238,34 +248,43 @@ def _build_pair(
     total_b: int,
     unindexed: int,
     near: float = DEFAULT_NEAR,
+    similar_names: bool = False,
 ) -> FolderPair:
     runs: list[Run] = []
-    cur: list | None = None  # [a_first, a_last, b_first, b_last, count, bytes, same, b_key]
+    # [a_first, a_last, b_first, b_last, count, bytes, same, b_key, skipped]
+    cur: list | None = None
+    passed: list[str] = []  # siblings passed over since the run's last match
     matched = nbytes = 0
     for i, (a_key, _, rec) in enumerate(listing):
         other = a_map.get(rec.name)
         if other is None:
-            if cur is not None and not _beside_sibling(listing, a_map, i):
-                runs.append(Run(*cur[:7]))
-                cur = None
+            if cur is None:
+                continue
+            if _beside_sibling(listing, a_map, i):
+                passed.append(rec.name)
+            else:
+                runs.append(_run(cur))
+                cur, passed = None, []
             continue
         matched += 1
         nbytes += rec.size
-        same = rec.name.casefold() == other.casefold()
+        same = rec.name == other
         b_key = a_key if same else natural_key(other)
         if cur is not None and b_key < cur[7]:
             # B-side order went backwards: "b_first … b_last" would mislead, so split.
-            runs.append(Run(*cur[:7]))
+            runs.append(_run(cur))
             cur = None
         if cur is None:
-            cur = [rec.name, rec.name, other, other, 1, rec.size, same, b_key]
+            cur = [rec.name, rec.name, other, other, 1, rec.size, same, b_key, []]
         else:
             cur[1], cur[3], cur[7] = rec.name, other, b_key
             cur[4] += 1
             cur[5] += rec.size
             cur[6] = cur[6] and same
+            cur[8] += passed
+        passed = []
     if cur is not None:
-        runs.append(Run(*cur[:7]))
+        runs.append(_run(cur))
 
     total_a = len(listing)
     matched_b = min(len(b_set), total_b)
@@ -280,25 +299,37 @@ def _build_pair(
     else:
         relation = PARTIAL
     return FolderPair(
-        a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation, 1, unindexed
-    )
+        a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation, 1, unindexed,
+        similar_names,
+    )  # fmt: skip
+
+
+def _run(cur: list) -> Run:
+    return Run(*cur[:7], tuple(cur[8]))
 
 
 def _beside_sibling(
     listing: list[tuple[tuple[str | int, ...], str, FileRecord]], a_map: dict[str, str], i: int
 ) -> bool:
-    """True if unmatched listing[i] sits next to a matched file with the same name stem.
+    """True if unmatched listing[i] is another format of a matched neighbour's shot.
 
-    Such siblings (the JPG of a matched RAW, or "X.DNG" beside a matched "X (2).DNG")
-    do not break a run.
+    The neighbour must share the name stem and have a different extension (the JPG of
+    a matched RAW). A same-format file ("X.DNG" beside a matched "X (2).DNG") is a
+    different file and ends the run.
     """
-    stem = match_stem(listing[i][1])
+    stem, ext = _stem_ext(listing[i][1])
     for j in (i - 1, i + 1):
         if 0 <= j < len(listing):
             name = listing[j][1]
-            if name in a_map and match_stem(name) == stem:
-                return True
+            if name in a_map:
+                other_stem, other_ext = _stem_ext(name)
+                if other_stem == stem and other_ext != ext:
+                    return True
     return False
+
+
+def _stem_ext(name: str) -> tuple[str, str]:
+    return match_stem(name), os.path.splitext(name)[1].casefold()
 
 
 def _key(x: str, y: str) -> tuple[str, str]:
@@ -320,6 +351,7 @@ class _Tree:
     files: int
     bytes: int
     children: int
+    similar: bool = False
 
 
 def _roll_up(
@@ -368,6 +400,7 @@ def _roll_up(
         if cx.keys() != cy.keys() or (own is None and not cx):
             return None
         folders, files, nbytes = (1, own.matched_a, own.bytes) if own else (0, 0, 0)
+        similar = own is not None and own.similar_names
         for name, sub in cx.items():
             t = tree(sub, cy[name])
             if t is None:
@@ -375,7 +408,8 @@ def _roll_up(
             folders += t.folders
             files += t.files
             nbytes += t.bytes
-        result = memo[k] = _Tree(folders, files, nbytes, len(cx))
+            similar = similar or t.similar
+        result = memo[k] = _Tree(folders, files, nbytes, len(cx), similar)
         return result
 
     for x, y in identical:
@@ -400,7 +434,7 @@ def _roll_up(
         elif t.children:
             pairs[k] = FolderPair(
                 k[0], k[1], (), t.files, t.files, t.files, t.files, t.bytes,
-                IDENTICAL_TREE, t.folders,
+                IDENTICAL_TREE, t.folders, 0, t.similar,
             )  # fmt: skip
 
 

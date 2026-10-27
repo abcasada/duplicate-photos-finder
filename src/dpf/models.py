@@ -33,6 +33,11 @@ class DuplicateGroup:
         return max(f.size for f in self.files)
 
     @property
+    def same_names(self) -> bool:
+        """True if every file has exactly the same name (case included)."""
+        return len({f.name for f in self.files}) == 1
+
+    @property
     def redundant_bytes(self) -> int:
         """Bytes that could be freed by keeping only one copy."""
         return sum(f.size for f in self.files) - self.size

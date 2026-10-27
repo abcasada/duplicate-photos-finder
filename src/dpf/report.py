@@ -32,7 +32,11 @@ _SAME_FOLDER_TOP = 10
 _INDENT = " " * 7
 TREE_TOP = 20
 
-CSV_FIELDS = ("group_id", "basis", "path", "dir", "name", "size", "mtime", "kind")
+CSV_FIELDS = (
+    "group_id", "basis", "path", "dir", "name", "size", "mtime", "kind", "same_names",
+)  # fmt: skip
+SKIPPED_SHOWN = 3
+SIMILAR_NAMES = "similar names"
 
 
 def human_bytes(n: int) -> str:
@@ -158,6 +162,8 @@ def _describe(p: FolderPair, near: float = DEFAULT_NEAR) -> str:
     elif contained_and_near(p, near):
         only = (only_b, "B") if p.relation == A_IN_B else (only_a, "A")
         text += f"; near-identical: {cover}, {plural(only[0], 'file')} only in {only[1]}"
+    if p.similar_names:
+        text += f"; {SIMILAR_NAMES}"
     if p.unindexed:
         text += f"; {plural(p.unindexed, 'other file')} not compared"
     return text
@@ -195,12 +201,26 @@ def _span(first: str, last: str) -> str:
     return first if first == last else f"{first} … {last}"
 
 
+def name_list(names: tuple[str, ...], shown: int = SKIPPED_SHOWN) -> str:
+    """Up to `shown` names, then "+N more"."""
+    listed = ", ".join(names[:shown])
+    if len(names) > shown:
+        listed += f", +{len(names) - shown:,} more"
+    return listed
+
+
+def skipped_note(names: tuple[str, ...]) -> str:
+    """E.g. "+1 inside not matched: DSC00003.ARW" for files passed over inside a run."""
+    return f"+{len(names):,} inside not matched: {name_list(names)}"
+
+
 def run_lines(
     runs: tuple[Run, ...], max_runs: int, *, indent: str = _INDENT, align: bool = True
 ) -> list[str]:
     """One line per run, up to `max_runs`, then an "… and N more runs" line.
 
-    `align` pads names and counts into columns (for monospaced text).
+    Files passed over inside a run (Run.skipped) are named on its line. `align` pads
+    names and counts into columns (for monospaced text).
     """
     shown = runs[:max_runs]
     if not shown:
@@ -214,6 +234,8 @@ def run_lines(
         if align:
             unit = unit.ljust(5)
         line = f"{indent}{label:<{label_w}}  {r.count:>{count_w},} {unit}"
+        if r.skipped:
+            line = f"{line.rstrip()}  ({skipped_note(r.skipped)})"
         if not r.same_names:
             line += f"  → in B: {_span(r.b_first, r.b_last)}"
         lines.append(line.rstrip())
@@ -221,7 +243,9 @@ def run_lines(
     if rest:
         files = sum(r.count for r in rest)
         more = plural(len(rest), "more run")
-        lines.append(f"{indent}… and {more} ({plural(files, 'file')})")
+        skipped = sum(len(r.skipped) for r in rest)
+        extra = f"; {skipped:,} inside not matched" if skipped else ""
+        lines.append(f"{indent}… and {more} ({plural(files, 'file')}{extra})")
     return lines
 
 
@@ -414,6 +438,7 @@ def write_json(result: GroupingResult, summary: dict, path: str) -> None:
         "same_folder": [
             {
                 "basis": g.basis,
+                "same_names": g.same_names,
                 "size": g.size,
                 "redundant_bytes": g.redundant_bytes,
                 "files": _group_files(g),
@@ -437,6 +462,9 @@ def write_csv(groups: Iterable[DuplicateGroup], path: str) -> int:
         w = csv.writer(fh)
         w.writerow(CSV_FIELDS)
         for n, g in enumerate(groups, 1):
+            same = "yes" if g.same_names else "no"
             for f in g.files:
-                w.writerow((n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind))
+                w.writerow(
+                    (n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind, same)
+                )
     return n

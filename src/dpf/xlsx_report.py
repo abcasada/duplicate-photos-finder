@@ -40,6 +40,7 @@ from dpf.report import (
     root_lines,
     run_lines,
     same_folder_stats,
+    name_list,
     tree_label,
     tree_tags,
 )
@@ -48,6 +49,7 @@ SHEETS = ("Summary", "Trees", "Folder pairs", "Sequences", "Same folder", "Files
 MAX_URL = 2079  # Excel's limit on a hyperlink target
 MAX_URLS = 65_530  # Excel's limit on hyperlinks per worksheet
 MAX_ROWS = 1_048_576
+_SKIPPED_NAMES = 20  # names listed per run on the Sequences sheet
 PATH_WIDTH = 70
 
 # Bytes shown in decimal units; the thresholds match human_bytes' rounding. Excel allows
@@ -111,6 +113,7 @@ class _Formats:
         self.date = add(num_format="yyyy-mm-dd hh:mm:ss")
         self.amber = add(num_format="#,##0", bg_color=AMBER, font_color="#9C5700")
         self.warning = add(font_color="#9C5700", bold=True)
+        self.warning_text = add(bg_color=AMBER, font_color="#9C5700")
         self.fills = {c: add(bg_color=c) for c in (GREEN, LIGHT_GREEN, LIGHT_BLUE)}
         self.title = add(bold=True, font_size=14)
         self.bold = add(bold=True)
@@ -251,22 +254,32 @@ def _trees(wb, fmt: _Formats, trees: list[TreePair]) -> _Table:
 def _sequence_text(p: FolderPair) -> str:
     """The first run on one line, so every row keeps a single-line height.
 
-    All runs are listed on the Sequences sheet.
+    All runs are listed on the Sequences sheet. Files not matched inside the other runs
+    are counted, since the first run's line only names its own.
     """
     if not p.runs:
         return ""
     first = run_lines(p.runs[:1], 1, indent="", align=False)[0]
     more = len(p.runs) - 1
-    return f"{first}  (+{more} more on Sequences sheet)" if more else first
+    skipped = sum(len(r.skipped) for r in p.runs[1:])
+    notes = [f"+{more} more on Sequences sheet"] if more else []
+    if skipped:
+        notes.append(f"{skipped:,} inside them not matched")
+    return f"{first}  ({'; '.join(notes)})" if notes else first
+
+
+def _names(p: FolderPair) -> str:
+    return "similar" if p.similar_names else "exact"
 
 
 def _pairs(
     wb, fmt: _Formats, pairs: list[FolderPair], tags: dict, near: float
 ) -> _Table:
     columns = [
-        ("#", 7), ("Tree", 6), ("Shared size", 13), ("Relation", None), ("Folder A", None),
-        ("Folder B", None), *_SIDE_COLUMNS, ("Only in A", 9), ("Only in B", 9),
-        ("Other files not compared", 12), ("Runs", 7), ("First sequence", 60),
+        ("#", 7), ("Tree", 6), ("Shared size", 13), ("Relation", None), ("Names", 9),
+        ("Folder A", None), ("Folder B", None), *_SIDE_COLUMNS, ("Only in A", 9),
+        ("Only in B", 9), ("Other files not compared", 12), ("Runs", 7),
+        ("First sequence", 60),
     ]  # fmt: skip
     t = _Table(wb, fmt, "Folder pairs", columns, freeze_cols=2)
     for n, p in enumerate(pairs, 1):
@@ -281,16 +294,17 @@ def _pairs(
         if p.relation == IDENTICAL_TREE:
             label += f": {plural(p.folders, 'folder')}"
         _relation(t, 3, label, _pair_fill(p))
-        t.folder(4, p.dir_a)
-        t.folder(5, p.dir_b)
-        _sides(t, 6, p.matched_a, p.total_a, p.matched_b, p.total_b)
-        t.num(12, p.total_a - p.matched_a)
-        t.num(13, p.total_b - p.matched_b)
-        _not_compared(t, 14, p.unindexed)
-        t.num(15, len(p.runs))
+        t.text(4, _names(p), fmt.warning_text if p.similar_names else None)
+        t.folder(5, p.dir_a)
+        t.folder(6, p.dir_b)
+        _sides(t, 7, p.matched_a, p.total_a, p.matched_b, p.total_b)
+        t.num(13, p.total_a - p.matched_a)
+        t.num(14, p.total_b - p.matched_b)
+        _not_compared(t, 15, p.unindexed)
+        t.num(16, len(p.runs))
         text = _sequence_text(p)
         if text:
-            t.text(16, text)
+            t.text(17, text)
     t.data_bar(2)
     return t
 
@@ -299,7 +313,7 @@ def _sequences(wb, fmt: _Formats, pairs: list[FolderPair]) -> _Table:
     columns = [
         ("Pair #", 7), ("Folder A", None), ("Folder B", None), ("First (A)", None),
         ("Last (A)", None), ("First (B)", None), ("Last (B)", None), ("Files", 8),
-        ("Size", 12),
+        ("Size", 12), ("Not matched inside", 12), ("Not matched names", None),
     ]  # fmt: skip
     t = _Table(wb, fmt, "Sequences", columns, freeze_cols=1)
     for n, p in enumerate(pairs, 1):
@@ -316,6 +330,9 @@ def _sequences(wb, fmt: _Formats, pairs: list[FolderPair]) -> _Table:
                 t.text(6, r.b_last)
             t.num(7, r.count)
             t.num(8, r.bytes, fmt.size)
+            if r.skipped:
+                t.num(9, len(r.skipped), fmt.amber)
+                t.text(10, name_list(r.skipped, _SKIPPED_NAMES))
     return t
 
 
@@ -338,10 +355,11 @@ def _same_folder(wb, fmt: _Formats, groups: list[DuplicateGroup]) -> _Table:
 def _files(wb, fmt: _Formats, groups: Sequence[DuplicateGroup]) -> _Table:
     columns = [
         ("Group", 8), ("Basis", None), ("Folder", None), ("Name", None), ("Size", 11),
-        ("Modified", 19), ("Kind", 7),
+        ("Modified", 19), ("Kind", 7), ("Names", 9),
     ]  # fmt: skip
     t = _Table(wb, fmt, "Files", columns, freeze_cols=1)
     for n, g in enumerate(groups, 1):
+        names = "exact" if g.same_names else "similar"
         for f in g.files:
             if not t.next_row():
                 continue
@@ -356,6 +374,7 @@ def _files(wb, fmt: _Formats, groups: Sequence[DuplicateGroup]) -> _Table:
             else:
                 t.ws.write_datetime(t.row, 5, modified, fmt.date)
             t.text(6, f.kind)
+            t.text(7, names)
     return t
 
 
@@ -495,6 +514,11 @@ def _notes(near: float) -> list[str]:
         f"  near-identical: neither side is fully contained, but at least {pct} of each "
         "side matched (light green)",
         "  partial overlap: some files in common (no colour)",
+        'Names: "similar" when some matched files are named differently on the two sides '
+        '(copy marks such as " (1)", a date before a camera number, or case); "exact" '
+        "otherwise. Files sheet: the same per group.",
+        'Sequences: "Not matched inside" counts files inside a run\'s range (the other '
+        "format of a matched RAW+JPG shot) that have no copy on the other side.",
         '"Other files not compared" (amber when not 0): non-photo/video files such as '
         "sidecars, edits or notes, symlinks and unreadable entries.",
         "  They were not compared at all: check them before deleting either side.",

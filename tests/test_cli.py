@@ -69,7 +69,8 @@ class CliTest(CliFixture):
         code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
         self.assertEqual(code, 0)
         self.assertIn("one/DCIM  ↔  ", out)
-        self.assertIn("three/Copies   (all photos/videos match, 10 files)", out)
+        self.assertIn("three/Copies   (all photos/videos match, 10 files; similar names)", out)
+        self.assertIn("two/Backup   (all photos/videos match, 10 files)\n", out)
         with open(os.path.join(self.out, "report.json")) as fh:
             self.assertEqual(len(json.load(fh)["pairs"]), 3)
         code, out, _ = self.run_cli(
@@ -237,6 +238,44 @@ class OfflineRootsTest(CliFixture):
         code, out, err = self.run_cli("find", "-q", "-o", self.out, self.one, self.two)
         self.assertEqual((code, err), (0, ""))
         self.assertIn("from index", out)
+
+    def empty_out(self, path):
+        """Leave `path` as an empty folder, like a drive that failed to mount."""
+        moved = path + ".contents"
+        os.rename(path, moved)
+        os.makedirs(path)
+        return moved
+
+    def test_empty_mount_folder_keeps_index(self):
+        self.empty_out(self.two)
+        code, out, err = self.run_cli("find", "-o", self.out, self.one, self.two)
+        self.assertEqual(code, 0, err)
+        self.assertIn(
+            f"dpf: {self.two} looks empty now but had 10 files when last scanned; keeping the "
+            "index (not mounted, or unreadable?). Use --allow-empty to accept the empty scan.\n",
+            err,
+        )  # fmt: skip
+        self.assertIn("all photos/videos match, 10 files", out)
+        self.assertRegex(out, rf"\s+{self.two}\s+\(from index, scanned [\d -:]+, not connected\)")
+        status = self.report_json()["summary"]["root_status"]
+        self.assertEqual([s["status"] for s in status], ["scanned now", "from index"])
+        self.assertEqual([s["files"] for s in status], [10, 10])
+        # quiet runs still warn; `scan` keeps the index too
+        code, _, err = self.run_cli("scan", "-q", self.two)
+        self.assertEqual(code, 0)
+        self.assertIn("looks empty now but had 10 files", err)
+        code, out, err = self.run_cli("drives")
+        self.assertRegex(out, rf"{self.two}\s+10 ")
+
+    def test_allow_empty_accepts_empty_scan(self):
+        self.empty_out(self.two)
+        code, _, err = self.run_cli("scan", "-q", "--allow-empty", self.two)
+        self.assertEqual((code, err), (0, ""))
+        code, out, err = self.run_cli("find", "-q", "--no-scan", "-o", self.out, self.one, self.two)
+        self.assertEqual(code, 0, err)
+        self.assertIn("No duplicates shared between folders.", out)
+        code, out, err = self.run_cli("find", "-q", "--allow-empty", "-o", self.out, self.two)
+        self.assertEqual((code, err), (0, ""))
 
     def test_no_scan_marks_connected_roots_from_index(self):
         code, out, _ = self.run_cli("find", "-q", "--no-scan", "-o", self.out, self.one, self.two)
@@ -449,6 +488,35 @@ class PoolsCliTest(CliFixture):
         code, _, err = self.run_cli("scan", "-q", "--pool", "B")
         self.assertEqual(code, 1)
         self.assertEqual(err, "dpf: no drives in pool B are connected\n")
+
+    def test_pool_patterns_match_per_segment(self):
+        """A B-drive subfolder named like an A drive stays out of pool A."""
+        b2 = os.path.join(self.media, "Storage 2B 8TB")
+        nested = os.path.join(b2, "old", "Storage 1A x")
+        shutil.copytree(os.path.join(self.drives, "one"), nested)
+        self.assertEqual(self.run_cli("scan", "-q", nested)[0], 0)
+        self.unplug(b2)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.report_json()["summary"]["roots"], [self.a1, self.a2])
+        code, out, _ = self.run_cli("pools")
+        self.assertNotIn("old/Storage 1A x", out.split("Pool B")[0])
+
+    def test_root_in_two_pools_is_refused(self):
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'All = ["{self.media}/Storage *"]',
+        )
+        for args in (("find", "-o", self.out), ("scan",)):
+            with self.subTest(args):
+                code, out, err = self.run_cli(*args, "-q", "--pool", "A")
+                self.assertEqual((code, out), (1, ""))
+                self.assertEqual(
+                    err,
+                    f"dpf: {self.a1} matches more than one pool (A, All); fix {self.pools_file} "
+                    "so each drive is in one pool\n",
+                )
+        self.assertFalse(os.path.exists(os.path.join(self.out, "report.txt")))
 
     def test_pool_and_paths_are_exclusive(self):
         for args in (("find", "--pool", "A", self.a1), ("scan", "--pool", "A", self.a1),

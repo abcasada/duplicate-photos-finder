@@ -112,8 +112,11 @@ class TextReportTest(unittest.TestCase):
             text,
         )
         self.assertIn(
-            "/drives/one/Edits  ↔  /drives/two/Renamed   (A is fully contained in B)", text
+            "/drives/one/Edits  ↔  /drives/two/Renamed   (A is fully contained in B; "
+            "similar names)",
+            text,
         )
+        self.assertNotIn("Hawaii   (all photos/videos match, 12 files; similar", text)
         self.assertIn("E1.jpg … E3.jpg  3 files  → in B: Trip 001.jpg … Trip 003.jpg", text)
         self.assertIn("covers 100% of A (3/3), 75% of B (3/4)", text)
         self.assertIn("Same-folder duplicates: 1 group, 1.0 kB redundant, in 1 folder", text)
@@ -123,6 +126,17 @@ class TextReportTest(unittest.TestCase):
         self.assertNotIn("IMG_0120", text)  # never every file
         text = format_text(self.result, {**SUMMARY, "xlsx_path": "/tmp/r.xlsx"})
         self.assertIn("Per-file detail:\n  XLSX: /tmp/r.xlsx", text)
+
+    def test_skipped_files_in_hidden_runs_are_counted(self):
+        a_names = ["A1.ARW", "A1.JPG", "A2.ARW", "B1.JPG", "C1.ARW", "C1.JPG", "C2.ARW"]
+        records = [rec("/a", n, size=i + 1) for i, n in enumerate(a_names)]
+        records += [rec("/b", n, size=i + 1) for i, n in enumerate(a_names) if n.endswith("ARW")]
+        with Index(":memory:") as idx:
+            idx.replace_root("/", records)
+            result = group(by_name(records), idx)
+        text = format_text(result, SUMMARY, max_runs=1)
+        self.assertIn("A1.ARW … A2.ARW  2 files  (+1 inside not matched: A1.JPG)\n", text)
+        self.assertIn("… and 1 more run (2 files; 1 inside not matched)", text)
 
     def test_single_file_run_and_max_runs(self):
         records = imgs("/a", range(0, 40)) + imgs("/b", range(0, 40, 2))
@@ -278,6 +292,10 @@ class FileOutputTest(unittest.TestCase):
             sorted(f["path"] for f in data["same_folder"][0]["files"]),
             ["/drives/one/Phone/PXL_1 (1).jpg", "/drives/one/Phone/PXL_1.jpg"],
         )
+        self.assertFalse(data["same_folder"][0]["same_names"])
+        self.assertEqual(first["runs"][0]["skipped"], [])
+        flags = {(p["dir_a"].rsplit("/", 1)[1], p["similar_names"]) for p in data["pairs"]}
+        self.assertEqual(flags, {("100CANON", False), ("Hawaii", False), ("Edits", True)})
 
     def test_json_trees(self):
         result = build_trees()
@@ -314,6 +332,12 @@ class FileOutputTest(unittest.TestCase):
         self.assertEqual((rows[0]["group_id"], rows[3]["group_id"]), ("1", "2"))
         self.assertEqual(rows[3]["basis"], "sha256")
         self.assertEqual(rows[3]["kind"], "video")
+        self.assertEqual([r["same_names"] for r in rows], ["yes", "yes", "yes", "yes"])
+        copy = FileRecord("/z", "Café ünïcode (1).jpg", 123, mtime, "image")
+        similar = [DuplicateGroup((a, copy), "similar name+size+mtime")]
+        write_csv(similar, path)
+        with open(path, encoding="utf-8", newline="") as fh:
+            self.assertEqual({r["same_names"] for r in csv.DictReader(fh)}, {"no"})
         self.assertEqual(int(rows[0]["size"]), 123)
         self.assertEqual(datetime.fromisoformat(rows[1]["mtime"]).timestamp(), mtime + 1)
 

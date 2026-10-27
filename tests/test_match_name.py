@@ -90,12 +90,98 @@ class MatchNameTest(unittest.TestCase):
             rec("/r/a", "DSC01234.ARW"),
             rec("/r/b", "DSC01234 (1).ARW", mtime=T + 1),
             rec("/r/c", "2023-08-26_DSC01234.ARW"),
-            rec("/r/d", "Copy of DSC01234.ARW"),
+            rec("/r/d", "20230826 DSC01234 (1).ARW"),
         ]
         got = self.groups(records)
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0][0], "similar name+size+mtime")
         self.assertEqual(len(got[0][1]), 4)
+
+    def names(self, records, **kw):
+        return sorted([p.rsplit("/", 2)[-2] + "/" + p.rsplit("/", 1)[-1] for p in paths]
+                      for _, paths in self.groups(records, **kw))  # fmt: skip
+
+    def test_copy_marks_table(self):
+        """Different copy numbers never match; numbered series fall back to exact names."""
+        cases = [
+            # (files as "folder/name", expected groups)
+            (["a/X.jpg", "b/X (1).jpg"], [["a/X.jpg", "b/X (1).jpg"]]),
+            (["a/X (1).jpg", "b/X (1).jpg"], [["a/X (1).jpg", "b/X (1).jpg"]]),
+            (["a/X (1).jpg", "b/X (2).jpg"], []),
+            (["a/Vacation (1).ARW", "b/Vacation (2).ARW"], []),
+            (["a/X.jpg", "a/X (1).jpg"], [["a/X (1).jpg", "a/X.jpg"]]),  # a copy in place
+            (["a/X.jpg", "b/X (1).jpg", "c/X (2).jpg"], []),  # ambiguous: no claim
+            (["a/X - Copy.jpg", "b/X (1).jpg"], [["a/X - Copy.jpg", "b/X (1).jpg"]]),
+            (["a/X - Copy (2).jpg", "b/X (2).jpg"], [["a/X - Copy (2).jpg", "b/X (2).jpg"]]),
+            (["a/X - Copy (2).jpg", "b/X (1).jpg"], []),
+            # Windows copies in place: unnumbered marks are never a series
+            (["a/X.jpg", "a/X - Copy.jpg", "a/X - Copy - Copy.jpg", "a/X - Copy (2).jpg"],
+             [["a/X - Copy (2).jpg", "a/X - Copy - Copy.jpg", "a/X - Copy.jpg", "a/X.jpg"]]),
+            (["a/X.jpg", "b/2023-08-26 X.jpg"], []),  # no camera number: text kept
+            # a folder holding "(1)" and "(2)" is a renamed series, not copies
+            (["s/Vacation (1).ARW", "s/Vacation (2).ARW", "b/Vacation.ARW"], []),
+            (
+                ["s/Vacation (1).ARW", "s/Vacation (2).ARW",
+                 "b/Vacation (1).ARW", "b/Vacation (2).ARW"],
+                [["b/Vacation (1).ARW", "s/Vacation (1).ARW"],
+                 ["b/Vacation (2).ARW", "s/Vacation (2).ARW"]],
+            ),
+            (["s/IMG_1234-1.JPG", "s/IMG_1234-2.JPG", "b/IMG_1234.JPG"], []),
+            (["s/X (1).jpg", "s/X - Copy (2).jpg", "b/X.jpg"], []),
+            (["a/IMG_1234-1.JPG", "b/IMG_1234-2.JPG"], []),
+            (["a/DSC01234_1.ARW", "b/DSC01234.ARW"], [["a/DSC01234_1.ARW", "b/DSC01234.ARW"]]),
+            (["a/DSC01234_1.ARW", "b/DSC01234_2.ARW"], []),
+            (
+                ["a/DSC01234 (1).ARW", "b/2023-08-26_DSC01234.ARW"],
+                [["a/DSC01234 (1).ARW", "b/2023-08-26_DSC01234.ARW"]],
+            ),
+            # text around a camera number must be neutral or the same on both sides
+            (["a/BodyA_DSC01234.ARW", "b/BodyB_DSC01234.ARW"], []),
+            (["a/BodyA_DSC01234.ARW", "b/DSC01234.ARW"], []),
+            (
+                ["a/BodyA_DSC01234.ARW", "b/BodyA_DSC01234 (1).ARW"],
+                [["a/BodyA_DSC01234.ARW", "b/BodyA_DSC01234 (1).ARW"]],
+            ),
+            (["a/DSC01234-Edit.tif", "b/DSC01234-Edit-2.tif"], []),
+            (
+                ["a/DSC01234-Edit.tif", "b/2023-08-26_DSC01234-Edit.tif"],
+                [["a/DSC01234-Edit.tif", "b/2023-08-26_DSC01234-Edit.tif"]],
+            ),
+            (["a/Lincoln DSC04205.ARW", "b/DSC04205.ARW"], []),
+        ]  # fmt: skip
+        for files, expected in cases:
+            with self.subTest(files=files):
+                records = [rec("/r/" + f.split("/")[0], f.split("/")[1]) for f in files]
+                self.assertEqual(self.names(records), expected)
+
+    def test_series_guard_only_splits_its_own_key(self):
+        records = [
+            rec("/r/s", "Vacation (1).ARW"),
+            rec("/r/s", "Vacation (2).ARW"),
+            rec("/r/b", "Vacation.ARW"),
+            rec("/r/c", "X.ARW"),
+            rec("/r/d", "X (1).ARW"),
+        ]
+        self.assertEqual(self.names(records), [["c/X.ARW", "d/X (1).ARW"]])
+
+    def test_series_guard_spans_mtimes(self):
+        """A burst renamed in place: frames a few seconds apart still mark a series."""
+        records = [
+            rec("/r/s", "Vacation (1).ARW", mtime=T),
+            rec("/r/s", "Vacation (2).ARW", mtime=T + 30),
+            rec("/r/b", "Vacation.ARW", mtime=T),
+        ]
+        self.assertEqual(self.groups(records), [])
+
+    def test_exact_names_ignores_marks_and_series(self):
+        records = [
+            rec("/r/s", "Vacation (1).ARW"),
+            rec("/r/s", "Vacation (2).ARW"),
+            rec("/r/b", "vacation (1).arw"),
+        ]
+        self.assertEqual(
+            self.names(records, exact_names=True), [["b/vacation (1).arw", "s/Vacation (1).ARW"]]
+        )
 
     def test_exact_names(self):
         records = [rec("/r/a", "x.jpg"), rec("/r/b", "X.JPG"), rec("/r/c", "x (1).jpg")]

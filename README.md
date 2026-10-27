@@ -44,7 +44,7 @@ Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md
 
 | Mode | What counts as a duplicate | Speed | Status |
 |---|---|---|---|
-| `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; renamed files matched by their camera number), same extension, same size, modification time within 2 s. `--exact-names` requires identical names | Seconds: reads only folder listings | ✅ available |
+| `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; files renamed with a date before their camera number still match), same extension, same size, modification time within 2 s. `--exact-names` requires identical names | Seconds: reads only folder listings | ✅ available |
 | `1b` (planned) | Same camera body serial + shutter count (from EXIF), so renamed or re-downloaded copies are caught and RAW+JPG pairs are recognised as one shot | ~50 min per large drive the first time (reads each file's header), cached afterwards | 📋 next |
 | `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 📋 planned |
 | `3` / `both` | Mode 1 report first, then mode 2 automatically | | 📋 planned |
@@ -71,7 +71,8 @@ the comparison, define **drive pools** and run one report per pool.
 
 Pools live in `~/.config/dpf/pools.toml` (or `$XDG_CONFIG_HOME/dpf/pools.toml`; any other
 file with `dpf --pools-file PATH …`). Each pool is a list of paths or glob patterns
-(`*`, `?`, `[..]`); pool names are case-insensitive:
+(`*`, `?`, `[..]`, matched per path segment as in the shell, so `*` never spans a `/`);
+pool names are case-insensitive:
 
 ```toml
 [pools]
@@ -119,7 +120,7 @@ dpf drives
 
 A report run with `--pool` names the pool in its header. `dpf drives` shows each drive's
 pool in a Pool column; a drive matching several pools lists them all, which means the
-patterns overlap and should be fixed.
+patterns overlap and should be fixed: `scan`/`find --pool` refuse to run until it is.
 
 ### More drives than you can connect at once
 
@@ -141,6 +142,12 @@ and the report header shows per drive whether it was *scanned now* or taken *fro
 with the date of that scan. Folder links in the report point at the drive's mount path, so
 they only open once it is plugged in again. `--no-scan` takes every drive from the index,
 connected or not.
+
+A drive whose mount folder exists but is completely empty (an unclean unplug, a failed
+mount) is not taken as an empty drive when the index holds files for it: `scan`/`find`
+keep its indexed files, treat it as not connected, and warn `… looks empty now but had N
+files when last scanned; keeping the index (not mounted, or unreadable?)`. `--allow-empty` accepts the
+empty scan instead.
 
 With plain paths instead of a pool, shell globs only match drives that are mounted, so
 spell out the paths of unplugged drives (`"/run/media/adam/Storage 2A 8TB"`), or copy them
@@ -221,7 +228,14 @@ paths you scanned, and the two sides are never the same folder or nested in each
 
 Except for matching folders, the shared files are listed as runs of consecutive names
 (`IMG_0100 … IMG_0450`), in natural sort order, followed by the coverage of each side.
-Percentages are rounded down, so 100% always means every file.
+Percentages are rounded down, so 100% always means every file. A run is not broken by
+the other format of a matched shot (the JPG of a matched RAW), but such files have no
+copy on the other side, so the run names them:
+`DSC00001.ARW … DSC00005.JPG  9 files  (+1 inside not matched: DSC00003.ARW)` (the
+Sequences sheet has a "Not matched inside" column). When the names differ on the two
+sides, the run shows the B names (`→ in B: …`) and the pair's label adds
+`; similar names` (the "Names" column in report.xlsx; `same_names` per group in
+files.csv).
 
 Only photos and videos are compared (everything, with `--all-files`). Other files such as
 `.xmp` sidecars, `.psd` edits or notes, symlinks, and anything unreadable are counted
@@ -237,9 +251,14 @@ The report header says `matched on similar name+size+mtime ±2s`. "Similar name"
 
 - **Case is ignored.**
 - **Copy marks are ignored:** ` (1)`, ` - Copy`, ` - Copy (2)`, ` copy`, `Copy of `, `~2`,
-  plus `-2` / `_1` directly after a camera number (`DSC00001-2.jpg`).
-- **Renamed files match by camera number.** `2023-08-26_DSC01234.ARW` and
-  `DSC01234.ARW` are the same name.
+  plus `-2` / `_1` / ` 2` directly after a camera number (`DSC00001-2.jpg`).
+- **Different copy numbers never match:** `X (1)` matches `X` or `X - Copy`, never
+  `X (2)`. A folder holding `X (1)` and `X (2)` (e.g. a Windows bulk rename of a burst)
+  is treated as a renamed series, and those names must then match exactly.
+- **A date around a camera number is ignored:** `2023-08-26_DSC01234.ARW`,
+  `20230826 DSC01234.ARW` and `DSC01234.ARW` are the same name. Any other text must be
+  the same on both sides, so `BodyA_DSC01234` ≠ `BodyB_DSC01234` ≠ `DSC01234` and
+  `DSC01234-Edit` ≠ `DSC01234-Edit-2`.
 - **The extension must be the same,** so a RAW never matches its JPG.
 - **Numbers after a space are kept** (`Party 2.jpg` ≠ `Party 3.jpg`), and so is `-2` after
   ordinary text, because real sequences of identical size and time use those.
@@ -272,8 +291,8 @@ on name and date without reading file contents.
 - **Phase 1** (done): scanner, SQLite index, mode 1, sequence/folder grouping, tree
   overview, text/Excel/JSON/CSV reports, offline drives, drive pools.
 - **Done since**: smarter mode 1 names (copy suffixes such as `DSC00001-2.jpg` or
-  `IMG_1 (1).JPG`, and camera numbers inside renamed files; size and date must still
-  match), and runs that stay whole across RAW+JPG siblings.
+  `IMG_1 (1).JPG`, and dates before camera numbers; size and date must still match),
+  and runs that stay whole across RAW+JPG siblings while naming the unmatched ones.
 - **Next, mode 1b (EXIF)**: shot identity from the camera body serial and shutter count.
   The author's Sony A7R IV bodies and Pentax K-1 Mark II both record these, but not
   sub-second times. Uses a fast exiftool pipeline that reads only the first 512 KB of

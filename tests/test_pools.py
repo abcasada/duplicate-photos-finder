@@ -89,6 +89,17 @@ class MatchTest(unittest.TestCase):
         self.assertTrue(matches("/m/Storage 1TB/x", "/m/Storage 1TB"))
         self.assertFalse(matches("/m/Storage 1TB-old", "/m/Storage 1TB"))
 
+    def test_wildcards_stay_within_one_segment(self):
+        pattern = "/run/media/*/Storage [0-9]A *"
+        self.assertTrue(matches("/run/media/adam/Storage 2A 8TB", pattern))
+        self.assertTrue(matches("/run/media/adam/Storage 2A 8TB/old/x", pattern))
+        self.assertFalse(matches("/run/media/adam/Storage 2B 8TB/old/Storage 1A x", pattern))
+        self.assertFalse(matches("/run/media/a/b/Storage 1A x", pattern))
+        self.assertFalse(matches("/m/x/y", "/m/*y"))
+        self.assertTrue(matches("/m/x//y/", "/m/x/?"))
+        self.assertTrue(matches("/anything", "/"))
+        self.assertFalse(matches("/run/media", pattern))
+
     def test_pools_of(self):
         pools = parse_pools({"pools": {
             "A": ["/m/Storage 1TB", "/m/Storage [0-9]A *"],
@@ -98,6 +109,7 @@ class MatchTest(unittest.TestCase):
         self.assertEqual(pools_of(pools, "/m/Storage 1TB"), ["A", "All"])
         self.assertEqual(pools_of(pools, "/m/Storage 1B 4TB (2)"), ["B", "All"])
         self.assertEqual(pools_of(pools, "/home/me/Pictures"), [])
+        self.assertEqual(pools_of(pools, "/m/Storage 2B 8TB/old/Storage 1A x"), ["B", "All"])
 
 
 class PoolPathsTest(unittest.TestCase):
@@ -128,6 +140,13 @@ class PoolPathsTest(unittest.TestCase):
             f"{self.m}/Storage 2A 8TB",
             f"{self.m}/Storage 3A 8TB",
             f"{self.m}/Storage 4A 8TB/Photos",
+        ])  # fmt: skip
+
+    def test_indexed_subfolder_of_other_drive_not_matched(self):
+        indexed = [f"{self.m}/Storage 2B 8TB/old/Storage 1A x", f"{self.m}/Storage 3A 8TB"]
+        paths = pool_paths(self.pool("Storage [0-9]A *"), indexed)
+        self.assertEqual(paths, [
+            f"{self.m}/Storage 1A 4TB", f"{self.m}/Storage 2A 8TB", f"{self.m}/Storage 3A 8TB",
         ])  # fmt: skip
 
     def test_brackets_in_names(self):

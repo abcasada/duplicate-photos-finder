@@ -67,11 +67,12 @@ _COLUMNS = "dir, name, name_key, size, mtime, kind, match_key"
 #   1  files, staging, roots
 #   2  dirs table (older inventories never recorded non-media content: dropped)
 #   3  match_key column (names.match_key), added and filled in place
+#   4  match_key recomputed: text around a camera number is only dropped when neutral
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 3
+_VERSION = 4
 
 _BATCH = 10_000
 
@@ -151,7 +152,7 @@ class Index:
                 # Scans from before the dirs table never recorded non-media content.
                 for table in ("files", "staging", "dirs", "roots"):
                     self.conn.execute(f"DELETE FROM {table}")
-            if version < 3:
+            if version < 4:
                 for table in ("files", "staging"):
                     columns = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
                     if "match_key" not in columns:
@@ -236,6 +237,10 @@ class Index:
 
     def begin_root(self, root: str) -> None:
         """Start a streaming rescan of `root`, discarding leftovers of an aborted one."""
+        self.discard_staged(root)
+
+    def discard_staged(self, root: str) -> None:
+        """Drop the records staged for `root`, leaving its indexed contents as they were."""
         where, params = _prefix_clause([root])
         with self.conn:
             self.conn.execute(f"DELETE FROM staging WHERE {where}", params)

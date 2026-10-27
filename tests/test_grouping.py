@@ -637,7 +637,8 @@ class SimilarNamesTest(unittest.TestCase):
              "2023-08-26_DSC00003.ARW"],
         )  # fmt: skip
 
-    def test_unmatched_siblings_do_not_split_runs(self):
+    def test_same_format_siblings_split_runs(self):
+        """X.DNG beside a matched X (2).DNG is a different file: it must end the run."""
         from dpf.report import run_lines
 
         a, b = [], []
@@ -647,11 +648,60 @@ class SimilarNamesTest(unittest.TestCase):
             b.append(rec("/m/B", f"IMGQ594{i}.DNG", 100 + i))
         (pair,) = self.result(a + b).pairs
         self.assertEqual(
-            run_lines(pair.runs, 8, indent=""),
-            ["IMGQ5941 (2).DNG … IMGQ5944 (2).DNG  4 files  "
-             "→ in B: IMGQ5941.DNG … IMGQ5944.DNG"],
-        )  # fmt: skip
+            [(r.a_first, r.a_last, r.count, r.skipped) for r in pair.runs],
+            [(f"IMGQ594{i} (2).DNG", f"IMGQ594{i} (2).DNG", 1, ()) for i in range(1, 5)],
+        )
+        self.assertEqual(
+            run_lines(pair.runs[:1], 8, indent=""),
+            ["IMGQ5941 (2).DNG  1 file   → in B: IMGQ5941.DNG"],
+        )
         self.assertEqual((pair.matched_a, pair.total_a, pair.relation), (4, 8, B_IN_A))
+
+    def test_unmatched_raw_inside_run_is_listed(self):
+        """A holds DSC00001-5 as ARW+JPG, B all but DSC00003.ARW: the gap must show."""
+        from dpf.report import run_lines
+
+        a = [rec("/m/A", f"DSC0000{i}.{ext}", i * 10 + n) for i in range(1, 6)
+             for n, ext in enumerate(("ARW", "JPG"))]  # fmt: skip
+        b = [rec("/m/B", r.name, r.size) for r in a if r.name != "DSC00003.ARW"]
+        (pair,) = self.result(a + b).pairs
+        (run,) = pair.runs
+        self.assertEqual(
+            (run.a_first, run.a_last, run.count, run.skipped),
+            ("DSC00001.ARW", "DSC00005.JPG", 9, ("DSC00003.ARW",)),
+        )
+        self.assertEqual((pair.relation, pair.matched_a, pair.total_a), (B_IN_A, 9, 10))
+        self.assertEqual(
+            run_lines(pair.runs, 8, indent=""),
+            ["DSC00001.ARW … DSC00005.JPG  9 files  (+1 inside not matched: DSC00003.ARW)"],
+        )
+
+    def test_skipped_names_capped_in_text(self):
+        from dpf.report import run_lines
+
+        a = [rec("/m/A", f"DSC0000{i}.{ext}", i * 10 + n) for i in range(1, 8)
+             for n, ext in enumerate(("ARW", "JPG"))]  # fmt: skip
+        b = [rec("/m/B", r.name, r.size) for r in a if r.name.endswith(".JPG")]
+        (pair,) = self.result(a + b).pairs
+        (run,) = pair.runs
+        # Each ARW sorts just before its matched JPG, so only DSC00001.ARW lies outside.
+        self.assertEqual(run.skipped, tuple(f"DSC0000{i}.ARW" for i in range(2, 8)))
+        self.assertEqual(
+            run_lines(pair.runs, 8, indent=""),
+            ["DSC00001.JPG … DSC00007.JPG  7 files  (+6 inside not matched: DSC00002.ARW, "
+             "DSC00003.ARW, DSC00004.ARW, +3 more)"],
+        )  # fmt: skip
+
+    def test_siblings_outside_a_run_are_not_listed(self):
+        a = [rec("/m/A", "X1.ARW", 1), rec("/m/A", "X1.JPG", 2), rec("/m/A", "X2.ARW", 3)]
+        a += [rec("/m/A", "X2.JPG", 4), rec("/m/A", "Y.JPG", 5)]
+        b = [rec("/m/B", "X1.ARW", 1), rec("/m/B", "X2.ARW", 3)]
+        (pair,) = self.result(a + b).pairs
+        # X2.JPG trails the run and Y.JPG ends it: neither lies inside X1.ARW … X2.ARW.
+        self.assertEqual(
+            [(r.a_first, r.a_last, r.skipped) for r in pair.runs],
+            [("X1.ARW", "X2.ARW", ("X1.JPG",))],
+        )
 
     def test_raw_jpg_siblings_do_not_split_runs(self):
         a = [rec("/m/A", f"DSC0000{i}.{ext}", i * 10 + n) for i in range(1, 5)
@@ -663,13 +713,46 @@ class SimilarNamesTest(unittest.TestCase):
         b.append(rec("/m/B", "DSC00006.ARW", 999))
         (pair,) = self.result(a + b).pairs
         self.assertEqual(
-            [(r.a_first, r.a_last, r.count) for r in pair.runs],
-            [("DSC00001.ARW", "DSC00004.ARW", 4), ("DSC00006.ARW", "DSC00006.ARW", 1)],
-        )
+            [(r.a_first, r.a_last, r.count, r.skipped) for r in pair.runs],
+            [("DSC00001.ARW", "DSC00004.ARW", 4,
+              ("DSC00001.JPG", "DSC00002.JPG", "DSC00003.JPG")),
+             ("DSC00006.ARW", "DSC00006.ARW", 1, ())],
+        )  # fmt: skip
         jpg_first = [rec("/m/A", "X1.JPG", 1), rec("/m/A", "X2.ARW", 5), rec("/m/A", "X2.JPG", 2)]
         jpg_first += [rec("/m/B", "X1.JPG", 1), rec("/m/B", "X2.JPG", 2)]
         (pair,) = self.result(jpg_first).pairs
-        self.assertEqual([(r.a_first, r.a_last) for r in pair.runs], [("X1.JPG", "X2.JPG")])
+        self.assertEqual(
+            [(r.a_first, r.a_last, r.skipped) for r in pair.runs],
+            [("X1.JPG", "X2.JPG", ("X2.ARW",))],
+        )
+
+    def test_similar_names_flag(self):
+        from dpf.report import run_lines
+
+        exact = [rec("/m/A", "DSC00001.JPG"), rec("/m/B", "DSC00001.JPG")]
+        (pair,) = self.result(exact).pairs
+        self.assertFalse(pair.similar_names)
+        case = [rec("/m/A", "DSC00001.JPG"), rec("/m/B", "dsc00001.jpg")]
+        (pair,) = self.result(case).pairs
+        self.assertTrue(pair.similar_names)
+        self.assertEqual(
+            run_lines(pair.runs, 8, indent=""), ["DSC00001.JPG  1 file   → in B: dsc00001.jpg"]
+        )
+        # A's file has an exact copy in B, but B's "(1)" copy is matched by a similar name.
+        extra = exact + [rec("/m/B", "DSC00001 (1).JPG")]
+        pair = pair_map(self.result(extra))[("/m/A", "/m/B")]
+        self.assertTrue(pair.runs[0].same_names)
+        self.assertTrue(pair.similar_names)
+
+    def test_similar_names_flag_survives_tree_roll_up(self):
+        records = [rec("/m/A/x", "DSC00001.JPG"), rec("/m/B/x", "DSC00001.JPG")]
+        records += [rec("/m/A/y", "DSC00002.JPG"), rec("/m/B/y", "DSC00002 (1).JPG")]
+        (pair,) = self.result(records).pairs
+        self.assertEqual((pair.dir_a, pair.dir_b, pair.relation), ("/m/A", "/m/B", IDENTICAL_TREE))
+        self.assertTrue(pair.similar_names)
+        (pair,) = self.result(records[:2] + [rec("/m/A/y", "Z.JPG"), rec("/m/B/y", "Z.JPG")]).pairs
+        self.assertEqual(pair.relation, IDENTICAL_TREE)
+        self.assertFalse(pair.similar_names)
 
     def test_copy_in_same_folder(self):
         res = self.result([rec("/m/A", "DSC0001.JPG"), rec("/m/A", "DSC0001 (1).JPG")])

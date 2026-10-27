@@ -237,7 +237,7 @@ class IndexFileTest(unittest.TestCase):
         conn.close()
 
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(idx.totals(["/m"]), (3, 207))
             self.assertEqual(idx.root_stats("/m/A").scanned_at, 123.0)
             self.assertEqual(idx.dir_extras("/m/A/x"), (2, 1))
@@ -261,6 +261,25 @@ class IndexFileTest(unittest.TestCase):
             self.assertEqual(idx.totals(["/m"])[0], 5)
         with Index(path) as idx:  # reopening is a no-op
             self.assertEqual(idx.totals(["/m"])[0], 5)
+
+    def test_migrates_version_3_match_keys_in_place(self):
+        """v4 recomputes match_key: other text around a camera number is now kept."""
+        path = os.path.join(self.tmp.name, "index.db")
+        with Index(path) as idx:
+            idx.replace_root("/m", [rec("/m/a", "BodyA_DSC01234.ARW"), rec("/m/b", "x.jpg")])
+            idx.begin_root("/s")
+            idx.add_records([rec("/s", "Trip DSC00001.ARW")])
+            for table in ("files", "staging"):
+                idx.conn.execute(f"UPDATE {table} SET match_key = 'stale'")
+            idx.conn.execute("PRAGMA user_version = 3")
+            idx.conn.commit()
+        with Index(path) as idx:
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            keys = dict(idx.conn.execute("SELECT name, match_key FROM files"))
+            self.assertEqual(keys, {"BodyA_DSC01234.ARW": "bodya_dsc01234.arw", "x.jpg": "x.jpg"})
+            staged = idx.conn.execute("SELECT match_key FROM staging").fetchall()
+            self.assertEqual(staged, [("trip dsc00001.arw",)])
+            self.assertEqual(idx.root_stats("/m").files, 2)
 
     def test_failed_migration_leaves_version_2_untouched(self):
         path = os.path.join(self.tmp.name, "index.db")

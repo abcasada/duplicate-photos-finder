@@ -1,6 +1,14 @@
 import unittest
 
-from dpf.names import camera_token, match_key, strip_copy_marks
+from dpf.names import (
+    camera_token,
+    copy_marks,
+    copy_numbers,
+    is_neutral,
+    match_key,
+    split_copy_marks,
+    strip_copy_marks,
+)
 
 # (name, expected key)
 KEYS = [
@@ -22,25 +30,37 @@ KEYS = [
     ("2023-08-26_DSC01234-2.ARW", "dsc01234.arw"),
     ("Beach_3 (1).jpg", "beach_3.jpg"),
     ("105_3661mod - Copy - Copy (2).jpg", "105_3661mod.jpg"),
-    # camera file numbers inside renamed files
+    # camera file numbers with neutral text (a date/time, separators) around them
     ("2023-08-26_DSC01234.ARW", "dsc01234.arw"),
-    ("Lincoln Air Show DSC04205.ARW", "dsc04205.arw"),
-    ("DSC04205-Edit.jpg", "dsc04205.jpg"),
+    ("20230826 DSC01234.ARW", "dsc01234.arw"),
+    ("2023_08_26_17_16_18_DSC01234.ARW", "dsc01234.arw"),
+    ("DSC01234_2023-08-26.ARW", "dsc01234_2023-08-26.arw"),  # no token: "_2…" follows
+    ("DSC01234 2023-08-26.ARW", "dsc01234.arw"),
     ("_DSC1234.ARW", "dsc1234.arw"),
-    ("Air show _DSC1234.ARW", "dsc1234.arw"),
     ("2023_DSC01234.ARW", "dsc01234.arw"),
-    ("Trip DSC_0627.NEF", "dsc_0627.nef"),
-    ("Trip _MG_1234.CR2", "mg_1234.cr2"),
-    ("Fuji DSCF0042.RAF", "dscf0042.raf"),
-    ("K1 IMGQ1234.DNG", "imgq1234.dng"),
+    ("2023-08-26 DSC_0627.NEF", "dsc_0627.nef"),
+    ("2023-08-26 _MG_1234.CR2", "mg_1234.cr2"),
+    ("2023-08-26 DSCF0042.RAF", "dscf0042.raf"),
+    ("2023-08-26 IMGQ1234.DNG", "imgq1234.dng"),
     ("2019 IMGP0042.PEF", "imgp0042.pef"),
-    ("Holiday IMG_0001.HEIC", "img_0001.heic"),
-    ("Ride GX010039.MP4", "gx010039.mp4"),
-    ("Ride GOPR0039.MP4", "gopr0039.mp4"),
-    ("Lumix P1020970.JPG", "p1020970.jpg"),
-    ("Old SAM_0696.JPG", "sam_0696.jpg"),
-    ("IMG_0001 2.jpg", "img_0001.jpg"),  # macOS "Keep Both", via the camera number
-    ("DSC01234 DSC01234.jpg", "dsc01234.jpg"),  # the same number twice is one token
+    ("2023-08-26 IMG_0001.HEIC", "img_0001.heic"),
+    ("2023-08-26 GX010039.MP4", "gx010039.mp4"),
+    ("2023-08-26 GOPR0039.MP4", "gopr0039.mp4"),
+    ("2023-08-26 P1020970.JPG", "p1020970.jpg"),
+    ("2023-08-26 SAM_0696.JPG", "sam_0696.jpg"),
+    ("IMG_0001 2.jpg", "img_0001.jpg"),  # macOS "Keep Both": a copy mark after a number
+    # other text around a camera number is kept verbatim (it may name a body or an edit)
+    ("Lincoln Air Show DSC04205.ARW", "lincoln air show dsc04205.arw"),
+    ("Lincoln Air Show DSC04205 (1).ARW", "lincoln air show dsc04205.arw"),
+    ("2023-08-26_Lincoln DSC04205.ARW", "2023-08-26_lincoln dsc04205.arw"),
+    ("BodyA_DSC01234.ARW", "bodya_dsc01234.arw"),
+    ("BodyA_DSC01234 (1).ARW", "bodya_dsc01234.arw"),
+    ("DSC04205-Edit.jpg", "dsc04205-edit.jpg"),
+    ("2023-08-26_DSC04205-Edit.jpg", "dsc04205-edit.jpg"),
+    ("DSC04205-Edit-2.tif", "dsc04205-edit-2.tif"),
+    ("Air show _DSC1234.ARW", "air show _dsc1234.arw"),
+    ("1_DSC01234.ARW", "1_dsc01234.arw"),  # too few digits for a date
+    ("DSC01234 DSC01234.jpg", "dsc01234 dsc01234.jpg"),
     # left alone: camera numbers are never truncated
     ("IMG_1234.jpg", "img_1234.jpg"),
     ("IMG_1235.jpg", "img_1235.jpg"),
@@ -80,6 +100,12 @@ KEYS = [
 
 # Pairs that must never share a key.
 DISTINCT = [
+    ("BodyA_DSC01234.ARW", "BodyB_DSC01234.ARW"),
+    ("BodyA_DSC01234.ARW", "DSC01234.ARW"),
+    ("DSC01234-Edit.tif", "DSC01234-Edit-2.tif"),
+    ("DSC01234-Edit.tif", "DSC01234.tif"),
+    ("Lincoln Air Show DSC04205.ARW", "DSC04205.ARW"),
+    ("1_DSC01234.ARW", "2_DSC01234.ARW"),
     ("IMG_1234.jpg", "IMG_1235.jpg"),
     ("DSC01234.ARW", "DSC01234.JPG"),
     ("DSC01234 (1).ARW", "DSC01234.JPG"),
@@ -110,9 +136,64 @@ class MatchKeyTest(unittest.TestCase):
         variants = [
             "DSC01234.ARW", "dsc01234.arw", "DSC01234 (1).ARW", "DSC01234-2.ARW",
             "DSC01234 - Copy.ARW", "Copy of DSC01234.ARW", "DSC01234~2.ARW",
-            "2023-08-26_DSC01234.ARW", "Air Show DSC01234 (1).ARW",
+            "2023-08-26_DSC01234.ARW", "20230826 DSC01234 (1).ARW",
         ]  # fmt: skip
         self.assertEqual({match_key(v) for v in variants}, {"dsc01234.arw"})
+
+    def test_copy_marks(self):
+        cases = [
+            ("X.jpg", ()),
+            ("X (1).jpg", ("(1)",)),
+            ("X(1).jpg", ("(1)",)),
+            ("X (2).jpg", ("(2)",)),
+            ("X - Copy.jpg", ("-copy",)),
+            ("X - Copy (2).jpg", ("-copy(2)",)),
+            ("Copy of X.jpg", ("copyof",)),
+            ("X~2.jpg", ("~2",)),
+            ("DSC00001-2.jpg", ("-2",)),
+            ("DSC00001_1.ARW", ("_1",)),
+            ("IMG_0001 2.jpg", ("2",)),
+            ("IMG_0001-12 (1).jpg", ("(1)", "-12")),
+            ("2023-08-26_DSC01234.ARW", ()),  # renamed, not marked
+            ("Pic-2.bmp", ()),
+            ("Party 2.jpg", ()),
+            ("(1).jpg", ()),  # a name that would vanish is not a mark
+        ]
+        for name, marks in cases:
+            with self.subTest(name=name):
+                self.assertEqual(copy_marks(name), marks)
+        self.assertEqual(split_copy_marks("x - copy (2) - copy"), ("x", ("-copy", "-copy(2)")))
+
+    def test_copy_numbers(self):
+        cases = [
+            ("X.jpg", ()),
+            ("X - Copy.jpg", ()),
+            ("Copy of X.jpg", ()),
+            ("X - Copy - Copy.jpg", ()),
+            ("X (1).jpg", (1,)),
+            ("X - Copy (2).jpg", (2,)),
+            ("Copy (3) of X.jpg", (3,)),
+            ("X copy 2.jpg", (2,)),
+            ("X~02.jpg", (2,)),
+            ("DSC00001-2.jpg", (2,)),
+            ("DSC00001_1.ARW", (1,)),
+            ("IMG_0001 2.jpg", (2,)),
+            ("IMG_0001-12 (1).jpg", (1, 12)),
+            ("Vacation (2).ARW", (2,)),
+            ("2023-08-26_DSC01234.ARW", ()),
+            ("Party 2.jpg", ()),
+        ]
+        for name, numbers in cases:
+            with self.subTest(name=name):
+                self.assertEqual(copy_numbers(name), numbers)
+
+    def test_is_neutral(self):
+        for text in ("", "_", " - ", "2023-08-26_", "20230826 ", "2023_08_26_17_16_18_", "2019 "):
+            with self.subTest(text=text):
+                self.assertTrue(is_neutral(text))
+        for text in ("bodya_", "1_", "12-", "-edit", "trip 2023 ", "(1)"):
+            with self.subTest(text=text):
+                self.assertFalse(is_neutral(text))
 
     def test_strip_copy_marks(self):
         self.assertEqual(strip_copy_marks("x - copy (2) - copy"), "x")

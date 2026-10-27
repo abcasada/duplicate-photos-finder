@@ -247,6 +247,72 @@ class ScanRootsTest(TempTree):
         self.assertEqual(stats[0].files, 25)
         self.assertEqual(self.idx.totals([self.p("r")])[0], 25)
 
+    def empty_out(self, *parts):
+        """Make a scanned folder look like an unmounted drive's leftover mount point."""
+        for entry in os.listdir(self.p(*parts)):
+            path = self.p(*parts, entry)
+            os.rename(path, self.p("moved-" + entry))
+
+    def test_empty_root_keeps_previous_contents(self):
+        touch(self.p("r", "a.jpg"), b"xx")
+        touch(self.p("r", "a.xmp"))
+        touch(self.p("r", "sub", "b.jpg"))
+        touch(self.p("s", "c.jpg"))
+        scan_roots(self.idx, [self.p("r"), self.p("s")])
+        before = self.idx.root_stats(self.p("r"))
+        self.empty_out("r")
+        os.remove(self.p("s", "c.jpg"))
+        os.makedirs(self.p("s", "empty sub"))  # not completely empty: a real, empty drive
+        kept = {}
+        stats = scan_roots(self.idx, [self.p("r"), self.p("s")], kept=kept)
+        self.assertEqual(kept, {self.p("r"): 2})
+        self.assertEqual([(st.root, st.files) for st in stats], [(self.p("s"), 0)])
+        self.assertEqual(self.idx.totals([self.p("r")]), (2, 2))
+        self.assertEqual(self.idx.root_stats(self.p("r")), before)
+        self.assertEqual(self.idx.dir_extras(self.p("r")), (1, 0))
+        self.assertEqual(self.idx.totals([self.p("s")])[0], 0)
+        staged = self.idx.conn.execute("SELECT count(*) FROM staging").fetchone()[0]
+        self.assertEqual(staged, 0)
+
+    def test_empty_root_accepted_with_allow_empty(self):
+        touch(self.p("r", "a.jpg"))
+        scan_roots(self.idx, [self.p("r")])
+        self.empty_out("r")
+        kept = {}
+        stats = scan_roots(self.idx, [self.p("r")], allow_empty=True, kept=kept)
+        self.assertEqual((kept, [st.files for st in stats]), ({}, [0]))
+        self.assertEqual(self.idx.totals([self.p("r")])[0], 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read chmod 000 directories")
+    def test_unreadable_root_keeps_previous_contents(self):
+        touch(self.p("r", "a.jpg"))
+        touch(self.p("r", "b.jpg"))
+        scan_roots(self.idx, [self.p("r")])
+        os.chmod(self.p("r"), 0)
+        try:
+            kept, errors = {}, []
+            stats = scan_roots(self.idx, [self.p("r")], kept=kept, errors=errors)
+        finally:
+            os.chmod(self.p("r"), 0o755)
+        self.assertEqual((kept, stats), ({self.p("r"): 2}, []))
+        self.assertEqual(self.idx.totals([self.p("r")])[0], 2)
+
+    def test_empty_root_never_indexed_is_recorded(self):
+        os.makedirs(self.p("r"))
+        kept = {}
+        stats = scan_roots(self.idx, [self.p("r")], kept=kept)
+        self.assertEqual((kept, [st.files for st in stats]), ({}, [0]))
+        self.assertIsNotNone(self.idx.root_stats(self.p("r")))
+
+    def test_root_with_only_skipped_entries_is_not_empty(self):
+        touch(self.p("r", "a.jpg"))
+        scan_roots(self.idx, [self.p("r")])
+        self.empty_out("r")
+        os.makedirs(self.p("r", "System Volume Information"))  # a mounted NTFS drive
+        stats = scan_roots(self.idx, [self.p("r")])
+        self.assertEqual([st.files for st in stats], [0])
+        self.assertEqual(self.idx.totals([self.p("r")])[0], 0)
+
     def test_worker_exception_propagates_and_keeps_old_contents(self):
         touch(self.p("r", "a.jpg"))
         scan_roots(self.idx, [self.p("r")])

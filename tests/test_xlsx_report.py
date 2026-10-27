@@ -91,18 +91,24 @@ class XlsxReportTest(unittest.TestCase):
         cells = wb.cells("Folder pairs")
         self.assertEqual(cells["A1"], "#")
         self.assertEqual(cells["D2"], "partial overlap")
-        self.assertEqual(cells["E2"], "/drives/one/DCIM/100CANON")
+        self.assertEqual((cells["E1"], cells["E2"]), ("Names", "exact"))
+        self.assertEqual(cells["F2"], "/drives/one/DCIM/100CANON")
         self.assertEqual(cells["C2"], 225_000_000)  # bytes, so sorting works
-        self.assertEqual((cells["G2"], cells["H2"], cells["I2"]), (45, 60, 0.75))
+        self.assertEqual((cells["H2"], cells["I2"], cells["J2"]), (45, 60, 0.75))
         self.assertEqual(
-            cells["Q2"],
+            cells["R2"],
             "IMG_0100.JPG … IMG_0139.JPG  40 files  (+1 more on Sequences sheet)",
         )
-        renamed = next(v for k, v in cells.items() if k[0] == "Q" and "Trip" in str(v))
-        self.assertEqual(renamed, "E1.jpg … E3.jpg  3 files  → in B: Trip 001.jpg … Trip 003.jpg")
+        renamed = next(r for r in range(2, 5) if "Trip" in str(cells.get(f"R{r}")))
+        self.assertEqual(
+            cells[f"R{renamed}"],
+            "E1.jpg … E3.jpg  3 files  → in B: Trip 001.jpg … Trip 003.jpg",
+        )
+        self.assertEqual(cells[f"E{renamed}"], "similar")
         seq = wb.cells("Sequences")
         self.assertEqual((seq["D2"], seq["E2"], seq["H2"]), ("IMG_0100.JPG", "IMG_0139.JPG", 40))
         self.assertNotIn("F2", seq)  # B names only when they differ
+        self.assertNotIn("J2", seq)  # nothing passed over inside the run
         self.assertIn("Trip 001.jpg", seq.values())
         files = wb.cells("Files")
         rows = sum(len(g.files) for g in groups)
@@ -149,7 +155,7 @@ class XlsxReportTest(unittest.TestCase):
         self.assertEqual((trees["H2"], trees["K2"]), (0.98, 1))
         self.assertEqual(trees["C3"], "B within A")
         pairs = wb.cells("Folder pairs")
-        tagged = {pairs[f"E{r}"]: pairs.get(f"B{r}") for r in range(2, 7)}
+        tagged = {pairs[f"F{r}"]: pairs.get(f"B{r}") for r in range(2, 7)}
         self.assertEqual(tagged["/d1/Photos/2019/Paris"], 1)
         self.assertEqual(tagged["/d1/Misc/a"], 2)
 
@@ -160,7 +166,7 @@ class XlsxReportTest(unittest.TestCase):
         self.assertIn("file:///x/Trip%20%231%20100%25", links)
         self.assertIn("file:///y/Caf%C3%A9%20%3D%20copy", links)
         cells = wb.cells("Folder pairs")
-        self.assertEqual((cells["E2"], cells["F2"]), (a, b))
+        self.assertEqual((cells["F2"], cells["G2"]), (a, b))
         trees = self.write(build_trees())
         self.assertIn("file:///d2/Photo%20backups/2019/Paris", trees.links("Folder pairs"))
         self.assertIn("file:///d2/Photo%20backups", trees.links("Trees"))
@@ -168,8 +174,8 @@ class XlsxReportTest(unittest.TestCase):
     def test_percent_is_floored(self):
         wb = self.write(result_of(pair("/a", "/b", 3842, 3843, 3842, 3842, A_IN_B)))
         cells = wb.cells("Folder pairs")
-        self.assertEqual(cells["I2"], 0.99)
-        self.assertEqual(cells["L2"], 1.0)
+        self.assertEqual(cells["J2"], 0.99)
+        self.assertEqual(cells["M2"], 1.0)
         n = wb.names.index("Folder pairs") + 1
         self.assertNotIn(b"0.9997", wb.zip.read(f"xl/worksheets/sheet{n}.xml"))
 
@@ -185,7 +191,7 @@ class XlsxReportTest(unittest.TestCase):
         with mock.patch("dpf.xlsx_report.MAX_URLS", 2):
             wb = self.write(result_of(*pairs))
         self.assertEqual(wb.links("Folder pairs"), ["file:///a/0", "file:///b/0"])
-        self.assertEqual(wb.cells("Folder pairs")["E4"], "/a/2")
+        self.assertEqual(wb.cells("Folder pairs")["F4"], "/a/2")
 
     def test_other_files_and_odd_strings(self):
         p = pair("=SUM(A1)", "http://example.com", 1, 1, 1, 1, A_IN_B, unindexed=3)
@@ -193,11 +199,38 @@ class XlsxReportTest(unittest.TestCase):
         wb = self.write(result_of(p), groups)
         cells = wb.cells("Folder pairs")
         self.assertEqual(
-            (cells["E2"], cells["F2"], cells["O2"]), ("=SUM(A1)", "http://example.com", 3)
+            (cells["F2"], cells["G2"], cells["P2"]), ("=SUM(A1)", "http://example.com", 3)
         )
         n = wb.names.index("Folder pairs") + 1
         self.assertNotIn(b"<f>", wb.zip.read(f"xl/worksheets/sheet{n}.xml"))
         self.assertEqual(wb.cells("Files")["F2"], "-1000000000000.0")  # pre-1900 dates as text
+
+    def test_skipped_files_and_names(self):
+        runs = (
+            Run("DSC00001.ARW", "DSC00005.JPG", "DSC00001.ARW", "DSC00005.JPG", 9, 90, True,
+                ("DSC00003.ARW",)),
+            Run("DSC00007.ARW", "DSC00009.JPG", "DSC00007.ARW", "DSC00009.JPG", 4, 40, True,
+                ("DSC00008.ARW", "DSC00009.ARW")),
+        )  # fmt: skip
+        p = FolderPair("/a", "/b", runs, 13, 16, 13, 13, 130, A_IN_B, similar_names=True)
+        groups = [
+            DuplicateGroup((rec("/a", "x.jpg"), rec("/b", "x.jpg")), "name"),
+            DuplicateGroup((rec("/a", "y.jpg"), rec("/b", "y (1).jpg")), "name"),
+        ]
+        wb = self.write(result_of(p), groups)
+        pairs = wb.cells("Folder pairs")
+        self.assertEqual(pairs["E2"], "similar")
+        self.assertEqual(
+            pairs["R2"],
+            "DSC00001.ARW … DSC00005.JPG  9 files  (+1 inside not matched: DSC00003.ARW)  "
+            "(+1 more on Sequences sheet; 2 inside them not matched)",
+        )
+        seq = wb.cells("Sequences")
+        self.assertEqual((seq["J1"], seq["K1"]), ("Not matched inside", "Not matched names"))
+        self.assertEqual((seq["J2"], seq["K2"]), (1, "DSC00003.ARW"))
+        self.assertEqual((seq["J3"], seq["K3"]), (2, "DSC00008.ARW, DSC00009.ARW"))
+        files = wb.cells("Files")
+        self.assertEqual((files["H1"], files["H2"], files["H4"]), ("Names", "exact", "similar"))
 
     def test_empty_result(self):
         wb = self.write(GroupingResult([], [], 0, 0, 0))

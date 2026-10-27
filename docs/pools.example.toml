@@ -4,9 +4,10 @@
 # A pool is a set of drives that are compared with each other and never with another
 # pool: `dpf find --pool A`, `dpf scan --pool B`, `dpf pools`.
 #
-# Each pool is a list of paths or glob patterns (fnmatch-style * ? [..]). A pattern
-# matches the drives mounted now and the drives in the index, so unplugged drives that
-# were scanned before still count. Pool names are case-insensitive.
+# Each pool is a list of paths or glob patterns (* ? [..]), matched one path segment at
+# a time, so * never spans a '/'. A pattern matches the drives mounted now and the drives
+# in the index, so unplugged drives that were scanned before still count. Pool names are
+# case-insensitive. A drive matching two pools is an error.
 [pools]
 # Primary drives: the 1TB SSD plus every "Storage <N>A ..." drive.
 A = ["/run/media/adam/Storage 1TB", "/run/media/adam/Storage [0-9]A *"]

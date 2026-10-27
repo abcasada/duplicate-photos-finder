@@ -148,6 +148,19 @@ def walk(
         stack.extend(sorted(subdirs, reverse=True))
 
 
+def _is_unusable_root(path: str) -> bool:
+    """True if `path` lists no entries at all, or cannot be listed.
+
+    A leftover mount point of an unplugged drive is empty; a failed or half-mounted drive
+    may refuse to list. Either way a scan of it says nothing about the drive's contents.
+    """
+    try:
+        with os.scandir(path) as it:
+            return next(it, None) is None
+    except OSError:
+        return True
+
+
 class _Stopped(Exception):
     pass
 
@@ -170,15 +183,20 @@ def _device_worker(
             errors: list[str] = []
             dir_stats: DirStats = {}
             batch: list[FileRecord] = []
+            found = 0
             sent = time.monotonic()
             for rec in walk(root, all_files=all_files, errors=errors, dir_stats=dir_stats):
                 batch.append(rec)
+                found += 1
                 if len(batch) >= BATCH_SIZE or time.monotonic() - sent >= BATCH_SECONDS:
                     put(("batch", root, batch))
                     batch, sent = [], time.monotonic()
             if batch:
                 put(("batch", root, batch))
-            put(("end", root, (errors, dir_stats)))
+            empty = not found and _is_unusable_root(root) and (
+                not (errors or dir_stats) or not os.access(root, os.R_OK | os.X_OK)
+            )
+            put(("end", root, (errors, dir_stats, empty)))
         put(("done", None, None))
     except _Stopped:
         pass
@@ -196,13 +214,21 @@ def scan_roots(
     all_files: bool = False,
     progress: Progress | None = None,
     errors: list[str] | None = None,
+    allow_empty: bool = False,
+    kept: dict[str, int] | None = None,
 ) -> list[RootStats]:
     """Scan `roots` (as from normalize_roots) into `index`, replacing what each held.
 
     Roots on the same device are walked sequentially by one thread; devices are walked
     in parallel. Error messages are appended to `errors` if given; per-directory counts
-    of entries not indexed (see walk) are stored with the root. Returns stats in
-    the order of `roots`. A root whose scan is interrupted keeps its previous contents.
+    of entries not indexed (see walk) are stored with the root. A root whose scan is
+    interrupted keeps its previous contents.
+
+    A root that lists no entries at all while the index holds files under it is most
+    likely an unmounted drive's leftover mount folder, and the index may be the only
+    record of that drive. Unless `allow_empty`, such a root keeps its previous contents
+    and is added to `kept` (root -> files still indexed). Returns stats, in the order
+    of `roots`, for the roots that were replaced.
     """
     roots = [os.path.abspath(r) for r in roots]
     by_dev: dict[int, list[str]] = {}
@@ -241,7 +267,13 @@ def scan_roots(
                     reported[root] = now
                     progress(root, c[0], c[1])
             elif kind == "end":
-                root_errors, dir_stats = payload
+                root_errors, dir_stats, empty = payload
+                previous = index.totals([root])[0] if empty and not allow_empty else 0
+                if previous:
+                    index.discard_staged(root)
+                    if kept is not None:
+                        kept[root] = previous
+                    continue
                 stats[root] = index.finish_root(root, len(root_errors), dir_stats)
                 if errors is not None:
                     errors.extend(root_errors)
@@ -253,4 +285,4 @@ def scan_roots(
                 raise payload
     finally:
         stop.set()
-    return [stats[r] for r in roots]
+    return [stats[r] for r in roots if r in stats]

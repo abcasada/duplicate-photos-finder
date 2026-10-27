@@ -1,8 +1,8 @@
 """Named drive pools from a TOML config: sets of drives compared only among themselves.
 
-A pool is a list of paths or fnmatch-style glob patterns (`*`, `?`, `[..]`). Patterns
-match both the directories mounted now and the roots in the index, so a pool also
-covers drives that are unplugged but were scanned before.
+A pool is a list of paths or glob patterns (`*`, `?`, `[..]`, matched per path segment
+as in a shell). Patterns match both the directories mounted now and the roots in the
+index, so a pool also covers drives that are unplugged but were scanned before.
 """
 
 from __future__ import annotations
@@ -101,15 +101,20 @@ def is_glob(pattern: str) -> bool:
 
 
 def matches(path: str, pattern: str) -> bool:
-    """True if `path`, or a folder containing it, matches `pattern` (full-path fnmatch)."""
-    path = path.rstrip("/") or "/"
-    while True:
-        if fnmatchcase(path, pattern):
-            return True
-        parent = os.path.dirname(path)
-        if parent == path:
-            return False
-        path = parent
+    """True if `path`, or a folder containing it, matches `pattern`.
+
+    Matching is per path segment, as in glob: `*`, `?` and `[..]` never match "/", so
+    "/m/Storage [0-9]A *" covers "/m/Storage 2A 8TB/x" but not
+    "/m/Storage 2B 8TB/old/Storage 1A x".
+    """
+    parts, pattern_parts = _segments(path), _segments(pattern)
+    return len(parts) >= len(pattern_parts) and all(
+        fnmatchcase(part, pat) for part, pat in zip(parts, pattern_parts)
+    )
+
+
+def _segments(path: str) -> list[str]:
+    return [p for p in path.split("/") if p]
 
 
 def pools_of(pools: Pools, path: str) -> list[str]:
