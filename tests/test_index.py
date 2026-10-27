@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 from dpf.index import Index
-from dpf.models import FileRecord
+from dpf.models import DriveSpace, FileRecord
 
 
 def rec(dir, name, size=100, mtime=1_000_000.0, kind="image"):
@@ -181,6 +181,35 @@ class IndexTest(unittest.TestCase):
         self.idx.finish_root("/m/A")
         self.assertEqual([r.root for r in self.idx.roots()], ["/m/A", "/m/A-old"])
 
+    def test_drive_space_recorded_with_root(self):
+        st = self.idx.replace_root("/a", [rec("/a", "x.jpg")], space=DriveSpace(30, 100, True))
+        self.assertEqual(self.idx.root_stats("/a"), st)
+        self.assertEqual((st.used_bytes, st.capacity_bytes, st.is_mount), (30, 100, True))
+        self.assertEqual((st.space_source, st.space_at), ("statvfs", st.scanned_at))
+        self.assertEqual(st.space, DriveSpace(30, 100, True, "statvfs", st.scanned_at))
+        self.idx.begin_root("/b")
+        st = self.idx.finish_root("/b", space=DriveSpace(1, 2, False))
+        self.assertEqual((st.used_bytes, st.is_mount), (1, False))
+        st = self.idx.finish_root("/b")
+        self.assertIsNone(st.space)
+        self.assertEqual(self.idx.root_stats("/b"), st)
+
+    def test_set_space(self):
+        self.idx.replace_root("/a", [rec("/a", "x.jpg")])
+        self.assertIsNone(self.idx.root_stats("/a").used_bytes)
+        manual = DriveSpace(5_090_000_000_000, 8 * 10**12, None, "manual", 1234.0)
+        st = self.idx.set_space("/a/", manual)
+        self.assertEqual(st.space, manual)
+        self.assertEqual(self.idx.root_stats("/a"), st)
+        self.assertEqual((st.files, st.is_mount), (1, None))
+        # only indexed roots: no row is created for a path never scanned
+        self.assertIsNone(self.idx.set_space("/a/sub", manual))
+        self.assertIsNone(self.idx.set_space("/b", manual))
+        self.assertEqual([r.root for r in self.idx.roots()], ["/a"])
+        # a scan replaces a hand-entered figure with its own measurement
+        st = self.idx.replace_root("/a", [], space=DriveSpace(7, 9, True))
+        self.assertEqual((st.used_bytes, st.space_source), (7, "statvfs"))
+
     def test_forget_root(self):
         self.idx.replace_root(
             "/m/A", [rec("/m/A", "1.jpg"), rec("/m/A/s", "2.jpg")], dir_stats={"/m/A/s": (1, 0)}
@@ -237,7 +266,7 @@ class IndexFileTest(unittest.TestCase):
         conn.close()
 
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(idx.totals(["/m"]), (3, 207))
             self.assertEqual(idx.root_stats("/m/A").scanned_at, 123.0)
             self.assertEqual(idx.dir_extras("/m/A/x"), (2, 1))
@@ -274,12 +303,72 @@ class IndexFileTest(unittest.TestCase):
             idx.conn.execute("PRAGMA user_version = 3")
             idx.conn.commit()
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
             keys = dict(idx.conn.execute("SELECT name, match_key FROM files"))
             self.assertEqual(keys, {"BodyA_DSC01234.ARW": "bodya_dsc01234.arw", "x.jpg": "x.jpg"})
             staged = idx.conn.execute("SELECT match_key FROM staging").fetchall()
             self.assertEqual(staged, [("trip dsc00001.arw",)])
             self.assertEqual(idx.root_stats("/m").files, 2)
+
+    def test_migrates_version_4_in_place(self):
+        """v5 adds the drive-space columns to roots; everything else is kept as it was."""
+        path = os.path.join(self.tmp.name, "index.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(_V4_SCHEMA)
+        conn.execute(
+            "INSERT INTO files VALUES ('/m/A', 'x.jpg', 'x.jpg', 5, 1.0, 'image', 'kept-key')"
+        )
+        conn.execute(
+            "INSERT INTO staging VALUES ('/m/C', 'y.jpg', 'y.jpg', 1, 1.0, 'image', 'staged-key')"
+        )
+        conn.execute("INSERT INTO dirs VALUES ('/m/A', 2, 1)")
+        conn.execute("INSERT INTO roots VALUES ('/m/A', 1, 5, 3, 123.0)")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+
+        with Index(path) as idx:
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            columns = [r[1] for r in idx.conn.execute("PRAGMA table_info(roots)")]
+            self.assertEqual(columns, [
+                "path", "files", "bytes", "errors", "scanned_at",
+                "used_bytes", "capacity_bytes", "is_mount", "space_source", "space_at",
+            ])  # fmt: skip
+            st = idx.root_stats("/m/A")
+            self.assertEqual((st.files, st.bytes, st.errors, st.scanned_at), (1, 5, 3, 123.0))
+            self.assertEqual(
+                (st.used_bytes, st.capacity_bytes, st.is_mount, st.space_source, st.space_at),
+                (None,) * 5,
+            )
+            self.assertEqual(idx.totals(["/m"]), (1, 5))
+            self.assertEqual(idx.dir_extras("/m/A"), (2, 1))
+            keys = idx.conn.execute("SELECT match_key FROM files UNION ALL "
+                                    "SELECT match_key FROM staging").fetchall()  # fmt: skip
+            self.assertEqual(keys, [("kept-key",), ("staged-key",)])
+            st = idx.set_space("/m/A", DriveSpace(1, 2, True))
+            self.assertEqual((st.used_bytes, st.scanned_at), (1, 123.0))
+        with Index(path) as idx:  # reopening is a no-op
+            self.assertEqual(idx.root_stats("/m/A").used_bytes, 1)
+
+    def test_failed_migration_leaves_version_4_untouched(self):
+        path = os.path.join(self.tmp.name, "index.db")
+        conn = sqlite3.connect(path)
+        conn.executescript(_V4_SCHEMA)
+        conn.execute("INSERT INTO roots VALUES ('/m/A', 1, 5, 0, 123.0)")
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+        conn.close()
+        bad = {"used_bytes": "INTEGER", "capacity_bytes": "NOT A TYPE ("}
+        with mock.patch("dpf.index._SPACE_COLUMNS", bad):
+            with self.assertRaises(sqlite3.Error):
+                Index(path)
+        conn = sqlite3.connect(path)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(roots)")}
+        self.assertNotIn("used_bytes", columns)
+        conn.close()
+        with Index(path) as idx:
+            self.assertEqual(idx.root_stats("/m/A").files, 1)
 
     def test_failed_migration_leaves_version_2_untouched(self):
         path = os.path.join(self.tmp.name, "index.db")
@@ -324,6 +413,29 @@ CREATE INDEX files_name_size ON files (name_key, size);
 CREATE TABLE staging (
     dir TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, size INTEGER NOT NULL,
     mtime REAL NOT NULL, kind TEXT NOT NULL, PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
+CREATE TABLE dirs (
+    dir TEXT PRIMARY KEY, other INTEGER NOT NULL, errors INTEGER NOT NULL
+) WITHOUT ROWID;
+"""
+
+# The schema of user_version 4, before the drive-space columns of roots.
+_V4_SCHEMA = """
+CREATE TABLE roots (
+    path TEXT PRIMARY KEY, files INTEGER NOT NULL, bytes INTEGER NOT NULL,
+    errors INTEGER NOT NULL, scanned_at REAL NOT NULL
+);
+CREATE TABLE files (
+    dir TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, size INTEGER NOT NULL,
+    mtime REAL NOT NULL, kind TEXT NOT NULL, match_key TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
+CREATE INDEX files_name_size ON files (name_key, size);
+CREATE INDEX files_match_size ON files (match_key, size);
+CREATE TABLE staging (
+    dir TEXT NOT NULL, name TEXT NOT NULL, name_key TEXT NOT NULL, size INTEGER NOT NULL,
+    mtime REAL NOT NULL, kind TEXT NOT NULL, match_key TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (dir, name)
 ) WITHOUT ROWID;
 CREATE TABLE dirs (
     dir TEXT PRIMARY KEY, other INTEGER NOT NULL, errors INTEGER NOT NULL

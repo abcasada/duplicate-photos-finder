@@ -12,6 +12,7 @@ from dpf.report import (
     OFFLINE_NOTE,
     format_text,
     human_bytes,
+    parse_bytes,
     root_lines,
     write_csv,
     write_json,
@@ -82,6 +83,16 @@ class HumanBytesTest(unittest.TestCase):
         self.assertEqual(human_bytes(12_400_000_000), "12.4 GB")
         self.assertEqual(human_bytes(3_100_000_000_000), "3.1 TB")
         self.assertEqual(human_bytes(999_960_000), "1.0 GB")
+
+    def test_parse_bytes(self):
+        for text, expected in (
+            ("5.09TB", 5_090_000_000_000), ("8.00 TB", 8 * 10**12), ("500GB", 500 * 10**9),
+            ("123", 123), ("123 B", 123), ("1kB", 1000), (" .5mb ", 500_000), ("2PB", 2 * 10**15),
+        ):  # fmt: skip
+            self.assertEqual(parse_bytes(text), expected, text)
+        for text in ("", "-1", "5T", "4.7TiB", "1.2.3GB", "GB", "1 GiB", "1e3"):
+            with self.subTest(text), self.assertRaises(ValueError):
+                parse_bytes(text)
 
 
 class TextReportTest(unittest.TestCase):

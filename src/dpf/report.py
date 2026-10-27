@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 import dataclasses
 import json
+import re
 from collections.abc import Iterable
 from datetime import datetime
+from decimal import Decimal
 
 from dpf.grouping import (
     A_IN_B,
@@ -49,6 +51,25 @@ def human_bytes(n: int) -> str:
         if round(value, 1) < 1000 or unit == _UNITS[-1]:
             return f"{value:.1f} {unit}"
     raise AssertionError("unreachable")
+
+
+_PARSE_UNITS = {"": 1, "b": 1} | {
+    unit.casefold(): 1000 ** (i + 1) for i, unit in enumerate(_UNITS)
+}
+
+
+def parse_bytes(text: str) -> int:
+    """Bytes from "5090000000000", "500GB" or "5.09 TB": decimal units, as in human_bytes.
+
+    Binary sizes (TiB, or df -h's bare "T") are refused rather than guessed.
+    """
+    m = re.fullmatch(r"\s*(\d+(?:\.\d*)?|\.\d+)\s*([A-Za-z]*)\s*", text)
+    unit = m and m[2].casefold()
+    if not m or unit not in _PARSE_UNITS:
+        raise ValueError(
+            f"not a size: {text!r} (use bytes, as `df -B1` shows, or decimal units: 500GB, 5.09TB)"
+        )
+    return int((Decimal(m[1]) * _PARSE_UNITS[unit]).to_integral_value())
 
 
 PAIR_LABELS = {

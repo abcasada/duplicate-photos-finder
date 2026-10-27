@@ -5,12 +5,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
 from dpf.cli import main
+from dpf.index import Index
 
 HAVE_XLSXWRITER = importlib.util.find_spec("xlsxwriter") is not None
 
@@ -358,11 +360,14 @@ class OfflineRootsTest(CliFixture):
         code, out, err = self.run_cli("drives")
         self.assertEqual((code, err), (0, ""))
         lines = out.splitlines()
-        self.assertRegex(lines[0], r"^Drive / folder\s+Files\s+Size\s+Unreadable\s+"
-                                   r"Last scanned\s+Connected$")  # fmt: skip
-        self.assertRegex(lines[1], rf"^{self.one}\s+10\s+55 B\s+0\s+[\d -:]+\s+yes$")
-        self.assertRegex(lines[2], rf"^{self.two}\s+10\s+55 B\s+0\s+[\d -:]+\s+no$")
-        self.assertEqual(lines[-1], "2 indexed, 1 connected; 20 files, 110 B in total")
+        self.assertRegex(lines[0], r"^Drive / folder\s+Files\s+Media size\s+Used on drive\s+"
+                                   r"Capacity\s+Last scanned\s+Connected$")  # fmt: skip
+        self.assertRegex(lines[1], rf"^{self.one}\s+10\s+55 B\s+n/a\s+n/a\s+[\d -:]+\s+yes$")
+        self.assertRegex(lines[2], rf"^{self.two}\s+10\s+55 B\s+n/a\s+n/a\s+[\d -:]+\s+no$")
+        self.assertEqual(lines[4:], [
+            "2 indexed, 1 connected; 20 files, 110 B of media",
+            "n/a: a folder inside a drive, not its mount point; its drive's space is not shown",
+        ])  # fmt: skip
 
     def test_drives_empty_index(self):
         db = os.path.join(self.tmp, "none", "index.db")
@@ -601,7 +606,7 @@ class PoolsCliTest(CliFixture):
         self.assertRegex(lines[0], r"\s+Connected\s+Pool$")
         rows = {line.split("  ")[0]: re.split(r"\s\s+", line)[-1] for line in lines[1:5]}
         self.assertEqual(rows, {
-            os.path.realpath(self.drives): "-",
+            os.path.realpath(self.drives): "—",
             self.a1: "A",
             self.a2: "A, Old",
             self.b1: "B",
@@ -611,6 +616,232 @@ class PoolsCliTest(CliFixture):
         self.assertEqual(code, 0)
         self.assertIn("dpf: warning: no pools file at", err)
         self.assertRegex(out.splitlines()[0], r"Connected$")
+
+
+GB = 10**9
+
+
+class SpaceCliTest(PoolsCliTest):
+    """Drive space: recorded by scans, by `dpf space`, or entered by hand.
+
+    Every folder directly under `media` passes for a mounted drive of 1000 GB with
+    250 GB used (os.statvfs and os.path.ismount are faked for them).
+    """
+
+    def setUp(self):
+        super().setUp()
+        statvfs, ismount = os.statvfs, os.path.ismount
+        fake = os.statvfs_result((1000, 1000, GB, GB * 3 // 4, 0, 0, 0, 0, 0, 255))
+
+        def is_drive(path):
+            return os.path.dirname(os.path.abspath(path)) == self.media
+
+        def fake_statvfs(path):
+            if is_drive(path) and os.path.isdir(path):
+                return fake
+            return statvfs(path)
+
+        def fake_ismount(path):
+            return (is_drive(path) and os.path.isdir(path)) or ismount(path)
+
+        for target, new in (("os.statvfs", fake_statvfs), ("os.path.ismount", fake_ismount)):
+            patcher = mock.patch(target, side_effect=new)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def forget_space(self, *roots):
+        """Make roots look scanned before schema v5."""
+        conn = sqlite3.connect(self.db)
+        conn.executemany(
+            "UPDATE roots SET used_bytes = NULL, capacity_bytes = NULL, is_mount = NULL, "
+            "space_source = NULL, space_at = NULL WHERE path = ?",
+            [(r,) for r in roots],
+        )
+        conn.commit()
+        conn.close()
+
+    def stats(self, root):
+        with Index(self.db) as idx:
+            return idx.root_stats(root)
+
+    def test_scan_records_space(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.drives), (0, "", ""))
+        st = self.stats(self.a1)
+        self.assertEqual(
+            (st.used_bytes, st.capacity_bytes, st.is_mount), (250 * GB, 1000 * GB, True)
+        )
+        self.assertEqual((st.space_source, st.space_at), ("statvfs", st.scanned_at))
+        st = self.stats(os.path.realpath(self.drives))
+        self.assertEqual((st.is_mount, st.space_source), (False, "statvfs"))
+
+    def test_drives_space_columns(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
+        self.assertEqual(self.run_cli("scan", "-q", self.b1, self.drives)[0], 0)
+        self.forget_space(self.b1)
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE roots SET scanned_at = scanned_at - 86400 WHERE path = ?", (self.a2,))
+        conn.commit()
+        conn.close()
+        code, out, err = self.run_cli("space", "--set", self.a2, "--used", "5.09TB",
+                                      "--capacity", "8.00TB")  # fmt: skip
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(
+            out, f"recorded {self.a2} by hand: 5.1 TB used of 8.0 TB (the drive was not accessed)\n"
+        )
+        code, out, err = self.run_cli("drives")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertRegex(lines[0], r"^Drive / folder\s+Files\s+Media size\s+Used on drive\s+"
+                                   r"Capacity\s+Space as of\s+Last scanned\s+Connected\s+Pool$")
+        date = r"\d{4}-\d\d-\d\d \d\d:\d\d"
+        rows = dict(zip([os.path.realpath(self.drives), self.a1, self.b1, self.a2], lines[1:5]))
+        self.assertRegex(rows[self.a1], rf"\s+10\s+55 B\s+250.0 GB \s+1.0 TB \s+{date}\s+yes\s+A$")
+        self.assertRegex(rows[self.a2], rf"\s+55 B\s+5.1 TB\*\s+8.0 TB\*\s+{date}\s+{date}\s+yes")
+        self.assertRegex(rows[self.b1], rf"\s+55 B\s+— \s+— \s+{date}\s+yes\s+B$")
+        folder = rows[os.path.realpath(self.drives)]
+        self.assertRegex(folder, rf"\s+n/a \s+n/a \s+{date}\s+yes\s+—$")
+        self.assertTrue(all(len(line) <= 150 for line in lines[:5]))
+        self.assertEqual(lines[6:], [
+            "4 indexed, 4 connected; 50 files, 275 B of media; 5.3 TB used of 9.0 TB on 2 drives "
+            "(partial)",
+            "* entered by hand (dpf space --set)",
+            "n/a: a folder inside a drive, not its mount point; its drive's space is not shown",
+            "1 drive has no space data (scanned before it was recorded); plug it in and run "
+            "'dpf space --missing'.",
+        ])  # fmt: skip
+
+    def test_space_measures_without_scanning(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.a2, self.drives)[0], 0)
+        self.forget_space(self.a1, self.a2)
+        before = self.stats(self.a1)
+        with mock.patch("dpf.scanner.walk", side_effect=AssertionError("no walk")), \
+                mock.patch("os.scandir", side_effect=AssertionError("no listing")):  # fmt: skip
+            code, out, err = self.run_cli("space")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[:2], [
+            f"skipped {os.path.realpath(self.drives)}: not a mount point (a folder, or a drive "
+            "not mounted)",
+            "",
+        ])  # fmt: skip
+        self.assertIn("recorded the space of 2 drives:\n", out)
+        self.assertRegex(out, rf"\n  {re.escape(self.a1)}\s+250.0 GB\s+1.0 TB\n")
+        st = self.stats(self.a1)
+        self.assertEqual((st.files, st.scanned_at), (before.files, before.scanned_at))
+        self.assertEqual((st.used_bytes, st.space_source, st.is_mount), (250 * GB, "statvfs", True))
+
+    def test_space_missing_and_unplugged(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.a2, self.b1)[0], 0)
+        self.forget_space(self.a2, self.b1)
+        self.unplug(self.b1)
+        code, out, err = self.run_cli("space", "--missing")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out.splitlines()[:4], [
+            f"skipped {self.a1}: space already recorded",
+            f"skipped {self.b1}: not connected",
+            "",
+            "recorded the space of 1 drive:",
+        ])  # fmt: skip
+        self.assertIsNotNone(self.stats(self.a2).used_bytes)
+        self.assertIsNone(self.stats(self.b1).used_bytes)
+        code, out, _ = self.run_cli("space", "--missing", "--pool", "A")
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            out.endswith("nothing recorded: no connected drive is missing space data\n")
+        )
+
+    def test_space_pool_and_paths_only_update_indexed_roots(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1)[0], 0)
+        code, out, err = self.run_cli("space", "--pool", "a")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"skipped {self.a2}: not scanned yet; run `dpf scan` on it first\n", out)
+        self.assertIn("recorded the space of 1 drive:", out)
+        self.assertNotIn(self.b1, out)
+        never = os.path.join(self.media, "Storage 9A gone")
+        code, out, err = self.run_cli("space", self.a2, never, self.a1 + "/")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"skipped {self.a2}: not scanned yet; run `dpf scan` on it first\n", out)
+        self.assertIn(f"skipped {never}: not connected, never scanned\n", out)
+        self.assertIn("recorded the space of 1 drive:", out)
+        with Index(self.db) as idx:
+            self.assertEqual([r.root for r in idx.roots()], [self.a1])
+
+    def test_space_leaves_hand_entered_drives_alone_unless_named(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.a2)[0], 0)
+        self.assertEqual(self.run_cli("space", "--set", self.a2, "--used", "1TB",
+                                      "--capacity", "8000000000000")[0], 0)  # fmt: skip
+        with mock.patch("os.path.isdir", side_effect=os.path.isdir) as isdir:
+            for args in (("space",), ("space", "--pool", "A"), ("space", "--missing")):
+                code, out, _ = self.run_cli(*args)
+                self.assertEqual(code, 0)
+                self.assertNotIn(f"  {self.a2}", out)
+        self.assertNotIn(self.a2, [c.args[0] for c in isdir.call_args_list])
+        st = self.stats(self.a2)
+        self.assertEqual(
+            (st.used_bytes, st.capacity_bytes, st.space_source), (10**12, 8 * 10**12, "manual")
+        )
+        self.assertIsNone(st.is_mount)
+        code, out, _ = self.run_cli("space", self.a2)
+        self.assertIn("recorded the space of 1 drive:", out)
+        self.assertEqual(self.stats(self.a2).space_source, "statvfs")
+
+    def test_space_set_never_touches_the_drive(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.a2)[0], 0)
+        touched = []
+
+        def spy(module, name):
+            original = getattr(module, name)
+
+            def wrapper(path, *args, **kwargs):
+                touched.append(path)
+                return original(path, *args, **kwargs)
+
+            return mock.patch.object(module, name, side_effect=wrapper)
+
+        os_calls = ("stat", "lstat", "statvfs", "scandir", "listdir", "access", "open", "readlink")
+        path_calls = ("ismount", "isdir", "exists", "realpath")
+        with contextlib.ExitStack() as stack:
+            for module, names in ((os, os_calls), (os.path, path_calls)):
+                for name in names:
+                    stack.enter_context(spy(module, name))
+            code, out, err = self.run_cli(
+                "space", "--set", self.a2 + "/", "--used", "5.09 TB", "--capacity", "8.00TB"
+            )
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertTrue(touched)  # the spies see the index's own path checks
+        self.assertEqual([p for p in touched if str(p).startswith(self.a2)], [])
+        st = self.stats(self.a2)
+        self.assertEqual((st.used_bytes, st.capacity_bytes), (5_090_000_000_000, 8 * 10**12))
+
+    def test_space_set_errors(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1)[0], 0)
+        code, out, err = self.run_cli(
+            "space", "--set", self.a2, "--used", "1GB", "--capacity", "2GB"
+        )
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(f"dpf: {self.a2} is not an indexed drive/folder", err)
+        self.assertIn(f"\n  {self.a1}\n", err)
+        code, _, err = self.run_cli("space", "--set", self.a1, "--used", "3GB", "--capacity", "2GB")
+        self.assertEqual(code, 1)
+        self.assertIn("expected 0 <= used <= capacity", err)
+        for args in (
+            ("--set", self.a1, "--used", "1GB"),
+            ("--set", self.a1, "--used", "1GB", "--capacity", "4.7T"),
+            ("--set", self.a1, "--used", "1GB", "--capacity", "2GB", "--missing"),
+            ("--set", self.a1, "--used", "1GB", "--capacity", "2GB", self.a1),
+            ("--used", "1GB", "--capacity", "2GB"),
+            ("--pool", "A", self.a1),
+        ):  # fmt: skip
+            with self.subTest(args), self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.run_cli("space", *args)
+            self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(self.stats(self.a1).space_source, "statvfs")
+
+    def test_space_without_index(self):
+        code, out, err = self.run_cli("space")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("nothing indexed yet", err)
+        self.assertFalse(os.path.exists(self.db))
 
 
 if __name__ == "__main__":

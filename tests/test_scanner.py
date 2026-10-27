@@ -274,6 +274,53 @@ class ScanRootsTest(TempTree):
         staged = self.idx.conn.execute("SELECT count(*) FROM staging").fetchone()[0]
         self.assertEqual(staged, 0)
 
+    def test_drive_space_recorded_once_per_root_after_walk(self):
+        touch(self.p("r", "a.jpg"))
+        touch(self.p("s", "b.jpg"))
+        fake = os.statvfs_result((4096, 4096, 1000, 250, 200, 0, 0, 0, 0, 255))
+        calls = []
+
+        def statvfs(path):
+            calls.append(path)
+            return fake
+
+        with mock.patch("os.statvfs", side_effect=statvfs):
+            stats = scan_roots(self.idx, [self.p("r"), self.p("s")])
+        self.assertEqual(sorted(calls), [self.p("r"), self.p("s")])
+        for st in stats:
+            stored = self.idx.root_stats(st.root)
+            self.assertEqual(stored, st)
+            self.assertEqual((st.used_bytes, st.capacity_bytes), (750 * 4096, 1000 * 4096))
+            self.assertEqual((st.is_mount, st.space_source), (False, "statvfs"))
+            self.assertEqual(st.space_at, st.scanned_at)
+
+    def test_drive_space_unavailable_is_not_recorded(self):
+        touch(self.p("r", "a.jpg"))
+        with mock.patch("os.statvfs", side_effect=OSError("nope")):
+            (st,) = scan_roots(self.idx, [self.p("r")])
+        self.assertEqual((st.files, st.used_bytes, st.space_source), (1, None, None))
+
+    def test_drive_space(self):
+        space = scanner.drive_space(self.root)
+        st = os.statvfs(self.root)
+        self.assertEqual(space.capacity, st.f_blocks * st.f_frsize)
+        self.assertFalse(space.is_mount)
+        self.assertIsNone(scanner.drive_space(self.p("missing")))
+        with mock.patch("os.path.ismount", return_value=True):
+            self.assertTrue(scanner.drive_space(self.root).is_mount)
+
+    def test_kept_root_keeps_its_recorded_space(self):
+        touch(self.p("r", "a.jpg"))
+        scan_roots(self.idx, [self.p("r")])
+        before = self.idx.root_stats(self.p("r"))
+        self.assertIsNotNone(before.used_bytes)
+        self.empty_out("r")
+        kept = {}
+        with mock.patch("os.path.ismount", return_value=True):
+            self.assertEqual(scan_roots(self.idx, [self.p("r")], kept=kept), [])
+        self.assertEqual(kept, {self.p("r"): 1})
+        self.assertEqual(self.idx.root_stats(self.p("r")), before)
+
     def test_empty_root_accepted_with_allow_empty(self):
         touch(self.p("r", "a.jpg"))
         scan_roots(self.idx, [self.p("r")])

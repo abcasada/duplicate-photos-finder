@@ -1,8 +1,9 @@
-"""Command-line interface: `dpf scan`, `dpf find`, `dpf drives` and `dpf pools`."""
+"""Command-line interface: `dpf scan`, `dpf find`, `dpf drives`, `dpf space` and `dpf pools`."""
 
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sys
 import time
@@ -11,14 +12,16 @@ from collections.abc import Collection
 from dpf import __version__
 from dpf.index import Index, default_db_path
 from dpf.grouping import DEFAULT_NEAR, GroupingResult
-from dpf.models import DuplicateGroup, RootStats
+from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
     Pool,
     PoolError,
     Pools,
     default_pools_path,
     get_pool,
+    is_glob,
     load_pools,
+    matches,
     pool_paths,
     pools_of,
 )
@@ -28,6 +31,8 @@ from dpf.report import (
     TREE_TOP,
     format_text,
     human_bytes,
+    parse_bytes,
+    plural,
     scan_date,
     write_csv,
     write_json,
@@ -143,6 +148,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
     )  # fmt: skip
+    s = sub.add_parser(
+        "space", help="record each drive's used and total space (no scan)",
+        description="Record the used and total space of indexed drives without scanning "
+        "them: one statvfs call per connected drive, no file reads. Only drives already in "
+        "the index (see `dpf drives`) are updated; scans record their space too.",
+    )  # fmt: skip
+    s.add_argument(
+        "roots", nargs="*", metavar="PATH",
+        help="indexed drives to measure (default: every connected indexed drive)",
+    )  # fmt: skip
+    s.add_argument("--pool", metavar="NAME", help="measure the indexed drives of this pool")
+    s.add_argument(
+        "--missing", action="store_true", help="only drives with no space recorded yet"
+    )
+    s.add_argument(
+        "--set", dest="set_path", metavar="PATH",
+        help="enter the space of indexed drive PATH by hand, without touching the drive "
+        "(e.g. one that may be failing); needs --used and --capacity",
+    )  # fmt: skip
+    s.add_argument("--used", type=_size, metavar="SIZE", help="with --set: e.g. 5.09TB")
+    s.add_argument("--capacity", type=_size, metavar="SIZE", help="with --set: e.g. 8.00TB")
+
     sub.add_parser(
         "pools", help="list the drive pools and their drives",
         description="List each pool from the pools file with its patterns and the drives "
@@ -159,6 +186,13 @@ def _fraction(text: str) -> float:
     if not 0 < value <= 1:
         raise argparse.ArgumentTypeError(f"expected a fraction in (0, 1], got {text!r}")
     return value
+
+
+def _size(text: str) -> int:
+    try:
+        return parse_bytes(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def _progress_printer(quiet: bool):
@@ -368,6 +402,8 @@ def _root_status(
 
 def _drives(idx: Index, args: argparse.Namespace) -> int:
     """`dpf drives`: list the indexed roots, or forget some of them."""
+    from dpf.scanner import drop_nested
+
     known = idx.roots()
     if args.forget:
         return _forget(idx, known, args.forget)
@@ -375,25 +411,213 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         print("nothing indexed yet; run `dpf scan PATH`")
         return 0
     pools = _pools_for_drives(args.pools_file)
-    header = ("Drive / folder", "Files", "Size", "Unreadable", "Last scanned", "Connected")
-    rows = [header + (("Pool",) if pools else ())]
-    for r in known:
+    spaces = [r.space for r in known]
+    by_hand = any(sp and sp.source == SPACE_MANUAL for sp in spaces)
+    dated = any(_space_date(r) for r in known)
+    header = ["Drive / folder", "Files", "Media size", "Used on drive", "Capacity"]
+    header += ["Space as of"] if dated else []
+    header += ["Last scanned", "Connected"] + (["Pool"] if pools else [])
+    rows = [tuple(header)]
+    connected = 0
+    for r, sp in zip(known, spaces):
         files, nbytes = idx.totals([r.root])
-        row = (
-            r.root, f"{files:,}", human_bytes(nbytes), f"{r.errors:,}",
-            scan_date(r.scanned_at), "yes" if os.path.isdir(r.root) else "no",
-        )  # fmt: skip
-        rows.append(row + ((", ".join(pools_of(pools, r.root)) or "-",) if pools else ()))
-    _print_table(rows, left=(0, 4, 5, 6))
-    from dpf.scanner import drop_nested
+        online = os.path.isdir(r.root)
+        connected += online
+        row = [r.root, f"{files:,}", human_bytes(nbytes), *_space_cells(sp, by_hand)]
+        row += [_space_date(r)] if dated else []
+        row += [scan_date(r.scanned_at), "yes" if online else "no"]
+        row += [", ".join(pools_of(pools, r.root)) or "—"] if pools else []
+        rows.append(tuple(row))
+    texts = ("Drive / folder", "Space as of", "Last scanned", "Connected", "Pool")
+    _print_table(rows, left={i for i, h in enumerate(header) if h in texts})
 
     files, nbytes = idx.totals(drop_nested(r.root for r in known))
-    connected = sum(row[5] == "yes" for row in rows[1:])
+    line = f"{len(known)} indexed, {connected} connected; {files:,} files, "
+    line += f"{human_bytes(nbytes)} of media"
+    drives = [sp for sp in spaces if sp and sp.is_mount is not False]
+    missing = sum(sp is None for sp in spaces)
+    if drives:
+        used = human_bytes(sum(sp.used for sp in drives))
+        capacity = human_bytes(sum(sp.capacity for sp in drives))
+        line += f"; {used} used of {capacity} on {plural(len(drives), 'drive')}"
+        line += " (partial)" if missing else ""
+    print(f"\n{line}")
+    if by_hand:
+        print("* entered by hand (dpf space --set)")
+    if any(sp and sp.is_mount is False for sp in spaces):
+        print("n/a: a folder inside a drive, not its mount point; its drive's space is not shown")
+    if missing:
+        print(
+            f"{plural(missing, 'drive')} {'has' if missing == 1 else 'have'} no space data "
+            f"(scanned before it was recorded); plug {'it' if missing == 1 else 'them'} in "
+            "and run 'dpf space --missing'."
+        )
+    return 0
+
+
+def _space_cells(space: DriveSpace | None, mark: bool) -> tuple[str, str]:
+    """Used and capacity cells: "—" if not recorded, "n/a" for a folder, "*" if by hand."""
+    pad = " " if mark else ""
+    if space is None:
+        return "—" + pad, "—" + pad
+    if space.is_mount is False:
+        return "n/a" + pad, "n/a" + pad
+    star = "*" if space.source == SPACE_MANUAL else pad
+    return human_bytes(space.used) + star, human_bytes(space.capacity) + star
+
+
+def _space_date(r: RootStats) -> str:
+    """When a drive's space was recorded, if not at its last scan (to the minute); else ""."""
+    if r.space_at is None or r.is_mount is False:
+        return ""
+    if scan_date(r.space_at) == scan_date(r.scanned_at):
+        return ""
+    return scan_date(r.space_at)
+
+
+def _space(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """`dpf space`: record drive space with statvfs, or as entered by hand (--set)."""
+    if args.set_path is not None:
+        if args.roots or args.pool or args.missing:
+            parser.error("space: --set takes no PATHs, --pool or --missing")
+        if args.used is None or args.capacity is None:
+            parser.error("space: --set needs --used and --capacity")
+    elif args.used is not None or args.capacity is not None:
+        parser.error("space: --used and --capacity go with --set PATH")
+    if args.pool and args.roots:
+        parser.error("space: give either PATHs or --pool, not both")
+    pool = None
+    if args.pool:
+        try:
+            pool = get_pool(load_pools(args.pools_file), args.pool)
+        except PoolError as e:
+            print(f"dpf: {e}", file=sys.stderr)
+            return 1
+    db = args.db or default_db_path()
+    if not os.path.exists(db):
+        print(f"dpf: nothing indexed yet ({db}); run `dpf scan PATH` first", file=sys.stderr)
+        return 1
+    with Index(db) as idx:
+        if args.set_path is not None:
+            return _space_set(idx, args)
+        return _space_measure(idx, args, pool)
+
+
+def _space_set(idx: Index, args: argparse.Namespace) -> int:
+    """Store hand-entered space for an indexed root. The path itself is never accessed."""
+    if args.capacity <= 0 or args.used > args.capacity:
+        print(
+            f"dpf: expected 0 <= used <= capacity, capacity > 0; got used "
+            f"{human_bytes(args.used)}, capacity {human_bytes(args.capacity)}",
+            file=sys.stderr,
+        )  # fmt: skip
+        return 1
+    root = os.path.abspath(args.set_path).rstrip("/") or "/"  # string only: no stat
+    space = DriveSpace(args.used, args.capacity, is_mount=None, source=SPACE_MANUAL)
+    stats = idx.set_space(root, space)
+    if stats is None:
+        listing = "\n".join(f"  {r.root}" for r in idx.roots()) or "  (none)"
+        print(
+            f"dpf: {args.set_path} is not an indexed drive/folder; `dpf space --set` needs one "
+            f"of these exactly:\n{listing}",
+            file=sys.stderr,
+        )  # fmt: skip
+        return 1
     print(
-        f"\n{len(known)} indexed, {connected} connected; "
-        f"{files:,} files, {human_bytes(nbytes)} in total"
+        f"recorded {root} by hand: {human_bytes(args.used)} used of "
+        f"{human_bytes(args.capacity)} (the drive was not accessed)"
     )
     return 0
+
+
+def _space_measure(idx: Index, args: argparse.Namespace, pool: Pool | None) -> int:
+    """Measure the space of connected indexed roots and print what was recorded.
+
+    Roots whose space was entered by hand are left alone (and not accessed at all)
+    unless named as a PATH.
+    """
+    from dpf.scanner import drive_space
+
+    known = {r.root: r for r in idx.roots()}
+    if not known:
+        print("nothing indexed yet; run `dpf scan PATH`")
+        return 0
+    notes: list[str] = []
+    if args.roots:
+        targets = []
+        for p in args.roots:
+            root = _indexed_root(known, p)
+            if root is None:
+                why = "not scanned yet; run `dpf scan` on it first"
+                notes.append(f"{p}: {why if os.path.isdir(p) else 'not connected, never scanned'}")
+            elif root not in targets:
+                targets.append(root)
+    elif pool is not None:
+        targets = [r for r in known if any(matches(r, pat) for pat in pool.patterns)]
+        notes += [
+            f"{p}: not scanned yet; run `dpf scan` on it first"
+            for p in _unscanned_pool_drives(pool, known)
+        ]  # fmt: skip
+    else:
+        targets = list(known)
+
+    rows = [("Drive / folder", "Used on drive", "Capacity")]
+    for root in targets:
+        r = known[root]
+        if args.missing and r.used_bytes is not None:
+            notes.append(f"{root}: space already recorded")
+            continue
+        if r.space_source == SPACE_MANUAL and not args.roots:
+            notes.append(f"{root}: space entered by hand; name it as a PATH to measure it")
+            continue
+        if not os.path.isdir(root):
+            notes.append(f"{root}: not connected")
+            continue
+        space = drive_space(root)
+        if space is None:
+            notes.append(f"{root}: cannot read its space")
+            continue
+        if not space.is_mount:
+            notes.append(f"{root}: not a mount point (a folder, or a drive not mounted)")
+            continue
+        idx.set_space(root, space)
+        rows.append((root, human_bytes(space.used), human_bytes(space.capacity)))
+    for note in notes:
+        print(f"skipped {note}")
+    if notes:
+        print()
+    if len(rows) == 1:
+        why = ": no connected drive is missing space data" if args.missing else ""
+        print(f"nothing recorded{why}")
+        return 0
+    print(f"recorded the space of {plural(len(rows) - 1, 'drive')}:")
+    _print_table(rows, left=(0,), indent="  ")
+    return 0
+
+
+def _indexed_root(known: Collection[str], path: str) -> str | None:
+    """The indexed root `path` names exactly (as given, or with symlinks resolved)."""
+    given = os.path.abspath(path).rstrip("/") or "/"
+    if given in known:
+        return given
+    real = os.path.realpath(path)
+    return real if real in known else None
+
+
+def _unscanned_pool_drives(pool: Pool, known: Collection[str]) -> list[str]:
+    """Connected drives matching `pool` with nothing indexed at or above them.
+
+    Globs list the mount folder's entries only; the drives themselves are not accessed.
+    """
+    found = set()
+    for pattern in pool.patterns:
+        if is_glob(pattern):
+            found.update(d.rstrip("/") for d in glob.glob(pattern))
+        elif pattern not in known and os.path.isdir(pattern):
+            found.add(pattern)
+    return sorted(
+        d for d in found if not any(d == k or d.startswith(k.rstrip("/") + "/") for k in known)
+    )
 
 
 def _pools_for_drives(path: str | None) -> Pools:
@@ -587,6 +811,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "pools":
         return _pools(args)
+    if args.command == "space":
+        return _space(args, parser)
     if args.command == "drives":
         db = args.db or default_db_path()
         if not os.path.exists(db):

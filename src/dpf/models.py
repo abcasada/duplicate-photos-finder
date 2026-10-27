@@ -43,10 +43,46 @@ class DuplicateGroup:
         return sum(f.size for f in self.files) - self.size
 
 
+SPACE_STATVFS = "statvfs"
+SPACE_MANUAL = "manual"
+
+
+@dataclass(frozen=True, slots=True)
+class DriveSpace:
+    """Used and total bytes of the drive holding a root.
+
+    `source` is SPACE_STATVFS (measured with os.statvfs) or SPACE_MANUAL (entered by
+    hand, the path untouched). `is_mount` is False when the root is a folder inside a
+    drive, and None when not checked. `taken_at` None means "now", when stored.
+    """
+
+    used: int
+    capacity: int
+    is_mount: bool | None
+    source: str = SPACE_STATVFS
+    taken_at: float | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class RootStats:
+    """A scanned root. The space fields are None until recorded (schema v5)."""
+
     root: str
     files: int
     bytes: int
     scanned_at: float
     errors: int = 0
+    used_bytes: int | None = None
+    capacity_bytes: int | None = None
+    is_mount: bool | None = None
+    space_source: str | None = None
+    space_at: float | None = None
+
+    @property
+    def space(self) -> DriveSpace | None:
+        if self.used_bytes is None or self.capacity_bytes is None:
+            return None
+        return DriveSpace(
+            self.used_bytes, self.capacity_bytes, self.is_mount,
+            self.space_source or SPACE_STATVFS, self.space_at,
+        )  # fmt: skip

@@ -6,7 +6,9 @@ roots by path prefix, so nested or overlapping roots are handled naturally.
 
 Besides media files, the `dirs` table records per directory how many entries were not
 indexed (non-media files, symlinks, unreadable entries), so a folder is never called a
-match while it holds content that was not compared.
+match while it holds content that was not compared. Each `roots` row also records the
+used and total space of the drive holding the root: measured at each scan or by
+`dpf space`, or entered by hand for a drive that must not be read.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 
-from dpf.models import FileRecord, RootStats
+from dpf.models import DriveSpace, FileRecord, RootStats
 from dpf.names import match_key
 
 _TABLES = """
@@ -26,7 +28,12 @@ CREATE TABLE IF NOT EXISTS roots (
     files      INTEGER NOT NULL,
     bytes      INTEGER NOT NULL,
     errors     INTEGER NOT NULL,
-    scanned_at REAL NOT NULL
+    scanned_at REAL NOT NULL,
+    used_bytes     INTEGER,
+    capacity_bytes INTEGER,
+    is_mount       INTEGER,
+    space_source   TEXT,
+    space_at       REAL
 );
 CREATE TABLE IF NOT EXISTS files (
     dir       TEXT NOT NULL,
@@ -62,17 +69,30 @@ CREATE INDEX IF NOT EXISTS files_match_size ON files (match_key, size);
 """
 
 _COLUMNS = "dir, name, name_key, size, mtime, kind, match_key"
+_ROOT_COLUMNS = (
+    "path, files, bytes, scanned_at, errors, "
+    "used_bytes, capacity_bytes, is_mount, space_source, space_at"
+)
+_SPACE_COLUMNS = {
+    "used_bytes": "INTEGER",
+    "capacity_bytes": "INTEGER",
+    "is_mount": "INTEGER",
+    "space_source": "TEXT",
+    "space_at": "REAL",
+}
 
 # Schema history (PRAGMA user_version):
 #   1  files, staging, roots
 #   2  dirs table (older inventories never recorded non-media content: dropped)
 #   3  match_key column (names.match_key), added and filled in place
 #   4  match_key recomputed: text around a camera number is only dropped when neutral
+#   5  roots.used_bytes, capacity_bytes, is_mount, space_source, space_at: the drive's
+#      space (statvfs at scan time, `dpf space`, or entered by hand); NULL until recorded
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 4
+_VERSION = 5
 
 _BATCH = 10_000
 
@@ -124,6 +144,30 @@ def _record(row: sqlite3.Row | tuple) -> FileRecord:
     return FileRecord(dir=row[0], name=row[1], size=row[2], mtime=row[3], kind=row[4])
 
 
+def _root_stats(row: tuple) -> RootStats:
+    *head, is_mount, source, space_at = row
+    return RootStats(
+        *head, is_mount=None if is_mount is None else bool(is_mount),
+        space_source=source, space_at=space_at,
+    )  # fmt: skip
+
+
+def _space_values(space: DriveSpace | None, now: float) -> tuple:
+    """(used_bytes, capacity_bytes, is_mount, space_source, space_at) column values."""
+    if space is None:
+        return (None,) * 5
+    is_mount = None if space.is_mount is None else int(space.is_mount)
+    taken = now if space.taken_at is None else space.taken_at
+    return space.used, space.capacity, is_mount, space.source, taken
+
+
+def _new_root_stats(
+    root: str, files: int, total: int, errors: int, space: DriveSpace | None
+) -> RootStats:
+    now = time.time()
+    return _root_stats((root, files, total, now, errors, *_space_values(space, now)))
+
+
 class Index:
     def __init__(self, path: str | None = None) -> None:
         self.path = path or default_db_path()
@@ -160,6 +204,11 @@ class Index:
                             f"ALTER TABLE {table} ADD COLUMN match_key TEXT NOT NULL DEFAULT ''"
                         )
                     self._refill_match_keys(table)
+            if version < 5:
+                columns = {r[1] for r in self.conn.execute("PRAGMA table_info(roots)")}
+                for column, kind in _SPACE_COLUMNS.items():
+                    if column not in columns:
+                        self.conn.execute(f"ALTER TABLE roots ADD COLUMN {column} {kind}")
             if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
             self.conn.commit()
@@ -207,10 +256,12 @@ class Index:
         records: Iterable[FileRecord],
         errors: int = 0,
         dir_stats: DirStats | None = None,
+        space: DriveSpace | None = None,
     ) -> RootStats:
         """Replace everything indexed under `root` with `records`, in one transaction.
 
-        `dir_stats` maps directories to (other, errors) counts of entries not indexed.
+        `dir_stats` maps directories to (other, errors) counts of entries not indexed;
+        `space` is the drive's space as measured after the walk (None: not recorded).
         """
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
@@ -226,7 +277,7 @@ class Index:
                 )
                 files += len(batch)
                 total += sum(r.size for r in batch)
-            stats = RootStats(root, files, total, time.time(), errors)
+            stats = _new_root_stats(root, files, total, errors, space)
             self._set_root(stats)
         return stats
 
@@ -254,11 +305,16 @@ class Index:
             )
 
     def finish_root(
-        self, root: str, errors: int = 0, dir_stats: DirStats | None = None
+        self,
+        root: str,
+        errors: int = 0,
+        dir_stats: DirStats | None = None,
+        space: DriveSpace | None = None,
     ) -> RootStats:
         """Replace everything indexed under `root` with its staged records.
 
-        `dir_stats` (as from scanner.walk) replaces the root's per-directory counts.
+        `dir_stats` (as from scanner.walk) replaces the root's per-directory counts, and
+        `space` (as from scanner.drive_space) its recorded drive space.
         """
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
@@ -273,7 +329,7 @@ class Index:
                 params,
             )
             self.conn.execute(f"DELETE FROM staging WHERE {where}", params)
-            stats = RootStats(root, files, total, time.time(), errors)
+            stats = _new_root_stats(root, files, total, errors, space)
             self._set_root(stats)
         return stats
 
@@ -283,9 +339,26 @@ class Index:
             "DELETE FROM roots WHERE path >= ? AND path < ?", _subtree_range(stats.root)
         )
         self.conn.execute(
-            "INSERT OR REPLACE INTO roots VALUES (?, ?, ?, ?, ?)",
-            (stats.root, stats.files, stats.bytes, stats.errors, stats.scanned_at),
-        )
+            f"INSERT OR REPLACE INTO roots ({_ROOT_COLUMNS}) VALUES ({', '.join('?' * 10)})",
+            (
+                stats.root, stats.files, stats.bytes, stats.scanned_at, stats.errors,
+                *_space_values(stats.space, stats.scanned_at),
+            ),
+        )  # fmt: skip
+
+    def set_space(self, root: str, space: DriveSpace) -> RootStats | None:
+        """Record `space` for the indexed root `root` (exact path); None if not indexed.
+
+        Never adds a roots row: a root that was never scanned stays unscanned.
+        """
+        root = root.rstrip("/") or "/"
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE roots SET used_bytes = ?, capacity_bytes = ?, is_mount = ?, "
+                "space_source = ?, space_at = ? WHERE path = ?",
+                (*_space_values(space, time.time()), root),
+            ).rowcount
+        return self.root_stats(root) if updated else None
 
     def forget_root(self, root: str) -> int:
         """Remove everything indexed at or under `root` (files, dirs, staging, roots rows).
@@ -316,17 +389,14 @@ class Index:
 
     def root_stats(self, root: str) -> RootStats | None:
         row = self.conn.execute(
-            "SELECT path, files, bytes, scanned_at, errors FROM roots WHERE path = ?",
-            (root.rstrip("/") or "/",),
+            f"SELECT {_ROOT_COLUMNS} FROM roots WHERE path = ?", (root.rstrip("/") or "/",)
         ).fetchone()
-        return RootStats(*row) if row else None
+        return _root_stats(row) if row else None
 
     def roots(self) -> list[RootStats]:
         """Every scanned root, sorted by path."""
-        rows = self.conn.execute(
-            "SELECT path, files, bytes, scanned_at, errors FROM roots ORDER BY path"
-        )
-        return [RootStats(*r) for r in rows]
+        rows = self.conn.execute(f"SELECT {_ROOT_COLUMNS} FROM roots ORDER BY path")
+        return [_root_stats(r) for r in rows]
 
     def containing_root(self, path: str) -> RootStats | None:
         """The innermost scanned root that is `path` or contains it."""

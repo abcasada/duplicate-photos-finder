@@ -114,13 +114,57 @@ dpf find --mode 1 --exact-names --pool A
 # Plain paths work too, instead of --pool (not together with it)
 dpf find --mode 1 /run/media/adam/Storage\ 1TB
 
-# What's in the index, which drives are plugged in, and which pool each belongs to
+# What's in the index: files, media size, used/total space of each drive, last scan,
+# which drives are plugged in, and which pool each belongs to
 dpf drives
+
+# Record used/total space of connected indexed drives without scanning them
+dpf space --missing            # only drives with no space recorded yet
+dpf space --pool B             # or: dpf space PATH...; no argument = all connected
 ```
 
 A report run with `--pool` names the pool in its header. `dpf drives` shows each drive's
 pool in a Pool column; a drive matching several pools lists them all, which means the
 patterns overlap and should be fixed: `scan`/`find --pool` refuse to run until it is.
+
+### Drive space
+
+`dpf drives` lists, per drive: Files and Media size (what the index holds), **Used on
+drive** and **Capacity** (the whole drive, as `df -H` would show it, in decimal units),
+Last scanned, Connected and Pool. Every scan records the drive's space with one `statvfs`
+call after its walk. In the table:
+
+- `—`: no space recorded (the drive was scanned before dpf recorded space). A footer counts
+  these and suggests `dpf space --missing`.
+- `n/a`: the root is a folder inside a drive, not its mount point. Its drive's space is
+  not shown, and it is left out of the totals.
+- `*`: entered by hand (see below).
+- A **Space as of** column appears when a drive's space was recorded at a different time
+  than its last scan.
+
+The totals line sums media size over all roots, and used/capacity over the drives that
+have space data, marked `(partial)` while some drives have none.
+
+`dpf space` records used/total space **without scanning**: one `statvfs` per connected
+indexed drive, no walk and no file reads. It takes PATHs, `--pool NAME`, or nothing (every
+connected drive in the index), and `--missing` limits it to drives with no space recorded
+yet. It only updates drives that are already in the index: a connected drive that was
+never scanned is skipped with "not scanned yet; run `dpf scan` on it first". Unplugged
+drives, and folders that are not mount points, are listed as skipped.
+
+For a drive that must not be read at all (e.g. one that may be failing), enter its space
+by hand from `df -H` or `df -B1` taken earlier:
+
+```sh
+dpf space --set "/run/media/adam/Storage 4A 8TB" --used 5.09TB --capacity 8.00TB
+```
+
+`--set` never accesses the path (not even `stat`); it only stores the figures for an
+indexed drive, named exactly as `dpf drives` lists it. Sizes are bytes or decimal units
+(`500GB`, `5.09TB`); binary units such as `TiB` or `df -h`'s `4.7T` are refused. `dpf
+space` without PATHs leaves hand-entered drives alone (it does not touch them at all);
+name such a drive as a PATH to measure it instead, and a full scan of it also replaces the
+hand-entered figure.
 
 ### More drives than you can connect at once
 

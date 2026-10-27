@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Iterator
 
 from dpf import media
 from dpf.index import Index
-from dpf.models import FileRecord, RootStats
+from dpf.models import DriveSpace, FileRecord, RootStats
 
 BATCH_SIZE = 5_000
 BATCH_SECONDS = 0.5
@@ -148,6 +148,22 @@ def walk(
         stack.extend(sorted(subdirs, reverse=True))
 
 
+def drive_space(path: str) -> DriveSpace | None:
+    """Used and total bytes of the filesystem holding `path`, or None if unavailable.
+
+    One os.statvfs call (filesystem counters, no file reads) plus os.path.ismount.
+    """
+    try:
+        st = os.statvfs(path)
+    except OSError:
+        return None
+    return DriveSpace(
+        used=(st.f_blocks - st.f_bfree) * st.f_frsize,
+        capacity=st.f_blocks * st.f_frsize,
+        is_mount=os.path.ismount(path),
+    )
+
+
 def _is_unusable_root(path: str) -> bool:
     """True if `path` lists no entries at all, or cannot be listed.
 
@@ -196,7 +212,7 @@ def _device_worker(
             empty = not found and _is_unusable_root(root) and (
                 not (errors or dir_stats) or not os.access(root, os.R_OK | os.X_OK)
             )
-            put(("end", root, (errors, dir_stats, empty)))
+            put(("end", root, (errors, dir_stats, empty, drive_space(root))))
         put(("done", None, None))
     except _Stopped:
         pass
@@ -229,6 +245,9 @@ def scan_roots(
     record of that drive. Unless `allow_empty`, such a root keeps its previous contents
     and is added to `kept` (root -> files still indexed). Returns stats, in the order
     of `roots`, for the roots that were replaced.
+
+    Each replaced root also records its drive's space (drive_space, measured once after
+    its walk); a kept root keeps the space recorded before.
     """
     roots = [os.path.abspath(r) for r in roots]
     by_dev: dict[int, list[str]] = {}
@@ -267,14 +286,14 @@ def scan_roots(
                     reported[root] = now
                     progress(root, c[0], c[1])
             elif kind == "end":
-                root_errors, dir_stats, empty = payload
+                root_errors, dir_stats, empty, space = payload
                 previous = index.totals([root])[0] if empty and not allow_empty else 0
                 if previous:
                     index.discard_staged(root)
                     if kept is not None:
                         kept[root] = previous
                     continue
-                stats[root] = index.finish_root(root, len(root_errors), dir_stats)
+                stats[root] = index.finish_root(root, len(root_errors), dir_stats, space)
                 if errors is not None:
                     errors.extend(root_errors)
                 if progress:

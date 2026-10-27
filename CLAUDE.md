@@ -59,9 +59,11 @@ tool has.
   Windows PC, and also has a separate machine `z400-1`.
 - Drive pools are in `~/.config/dpf/pools.toml` (not in the repo; the example is
   `docs/pools.example.toml`):
-  - **A** = `Storage 1TB` + `Storage [0-9]A *` (1A 4TB, 2A 8TB, 3A 8TB)
-  - **B** = `Storage [0-9]B *` (1B 4TB, 2B 8TB, 3B 8TB). 1B is currently labelled
+  - **A** = `Storage 1TB` + `Storage [0-9]A *` (1A 4TB, 2A 8TB, 3A 8TB, 4A 8TB)
+  - **B** = `Storage [0-9]B *` (1B 4TB, 2B 8TB, 3B 8TB, 4B 10TB). 1B is still labelled
     "Storage 1B 4TB (2)" by mistake.
+  - **Storage 4A 8TB may be failing** (user, 2026-10-27): do not read it, list it, stat
+    it or run dpf against it unless the user asks.
 - Cameras that produce most duplicates: **two Sony A7R IV bodies** (`DSC#####`, ARW+JPG)
   and a **Pentax K-1 Mark II** (`IMGQ####`, DNG+JPG). There is also a Pentax K-50
   (`IMGP`), a Nikon D7500, GoPros (`GX`/`GH`), phones, and Sony video (`C####.MP4`).
@@ -86,9 +88,9 @@ Data flows **scan → index → match → group → report**.
 
 | Module | Role |
 |---|---|
-| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `find`, `drives` (`--forget`), `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
-| `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing) and `drop_nested`. |
-| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots`, `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`. |
+| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `find`, `drives` (`--forget`), `space` (`--missing`, `--set`), `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
+| `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing), `drop_nested`, and `drive_space` (one `os.statvfs` + `ismount`, taken once per root after its walk). |
+| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`, `set_space` (updates an existing roots row only). |
 | `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped; around a camera-number token only *neutral* text (dates, separators) is dropped, other text is kept; extension kept). `copy_numbers(name)` feeds the matcher's copy-number rules. `match_key` is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
 | `src/dpf/match_name.py` | Mode 1 matcher. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance, and a cluster with several copy numbers is split by number. |
 | `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). |
@@ -102,7 +104,7 @@ Data flows **scan → index → match → group → report**.
 Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
 `~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out`).
 
-## Current status (2026-10-26)
+## Current status (2026-10-27)
 
 **Done, on `main`, pushed to github.com/abcasada/duplicate-photos-finder.**
 
@@ -115,8 +117,27 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
 - **Named pools** (`--pool`, `dpf pools`) and `dpf drives` (`--forget`).
 - **Reviews:** an independent review found two serious false-"identical" bugs (roll-up
   above roots; ignoring sidecar/non-media files). Both are fixed, with regression tests.
-- **Index contents:** 6 drives (1TB, 1A, 2A, 3A, 2B, 3B). **Storage 1B has never been
-  scanned.**
+- **Index contents:** 9 drives (1TB, 1A, 1B, 2A, 2B, 3A, 3B, 4A, 4B).
+- **Storage 4A may be failing** (user, 2026-10-27): do not read it unless the user asks.
+  Its space was recorded by hand from `df` on 2026-10-27 (5.09 TB used of 8.00 TB) with
+  `dpf space --set`, which never accesses the path.
+- **Drive space (schema v5):** `roots` records each drive's used/total space.
+  - Every scan takes one `os.statvfs` per root after its walk (`space_source`
+    'statvfs'). A kept (empty-looking) root keeps its previous values.
+  - `dpf space [PATH… | --pool NAME] [--missing]` measures connected indexed drives
+    without scanning (no walk, no file reads). It never creates a roots row: a connected
+    drive never scanned is skipped ("not scanned yet"). Folders that are not mount
+    points are skipped, as are hand-entered drives unless named as a PATH (they are not
+    touched at all otherwise).
+  - `dpf space --set PATH --used 5.09TB --capacity 8.00TB` stores figures by hand
+    (`space_source` 'manual') for an indexed root named exactly. It never stats the path.
+    Sizes are decimal (`report.parse_bytes`); binary units are refused.
+  - `dpf drives` columns: Drive / folder, Files, Media size, Used on drive, Capacity,
+    [Space as of, only when space was recorded at another time than the last scan], Last
+    scanned, Connected, Pool. `—` = not recorded, `n/a` = folder rather than mount point
+    (not in totals), `*` = entered by hand. Footer counts drives without space data and
+    points to `dpf space --missing`. The old Unreadable column was dropped (scans still
+    print unreadable counts).
 
 - **Smarter mode 1 names (`src/dpf/names.py`):** the match key is the name with copy
   marks stripped (`DSC00001-2.jpg`, `IMG_1 (1).JPG`) and dates around a camera file number
@@ -142,6 +163,9 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
   is migrated in place on the real index (2026-10-26, all 549,217 rows kept). Backups
   taken before each migration: `~/.cache/dpf/index.v2-backup-20261025.db` and
   `~/.cache/dpf/index.v3-backup-20261026.db`. Delete them once v4 has proven fine.
+- **Index schema v5** adds the five nullable drive-space columns to `roots`
+  (`ALTER TABLE`, all NULL for existing rows; nothing else changes). It migrates in
+  place on the first open by any dpf command; back up `index.db` before that first run.
 - **Empty or unreadable mount folders:** a root that lists no entries at all, or cannot
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.
@@ -191,9 +215,12 @@ Known limitations (documented, not fixed):
 - **Tests.** Every behaviour change gets unittest coverage, built on temp dirs. Validate
   on real data **read-only**, using `--no-scan` and `-o <scratch dir>` when drives aren't
   connected.
-- **Subagents (Claude Code).** The user wants subagents used where helpful, with an
-  explicit model and effort level, leaning toward Opus. Definitions are in
-  `.claude/agents/`:
+- **Subagents (Claude Code).** Use agents to get a high-quality result with only the
+  time and tokens required. **Time and tokens are of equal value**: don't spend more of
+  one to save the other. In practice, make small changes directly when you already have
+  the context, and delegate large features, independent parallel work and fresh-eyes
+  reviews. Every agent gets an explicit model and effort level, leaning toward Opus.
+  Definitions are in `.claude/agents/`:
   - `implementer`: opus, high
   - `reviewer`: opus, medium, read-only
   - `lookup`: sonnet, low
