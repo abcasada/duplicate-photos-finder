@@ -45,8 +45,13 @@ tool has.
 5. **Runtime is Python stdlib only.** The machine has no pip/ensurepip. XlsxWriter
    (`python3-xlsxwriter`, apt) is the single *optional* dependency. Without it dpf skips
    `report.xlsx` with a hint. Tests use `unittest`, not pytest.
-6. **Pools are never compared with each other.** Pool A (primary) and pool B (backups)
-   are separate runs (`--pool A`, `--pool B`). One pool per run.
+6. **Pools are never searched for duplicates across each other.** Pool A (primary) and
+   pool B (backups) each get their own duplicate search, also when one run handles both
+   (`--pool A --pool B`); no duplicate group or folder pair ever spans two pools. The
+   single, explicit cross-pool comparison is **backup coverage** (`[backups]` in
+   pools.toml, `src/dpf/coverage.py`): which files of one pool have no copy anywhere in
+   the other. It reads the other pool from the index only (never scans it) and reports
+   missing files, never duplicates.
 
 ## Environment
 
@@ -90,19 +95,21 @@ Data flows **scan → index → match → group → report**.
 |---|---|
 | `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `find`, `drives` (`--forget`), `space` (`--missing`, `--set`), `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
 | `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing), `drop_nested`, and `drive_space` (one `os.statvfs` + `ismount`, taken once per root after its walk). |
-| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`, `set_space` (updates an existing roots row only). |
+| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`, `set_space` (updates an existing roots row only). |
 | `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped; around a camera-number token only *neutral* text (dates, separators) is dropped, other text is kept; extension kept). `copy_numbers(name)` feeds the matcher's copy-number rules. `match_key` is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
-| `src/dpf/match_name.py` | Mode 1 matcher. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance, and a cluster with several copy numbers is split by number. |
+| `src/dpf/match_name.py` | Mode 1 matcher; `bucket_groups` holds the per-bucket rules and is shared with coverage. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance, and a cluster with several copy numbers is split by number. |
 | `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). |
-| `src/dpf/report.py` | `report.txt` (`format_text`), `report.json`, `files.csv`, and shared label/format helpers (`pair_label`, `tree_label`, `run_lines`, `floor_percent`, `human_bytes` (decimal units), root-status lines). |
-| `src/dpf/xlsx_report.py` | `report.xlsx` (optional, XlsxWriter). Sheets: Summary, Trees, Folder pairs, Sequences, Same folder, Files. Sizes are stored as bytes with a GB display format, percentages are floored, relations are colour-coded, and folders are `file://` links (stopping at Excel's link limits). |
-| `src/dpf/pools.py` | Loads `pools.toml` (stdlib `tomllib`). A pattern is matched against mounted dirs **and** indexed roots, so unplugged drives stay in their pool. Matching is per path segment (`*` never spans `/`); `cli` refuses a pool run when a root matches more than one pool. |
+| `src/dpf/report.py` | `report.txt` (`format_text`, `format_coverage`, `footer_lines`), `report.json` (`write_json`, combined `write_pools_json`), `files.csv` (`write_pool_csv` adds a pool column), `missing.csv` (`write_missing_csv`), and shared label/format helpers (`pair_label`, `tree_label`, `run_lines`, `floor_percent`, `human_bytes` (decimal units), root-status lines). |
+| `src/dpf/xlsx_report.py` | `report.xlsx` (optional, XlsxWriter). Sheets: Summary, Trees, Folder pairs, Sequences, Same folder, Files, plus one per coverage direction ("A not in B"). `write_combined_xlsx` writes several pools into one workbook with pool-prefixed sheet names (`sheet_name`: unique, ≤31 chars). Sizes are stored as bytes with a GB display format, percentages are floored, relations are colour-coded, and folders are `file://` links (stopping at Excel's link limits). |
+| `src/dpf/pools.py` | Loads `pools.toml` (stdlib `tomllib`), including the optional `[backups]` table (`B = "A"`: B backs up A; validated: known pools, no self-link, no cycles) into `Pool.backs_up`; `coverage_partners` lists a pool's linked pools. A pattern is matched against mounted dirs **and** indexed roots, so unplugged drives stay in their pool. Matching is per path segment (`*` never spans `/`); `cli` refuses a pool run when a root matches more than one pool. |
 | `src/dpf/media.py` | Extension sets (images incl. RAW/HEIC, videos), `SKIP_DIRS` (`$RECYCLE.BIN`, `System Volume Information`, …), `is_junk` (`._*`, Thumbs.db, desktop.ini, .DS_Store). |
 | `src/dpf/models.py` | `FileRecord`, `DuplicateGroup`, `RootStats` (frozen dataclasses). |
 | `bin/dpf` | Launcher that adds `src/` to the path. It works through a symlink (e.g. `~/.local/bin/dpf`). |
 
-Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
-`~/.cache/dpf/reports/<timestamp>-<mode>/` (or `--out`).
+Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` (plus
+`missing.csv` when coverage ran) to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or
+`--out`). With several `--pool`s they are combined: text sections per pool, one workbook
+with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV column.
 
 ## Current status (2026-10-27)
 
@@ -153,7 +160,7 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
   - Real gain: pool A +27 new groups and 23 groups with added copies (+4 GB), pool B +2.
     Renamed-*and-rewritten* copies (Lightroom) differ in size, so they need mode 1b or 2.
 - **Runs stay whole across same-shot siblings:** an unmatched `X.JPG` next to a matched
-  `X.ARW` no longer splits a run (`grouping._beside_sibling`), but it is listed in
+  `X.ARW` no longer splits a run (`grouping.beside_sibling`), but it is listed in
   `Run.skipped` and shown (`(+1 inside not matched: X.JPG)`). Same-extension siblings
   break the run. Pairs with differently named matches carry `FolderPair.similar_names`
   (`; similar names` in the text label, "Names" column in xlsx). Real data (2026-10-26):
@@ -166,6 +173,24 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` to
 - **Index schema v5** adds the five nullable drive-space columns to `roots`
   (`ALTER TABLE`, all NULL for existing rows; nothing else changes). It migrates in
   place on the first open by any dpf command; back up `index.db` before that first run.
+- **Backup coverage (2026-10-27):** `[backups] B = "A"` in pools.toml (added to the
+  user's file). `find --pool A` adds "Not backed up — no copy anywhere in pool B",
+  `--pool B` "Only in the backup — no copy anywhere in pool A"; `--pool A --pool B` does
+  both pools and both directions in one folder/workbook (README "Backup coverage").
+  No schema change (computed from `match_key`, `size`, `mtime`). Real index (9 drives,
+  881,824 files, everything from the index): A not in B 292,454 files / 5.0 TB in 43,497
+  folders; B not in A 152,135 files / 4.0 TB in 1,209 folders. About 8.5 s and 6 s per
+  direction; the combined `--pool A --pool B --no-scan` run takes ~37 s and writes a
+  10 MB workbook.
+  - Why so much is "missing": 262k A files have no same-name+size file in B at all
+    (4A's 120k files vs 4B's 21k, Plex, recent shoots). 114k missing A files do have a
+    similarly named file in B with another size or date (flagged "with a similar name
+    there"): mostly DNG/ARW re-saved with metadata (a few kB larger, newer mtime), and
+    6,442 same-name+size copies whose mtime differs by exactly whole hours (3,984 at
+    −1 h, 2,453 at −6 h; e.g. 2025-11-12 Northern Lights vs 4B `_Dumps/2026-09-17`).
+    The user may want an option to accept whole-hour offsets; not built.
+  - A backup of the index was taken before the real-data runs
+    (`~/.cache/dpf/index.v5-backup-20261027.db`); no migration was needed.
 - **Empty or unreadable mount folders:** a root that lists no entries at all, or cannot
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.

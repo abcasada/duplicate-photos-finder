@@ -1,4 +1,5 @@
 import contextlib
+import csv
 import importlib.util
 import io
 import json
@@ -13,6 +14,7 @@ from unittest import mock
 
 from dpf.cli import main
 from dpf.index import Index
+from dpf.report import CSV_FIELDS
 
 HAVE_XLSXWRITER = importlib.util.find_spec("xlsxwriter") is not None
 
@@ -414,7 +416,7 @@ class OfflineRootsTest(CliFixture):
 
 
 
-class PoolsCliTest(CliFixture):
+class PoolsFixture(CliFixture):
     """Pools A (1A, 2A) and B (1B) over drives mounted under `media`."""
 
     def setUp(self):
@@ -444,6 +446,9 @@ class PoolsCliTest(CliFixture):
         with open(os.path.join(self.out, "report.json")) as fh:
             return json.load(fh)
 
+
+
+class PoolsCliTest(PoolsFixture):
     def test_find_pool_with_member_offline(self):
         self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
         self.unplug(self.a2)
@@ -616,6 +621,232 @@ class PoolsCliTest(CliFixture):
         self.assertEqual(code, 0)
         self.assertIn("dpf: warning: no pools file at", err)
         self.assertRegex(out.splitlines()[0], r"Connected$")
+
+
+def write_photos(folder, names, size=1000, mtime=1_700_000_000):
+    os.makedirs(folder, exist_ok=True)
+    for i, name in enumerate(names):
+        path = os.path.join(folder, name)
+        with open(path, "wb") as fh:
+            fh.write(b"y" * (size + i))
+        os.utime(path, (mtime + i, mtime + i))
+
+
+class CoverageCliTest(PoolsFixture):
+    """Pool B (1B) backs up pool A (1A, 2A); each drive holds DCIM with IMG_1 … IMG_10."""
+
+    def setUp(self):
+        super().setUp()
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+            "[backups]",
+            'B = "A"',
+        )
+        write_photos(os.path.join(self.a2, "Trip", "day1"), [f"DSC{n:05d}.ARW" for n in (1, 2)])
+        write_photos(os.path.join(self.a2, "Trip", "day2"), [f"DSC{n:05d}.ARW" for n in (3, 4)])
+        write_photos(os.path.join(self.b1, "Only B"), ["PXL_1.jpg", "PXL_2.jpg"], 50)
+        open(os.path.join(self.a1, "DCIM", "empty.jpg"), "wb").close()
+
+    def read(self, name):
+        with open(os.path.join(self.out, name), newline="") as fh:
+            return fh.read()
+
+    def test_pool_a_reports_not_backed_up(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Not backed up — no copy anywhere in pool B\n", out)
+        self.assertIn(f"Pool B:         {self.b1}   (from index, scanned ", out)
+        self.assertIn(
+            "Not backed up:  4 files, 4.0 kB, in 2 folders (+ 1 empty file not compared)", out
+        )
+        self.assertIn(
+            f"{self.a2}/Trip   (whole tree missing from B: 2 folders, 4 files, 4.0 kB)", out
+        )
+        self.assertNotIn("Only in the backup", out)
+        self.assertIn(f"Missing files: {self.out}/missing.csv", out)
+        rows = list(csv.DictReader(io.StringIO(self.read("missing.csv"))))
+        self.assertEqual([r["name"] for r in rows], [f"DSC{n:05d}.ARW" for n in range(1, 5)])
+        self.assertEqual({(r["pool"], r["missing_from"]) for r in rows}, {("A", "B")})
+        data = self.report_json()
+        self.assertEqual(list(data["coverage"]), ["A not in B"])
+        self.assertEqual(data["coverage"]["A not in B"]["missing_files"], 4)
+        self.assertEqual(data["summary"]["pool"], "A")
+        if HAVE_XLSXWRITER:
+            from tests.test_xlsx_report import Workbook
+
+            wb = Workbook(os.path.join(self.out, "report.xlsx"))
+            self.addCleanup(wb.close)
+            self.assertEqual(wb.names[-1], "A not in B")
+            self.assertEqual(wb.names[1], "Trees")
+
+    def test_pool_b_from_index_reports_only_in_backup(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
+        self.unplug(self.a1)
+        self.unplug(self.a2)
+        code, out, err = self.run_cli("find", "-q", "--pool", "B", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Only in the backup — no copy anywhere in pool A\n", out)
+        self.assertIn(f"Pool A:         {self.a1}   (from index, scanned ", out)
+        self.assertIn("not connected)", out)
+        self.assertIn("Pool A comes from the index; it was not scanned now.", out)
+        self.assertIn("Only in backup: 2 files, 101 B, in 1 folder\n", out)
+        self.assertIn(f"{self.b1}/Only B   (all 2 files missing from A)", out)
+
+    def test_other_pool_not_scanned_by_this_run(self):
+        """Coverage reads the other pool from the index only; it never scans it."""
+        self.assertEqual(self.run_cli("scan", "-q", self.b1)[0], 0)
+        write_photos(os.path.join(self.b1, "Later"), [f"DSC{n:05d}.ARW" for n in (1, 2)])
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Not backed up:  4 files", out)
+        self.assertIn(f"{self.b1}   (from index, scanned ", out)
+
+    def test_never_scanned_member_and_unindexed_pool(self):
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *", "{self.media}/Storage 9B"]',
+            "[backups]",
+            'B = "A"',
+        )
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            err,
+            "dpf: warning: pool B has nothing in the index (scan it first); coverage check "
+            "skipped\n",
+        )
+        self.assertNotIn("Not backed up", out)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "missing.csv")))
+        self.assertEqual(self.run_cli("scan", "-q", self.b1)[0], 0)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("1 drive of pool B never scanned", out)
+        self.assertIn(f"\n                  {self.media}/Storage 9B\n", out)
+        code, _, err = self.run_cli(
+            "find", "-q", self.a1, "--coverage-against", "Nothing", "-o", self.out
+        )
+        self.assertEqual((code, err), (1, "dpf: unknown pool Nothing; defined pools: A, B\n"))
+
+    def test_no_coverage(self):
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "--no-coverage", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn("Not backed up", out)
+        self.assertNotIn("Missing files:", out)
+        self.assertNotIn("coverage", self.report_json())
+        self.assertFalse(os.path.exists(os.path.join(self.out, "missing.csv")))
+
+    def test_coverage_against_with_paths(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        trip = os.path.join(self.a2, "Trip")
+        code, out, err = self.run_cli(
+            "find", "-q", trip, os.path.join(self.a1, "DCIM"), "--coverage-against", "b",
+            "-o", self.out,
+        )  # fmt: skip
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Not in pool B — no copy anywhere in pool B\n", out)
+        self.assertIn("Compared:       these folders compared with pool B;", out)
+        self.assertIn(f"{trip}   (whole tree missing from B: 2 folders, 4 files, 4.0 kB)", out)
+        self.assertEqual(list(self.report_json()["coverage"]), ["Not in B"])
+        code, _, err = self.run_cli(
+            "find", "-q", self.b1, "--coverage-against", "B", "-o", self.out
+        )
+        self.assertEqual(code, 1)
+        self.assertIn(f"dpf: the PATHs and pool B overlap at {self.b1} / {self.b1}", err)
+
+    def test_coverage_against_explicit_pool(self):
+        code, out, err = self.run_cli(
+            "find", "-q", "--pool", "B", "--coverage-against", "A", "-o", self.out
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "dpf: pool A has nothing in the index (scan it first)\n")
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
+        code, out, err = self.run_cli(
+            "find", "-q", "--pool", "B", "--coverage-against", "A", "-o", self.out
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Only in the backup — no copy anywhere in pool A", out)
+        code, _, err = self.run_cli(
+            "find", "-q", "--pool", "B", "--coverage-against", "b", "-o", self.out
+        )
+        self.assertEqual(
+            (code, err), (1, "dpf: --coverage-against B: that is the pool being searched\n")
+        )
+
+    def test_argument_errors(self):
+        for args in (
+            ("--pool", "A", "--pool", "a"),
+            ("--pool", "A", "--no-coverage", "--coverage-against", "B"),
+            ("--pool", "A", "--pool", "B", "--coverage-against", "B"),
+            ("--pool", "A", self.a1),
+        ):
+            with self.subTest(args), self.assertRaises(SystemExit) as cm:
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.run_cli("find", "-q", *args, "-o", self.out)
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_two_pools_in_one_run(self):
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "--pool", "B", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertTrue(out.startswith("dpf duplicate report: pool A, pool B\n"))
+        a, b, cov = out.index("===== Pool A ====="), out.index("===== Pool B ====="), out.index(
+            "===== Backup coverage ====="
+        )
+        self.assertLess(a, b)
+        self.assertLess(b, cov)
+        pool_a, pool_b = out[a:b], out[b:cov]
+        self.assertIn(f"{self.a1}/DCIM/DCIM  ↔  {self.a2}/DCIM/DCIM", pool_a)
+        self.assertNotIn(self.b1, pool_a)  # never a duplicate pair across pools
+        self.assertIn("No duplicates shared between folders.", pool_b)
+        self.assertNotIn(self.a1, pool_b)
+        self.assertIn("Not backed up — no copy anywhere in pool B", out[cov:])
+        self.assertIn("Only in the backup — no copy anywhere in pool A", out[cov:])
+        self.assertEqual(out.count("Per-file detail:"), 1)
+        with open(os.path.join(self.out, "report.txt")) as fh:
+            self.assertEqual(fh.read(), out)
+
+        data = self.report_json()
+        self.assertEqual(list(data["pools"]), ["A", "B"])
+        self.assertEqual(data["summary"]["pools"], ["A", "B"])
+        self.assertEqual(list(data["coverage"]), ["A not in B", "B not in A"])
+        for pair in data["pools"]["A"]["pairs"]:
+            self.assertNotIn(self.b1, pair["dir_a"] + pair["dir_b"])
+        self.assertEqual(data["pools"]["B"]["pairs"], [])
+        rows = list(csv.DictReader(io.StringIO(self.read("files.csv"))))
+        self.assertEqual({r["pool"] for r in rows}, {"A"})
+        self.assertTrue(all(r["path"].startswith((self.a1, self.a2)) for r in rows))
+        rows = list(csv.DictReader(io.StringIO(self.read("missing.csv"))))
+        self.assertEqual(
+            sorted({(r["pool"], r["missing_from"]) for r in rows}), [("A", "B"), ("B", "A")]
+        )
+        if HAVE_XLSXWRITER:
+            from tests.test_xlsx_report import Workbook
+
+            wb = Workbook(os.path.join(self.out, "report.xlsx"))
+            self.addCleanup(wb.close)
+            self.assertEqual(wb.names, [
+                "Summary",
+                "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
+                "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
+                "A not in B", "B not in A",
+            ])  # fmt: skip
+            self.assertEqual(wb.cells("A Folder pairs")["F2"], f"{self.a1}/DCIM/DCIM")
+            self.assertNotIn("A2", wb.cells("B Folder pairs"))
+
+    def test_single_pool_run_unchanged_without_backups(self):
+        self.write_pools(f'A = ["{self.media}/Storage [0-9]A *"]', f'B = ["{self.b1}"]')
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn("=====", out)
+        self.assertNotIn("Not backed up", out)
+        self.assertEqual(self.read("files.csv").splitlines()[0], ",".join(CSV_FIELDS))
+
+    def test_pools_listing_shows_links(self):
+        code, out, _ = self.run_cli("pools")
+        self.assertEqual(code, 0)
+        self.assertIn("Pool A\n  backed up by: pool B\n", out)
+        self.assertIn("Pool B\n  backup of: pool A\n", out)
 
 
 GB = 10**9

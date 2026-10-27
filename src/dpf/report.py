@@ -6,10 +6,17 @@ import csv
 import dataclasses
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime
 from decimal import Decimal
 
+from dpf.coverage import (
+    NOT_BACKED_UP,
+    ONLY_IN_BACKUP,
+    Coverage,
+    MissingFolder,
+    caveat,
+)
 from dpf.grouping import (
     A_IN_B,
     B_IN_A,
@@ -230,18 +237,23 @@ def name_list(names: tuple[str, ...], shown: int = SKIPPED_SHOWN) -> str:
     return listed
 
 
-def skipped_note(names: tuple[str, ...]) -> str:
+def skipped_note(names: tuple[str, ...], label: str = "not matched") -> str:
     """E.g. "+1 inside not matched: DSC00003.ARW" for files passed over inside a run."""
-    return f"+{len(names):,} inside not matched: {name_list(names)}"
+    return f"+{len(names):,} inside {label}: {name_list(names)}"
 
 
 def run_lines(
-    runs: tuple[Run, ...], max_runs: int, *, indent: str = _INDENT, align: bool = True
+    runs: tuple[Run, ...],
+    max_runs: int,
+    *,
+    indent: str = _INDENT,
+    align: bool = True,
+    skipped_label: str = "not matched",
 ) -> list[str]:
     """One line per run, up to `max_runs`, then an "… and N more runs" line.
 
-    Files passed over inside a run (Run.skipped) are named on its line. `align` pads
-    names and counts into columns (for monospaced text).
+    Files passed over inside a run (Run.skipped) are named on its line, described by
+    `skipped_label`. `align` pads names and counts into columns (for monospaced text).
     """
     shown = runs[:max_runs]
     if not shown:
@@ -256,7 +268,7 @@ def run_lines(
             unit = unit.ljust(5)
         line = f"{indent}{label:<{label_w}}  {r.count:>{count_w},} {unit}"
         if r.skipped:
-            line = f"{line.rstrip()}  ({skipped_note(r.skipped)})"
+            line = f"{line.rstrip()}  ({skipped_note(r.skipped, skipped_label)})"
         if not r.same_names:
             line += f"  → in B: {_span(r.b_first, r.b_last)}"
         lines.append(line.rstrip())
@@ -265,7 +277,7 @@ def run_lines(
         files = sum(r.count for r in rest)
         more = plural(len(rest), "more run")
         skipped = sum(len(r.skipped) for r in rest)
-        extra = f"; {skipped:,} inside not matched" if skipped else ""
+        extra = f"; {skipped:,} inside {skipped_label}" if skipped else ""
         lines.append(f"{indent}… and {more} ({plural(files, 'file')}{extra})")
     return lines
 
@@ -347,10 +359,12 @@ def format_text(
     min_files: int = 1,
     max_runs: int = 8,
     tree_top: int = TREE_TOP,
+    footer: bool = True,
 ) -> str:
     """Folder-level report. Never lists every file; the CSV/JSON hold that detail.
 
-    A tree overview of up to `tree_top` tree pairs precedes the folder pairs.
+    A tree overview of up to `tree_top` tree pairs precedes the folder pairs. `footer`
+    adds the lines naming the per-file reports (footer_lines).
     """
     out: list[str] = ["dpf duplicate report", ""]
     out.append(f"Mode:        {summary.get('mode', '?')}; matched on {summary.get('basis', '?')}")
@@ -425,19 +439,21 @@ def format_text(
             out.append(f"  … and {plural(len(ranked) - _SAME_FOLDER_TOP, 'more folder')}")
         out.append("")
 
-    csv_path, json_path = summary.get("csv_path"), summary.get("json_path")
-    xlsx_path = summary.get("xlsx_path")
-    if csv_path or json_path or xlsx_path:
-        out.append("Per-file detail:")
-        if csv_path:
-            out.append(f"  CSV:  {csv_path}")
-        if json_path:
-            out.append(f"  JSON: {json_path}")
-        if xlsx_path:
-            out.append(f"  XLSX: {xlsx_path}")
-    else:
-        out.append("Per-file detail is in the CSV/JSON reports.")
+    if footer:
+        out.extend(footer_lines(summary))
     return "\n".join(out) + "\n"
+
+
+def footer_lines(summary: dict) -> list[str]:
+    """Where the per-file detail went (summary["csv_path"], "json_path", "xlsx_path", …)."""
+    labels = (
+        ("CSV:  ", "csv_path"), ("JSON: ", "json_path"), ("XLSX: ", "xlsx_path"),
+        ("Missing files: ", "missing_csv_path"),
+    )  # fmt: skip
+    lines = [f"  {label}{summary[key]}" for label, key in labels if summary.get(key)]
+    if not lines:
+        return ["Per-file detail is in the CSV/JSON reports."]
+    return ["Per-file detail:", *lines]
 
 
 def _group_files(g: DuplicateGroup) -> list[dict]:
@@ -446,9 +462,9 @@ def _group_files(g: DuplicateGroup) -> list[dict]:
     ]
 
 
-def write_json(result: GroupingResult, summary: dict, path: str) -> None:
-    """Everything structured: summary, tree pairs, folder pairs with runs, same-folder groups."""
-    data = {
+def report_data(result: GroupingResult, summary: dict) -> dict:
+    """The JSON form of one duplicate report (summary, trees, pairs, same-folder groups)."""
+    return {
         "summary": summary,
         "groups": result.groups,
         "redundant_bytes": result.redundant_bytes,
@@ -467,6 +483,39 @@ def write_json(result: GroupingResult, summary: dict, path: str) -> None:
             for g in result.same_folder
         ],
     }
+
+
+def write_json(
+    result: GroupingResult, summary: dict, path: str, coverage: Sequence[Coverage] = ()
+) -> None:
+    """Everything structured: summary, tree pairs, folder pairs with runs, same-folder groups.
+
+    Coverage sections, if any, go under "coverage", keyed by their label ("A not in B").
+    """
+    data = report_data(result, summary)
+    if coverage:
+        data["coverage"] = {c.label: coverage_data(c) for c in coverage}
+    _dump(data, path)
+
+
+def write_pools_json(
+    pools: Sequence[tuple[str, GroupingResult, dict]],
+    coverage: Sequence[Coverage],
+    summary: dict,
+    path: str,
+) -> None:
+    """A combined report: {"summary", "pools": {name: report}, "coverage": {label: …}}."""
+    _dump(
+        {
+            "summary": summary,
+            "pools": {name: report_data(result, s) for name, result, s in pools},
+            "coverage": {c.label: coverage_data(c) for c in coverage},
+        },
+        path,
+    )
+
+
+def _dump(data: dict, path: str) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=1, default=str)
         fh.write("\n")
@@ -483,9 +532,178 @@ def write_csv(groups: Iterable[DuplicateGroup], path: str) -> int:
         w = csv.writer(fh)
         w.writerow(CSV_FIELDS)
         for n, g in enumerate(groups, 1):
-            same = "yes" if g.same_names else "no"
-            for f in g.files:
+            w.writerows(_group_rows(n, g))
+    return n
+
+
+def write_pool_csv(pools: Sequence[tuple[str, Iterable[DuplicateGroup]]], path: str) -> int:
+    """write_csv for several pools, with a leading "pool" column; group ids restart per pool."""
+    total = 0
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(("pool", *CSV_FIELDS))
+        for name, groups in pools:
+            for n, g in enumerate(groups, 1):
+                w.writerows((name, *row) for row in _group_rows(n, g))
+                total += 1
+    return total
+
+
+def _group_rows(n: int, g: DuplicateGroup) -> Iterator[tuple]:
+    same = "yes" if g.same_names else "no"
+    for f in g.files:
+        yield (n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind, same)
+
+
+# -- backup coverage ---------------------------------------------------------------
+
+COVERAGE_TOP = 50
+MISSING_CSV_FIELDS = (
+    "pool", "missing_from", "path", "dir", "name", "size", "mtime", "kind", "similar_name_there",
+)  # fmt: skip
+
+
+def coverage_relation(cov: Coverage) -> str:
+    """E.g. "pool B is the backup of pool A"."""
+    mine = f"pool {cov.pool}" if cov.pool else "these folders"
+    if cov.direction == NOT_BACKED_UP:
+        return f"pool {cov.other} is the backup of {mine}"
+    if cov.direction == ONLY_IN_BACKUP:
+        return f"{mine} is the backup of pool {cov.other}"
+    return f"{mine} compared with pool {cov.other}"
+
+
+def coverage_totals(cov: Coverage) -> str:
+    """E.g. "1,234 files, 5.6 GB, in 78 folders (+ 3 empty files not compared)"."""
+    text = (
+        f"{plural(len(cov.missing), 'file')}, {human_bytes(cov.missing_bytes)}, "
+        f"in {plural(cov.missing_dirs, 'folder')}"
+    )
+    if cov.empty:
+        text += f" (+ {plural(cov.empty, 'empty file')} not compared)"
+    return text
+
+
+def missing_label(cov: Coverage, m: MissingFolder) -> str:
+    """E.g. "whole tree missing from B: 12 folders, 3,400 files, 210.0 GB"."""
+    where = f"missing from {cov.other}"
+    if m.whole_tree:
+        text = (
+            f"whole tree {where}: {plural(m.folders, 'folder')}, {plural(m.missing, 'file')}, "
+            f"{human_bytes(m.bytes)}"
+        )
+    elif m.missing == m.total:
+        text = f"all {plural(m.total, 'file')} {where}"
+    else:
+        text = f"{m.missing:,} of {plural(m.total, 'file')} {where}"
+    if m.similar:
+        text += f"; {m.similar:,} {SIMILAR_THERE}"
+    if m.unindexed:
+        text += f"; {plural(m.unindexed, 'other file')} not compared"
+    return text
+
+
+SIMILAR_THERE = "with a similar name there"
+
+
+def similar_note(cov: Coverage) -> str:
+    """The totals line explaining missing files whose name does occur in the other pool."""
+    return (
+        f"{len(cov.similar):,} of them {'has' if len(cov.similar) == 1 else 'have'} a file "
+        f"with a similar name in pool {cov.other}, but of another size or date: an edited "
+        "or re-saved version, or a different photo with the same number"
+    )
+
+
+def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: int = 8) -> str:
+    """One coverage section: header, totals, then folders largest first (never every file)."""
+    out = [cov.title, "=" * len(cov.title)]
+    out.append(f"{'Compared:':<16}{coverage_relation(cov)}; {cov.basis or '?'}")
+    lines = root_lines({"root_status": cov.other_status, "roots": cov.other_roots})
+    for i, line in enumerate(lines):
+        out.append(f"{f'Pool {cov.other}:' if i == 0 else '':<16}{line}")
+    if any_offline({"root_status": cov.other_status}):
+        out.append(f"{'':<16}Pool {cov.other} comes from the index; it was not scanned now.")
+    if cov.never_scanned:
+        out.append(
+            f"{'':<16}Not compared: {plural(len(cov.never_scanned), 'drive')} of pool "
+            f"{cov.other} never scanned, so files only there are not counted as copies:"
+        )
+        out.extend(f"{'':<18}{p}" for p in cov.never_scanned)
+    out.append(f"{'':<16}{caveat(cov.basis_words)}")
+    head = {NOT_BACKED_UP: "Not backed up", ONLY_IN_BACKUP: "Only in backup"}.get(
+        cov.direction, f"Not in {cov.other}"
+    )
+    out.append(f"{head + ':':<16}{coverage_totals(cov)}")
+    mine = f"pool {cov.pool}" if cov.pool else "these folders"
+    out.append(
+        f"{'':<16}{_percent(len(cov.missing), cov.files)} of the "
+        f"{plural(cov.files, 'file')} compared in {mine}"
+    )
+    if cov.similar:
+        out.append(f"{'':<16}{similar_note(cov)}")
+    out.append("")
+    if not cov.folders:
+        out.append(
+            f"Every compared file has a copy in pool {cov.other}." if cov.files
+            else "No files to compare."
+        )  # fmt: skip
+        return "\n".join(out) + "\n"
+    shown = cov.folders if top is None else cov.folders[: max(top, 0)]
+    num_w = len(f"[{len(shown)}]")
+    for n, m in enumerate(shown, 1):
+        num = f"[{n}]".ljust(num_w)
+        out.append(f"{num}  {human_bytes(m.bytes):>8}  {m.dir}   ({missing_label(cov, m)})")
+        if m.runs and m.missing < m.total:
+            label = f"with a copy in {cov.other}"
+            out.extend(run_lines(m.runs, max_runs, skipped_label=label))
+    rest = cov.folders[len(shown):]
+    if rest:
+        files = sum(m.missing for m in rest)
+        out.append(
+            f"… {plural(len(rest), 'more folder')} ({plural(files, 'file')}, "
+            f"{human_bytes(sum(m.bytes for m in rest))}) not shown (coverage top {top})"
+        )
+    return "\n".join(out) + "\n"
+
+
+def coverage_data(cov: Coverage) -> dict:
+    """The JSON form of a coverage section (per-file detail is in missing.csv)."""
+    return {
+        "pool": cov.pool,
+        "against": cov.other,
+        "direction": cov.direction,
+        "title": cov.title,
+        "relation": coverage_relation(cov),
+        "basis": cov.basis,
+        "caveat": caveat(cov.basis_words),
+        "roots": cov.roots,
+        "other_roots": cov.other_status or cov.other_roots,
+        "never_scanned": cov.never_scanned,
+        "files_compared": cov.files,
+        "bytes": cov.bytes,
+        "missing_files": len(cov.missing),
+        "missing_bytes": cov.missing_bytes,
+        "missing_folders": cov.missing_dirs,
+        "similar_name_files": len(cov.similar),
+        "empty_files": cov.empty,
+        "elapsed": cov.elapsed,
+        "folders": [dataclasses.asdict(m) for m in cov.folders],
+    }
+
+
+def write_missing_csv(coverages: Iterable[Coverage], path: str) -> int:
+    """One row per missing file of every coverage section; returns the rows written."""
+    n = 0
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(MISSING_CSV_FIELDS)
+        for cov in coverages:
+            for f in cov.missing:
+                path = f.path
                 w.writerow(
-                    (n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind, same)
-                )
+                    (cov.pool or "", cov.other, path, f.dir, f.name, f.size, _iso(f.mtime),
+                     f.kind, "yes" if path in cov.similar else "no")
+                )  # fmt: skip
+                n += 1
     return n

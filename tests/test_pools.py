@@ -4,8 +4,11 @@ import tempfile
 import unittest
 
 from dpf.pools import (
+    BACKUP,
+    PRIMARY,
     Pool,
     PoolError,
+    coverage_partners,
     get_pool,
     load_pools,
     matches,
@@ -75,6 +78,44 @@ class ConfigTest(unittest.TestCase):
         pools = parse_pools({"pools": {"A": ["/a"], "B": ["/b"]}})
         with self.assertRaisesRegex(PoolError, "unknown pool C; defined pools: A, B"):
             get_pool(pools, "C")
+
+
+class BackupsTest(unittest.TestCase):
+    POOLS = {"A": ["/a"], "B": ["/b"], "C": ["/c"]}
+
+    def test_links(self):
+        pools = parse_pools({"pools": self.POOLS, "backups": {"b": "A", "C": "b"}})
+        self.assertEqual(pools["b"], Pool("B", ("/b",), "a"))
+        self.assertEqual((pools["a"].backs_up, pools["c"].backs_up), (None, "b"))
+        self.assertEqual(coverage_partners(pools, pools["a"]), [(pools["b"], BACKUP)])
+        self.assertEqual(
+            coverage_partners(pools, pools["b"]), [(pools["a"], PRIMARY), (pools["c"], BACKUP)]
+        )
+        self.assertEqual(coverage_partners(parse_pools({"pools": self.POOLS}), pools["a"]), [])
+
+    def test_load_from_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pools.toml")
+            with open(path, "w") as fh:
+                fh.write('[pools]\nA = ["/a"]\nB = ["/b"]\n\n[backups]\nB = "A"\n')
+            self.assertEqual(load_pools(path)["b"].backs_up, "a")
+
+    def test_invalid(self):
+        cases = [
+            ({"backups": ["B"]}, "cfg: [backups] must be a table"),
+            ({"backups": {"B": 1}}, "cfg: [backups] B must name one pool"),
+            ({"backups": {"B": ["A"]}}, "cfg: [backups] B must name one pool"),
+            ({"backups": {"B": "Z"}}, "[backups] names unknown pool Z; defined pools: A, B, C"),
+            ({"backups": {"Z": "A"}}, "cfg: [backups] names unknown pool Z"),
+            ({"backups": {"B": "b"}}, "cfg: [backups] pool B cannot back up itself"),
+            ({"backups": {"B": "A", "b": "C"}}, "cfg: [backups] lists pool B twice"),
+            ({"backups": {"B": "A", "A": "B"}}, "[backups] links form a cycle: B → A → B"),
+            ({"backups": {"A": "B", "B": "C", "C": "a"}}, "cycle: A → B → C → A"),
+        ]
+        for extra, expected in cases:
+            with self.subTest(expected), self.assertRaises(PoolError) as cm:
+                parse_pools({"pools": self.POOLS, **extra}, "cfg")
+            self.assertIn(expected, str(cm.exception))
 
 
 class MatchTest(unittest.TestCase):

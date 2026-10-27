@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 import re
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import combinations
 
@@ -260,7 +260,7 @@ def _build_pair(
         if other is None:
             if cur is None:
                 continue
-            if _beside_sibling(listing, a_map, i):
+            if beside_sibling(listing, a_map, i):
                 passed.append(rec.name)
             else:
                 runs.append(_run(cur))
@@ -308,10 +308,12 @@ def _run(cur: list) -> Run:
     return Run(*cur[:7], tuple(cur[8]))
 
 
-def _beside_sibling(
-    listing: list[tuple[tuple[str | int, ...], str, FileRecord]], a_map: dict[str, str], i: int
+def beside_sibling(
+    listing: list[tuple[tuple[str | int, ...], str, FileRecord]], a_map: Container[str], i: int
 ) -> bool:
     """True if unmatched listing[i] is another format of a matched neighbour's shot.
+
+    `a_map` holds the matched names (coverage passes the missing ones instead).
 
     The neighbour must share the name stem and have a different extension (the JPG of
     a matched RAW). A same-format file ("X.DNG" beside a matched "X (2).DNG") is a

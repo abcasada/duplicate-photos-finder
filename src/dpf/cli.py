@@ -8,15 +8,19 @@ import os
 import sys
 import time
 from collections.abc import Collection
+from dataclasses import dataclass, field
 
 from dpf import __version__
 from dpf.index import Index, default_db_path
 from dpf.grouping import DEFAULT_NEAR, GroupingResult
+from dpf.coverage import NOT_BACKED_UP, NOT_IN_OTHER, ONLY_IN_BACKUP, Coverage
 from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
+    BACKUP,
     Pool,
     PoolError,
     Pools,
+    coverage_partners,
     default_pools_path,
     get_pool,
     is_glob,
@@ -26,9 +30,12 @@ from dpf.pools import (
     pools_of,
 )
 from dpf.report import (
+    COVERAGE_TOP,
     FROM_INDEX,
     SCANNED_NOW,
     TREE_TOP,
+    footer_lines,
+    format_coverage,
     format_text,
     human_bytes,
     parse_bytes,
@@ -36,6 +43,9 @@ from dpf.report import (
     scan_date,
     write_csv,
     write_json,
+    write_missing_csv,
+    write_pool_csv,
+    write_pools_json,
 )
 
 MODES = {"1": "name", "name": "name", "2": "content", "content": "content", "3": "both", "both": "both"}
@@ -66,8 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("roots", nargs="*", metavar="PATH", help="folders or drive mount points")
     common.add_argument(
-        "--pool", metavar="NAME",
-        help="use the drives of this pool (see `dpf pools`) instead of PATHs",
+        "--pool", metavar="NAME", action="append",
+        help="use the drives of this pool (see `dpf pools`) instead of PATHs; repeat it "
+        "(--pool A --pool B) to handle several pools in one run, each searched on its own",
     )  # fmt: skip
     common.add_argument(
         "--all-files", action="store_true", help="index every file, not just photos/videos"
@@ -140,6 +151,20 @@ def _build_parser() -> argparse.ArgumentParser:
     f.add_argument(
         "--tree-top", type=int, default=TREE_TOP, metavar="N",
         help=f"tree pairs shown in the tree overview; 0 hides it (default: {TREE_TOP})",
+    )  # fmt: skip
+    f.add_argument(
+        "--no-coverage", action="store_true",
+        help="skip the backup coverage check (files with no copy in the pool linked to this "
+        "one by [backups] in the pools file)",
+    )  # fmt: skip
+    f.add_argument(
+        "--coverage-against", metavar="POOL",
+        help="check coverage against this pool (taken from the index, never scanned), "
+        "instead of the pools linked by [backups]; works with PATHs too",
+    )  # fmt: skip
+    f.add_argument(
+        "--coverage-top", type=int, default=COVERAGE_TOP, metavar="N",
+        help=f"folders listed per coverage section in report.txt (default: {COVERAGE_TOP})",
     )  # fmt: skip
     f.add_argument(
         "--no-xlsx", action="store_true", help="don't write report.xlsx (needs XlsxWriter)"
@@ -295,7 +320,41 @@ def _check_output_location(
             )
 
 
-def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namespace) -> int:
+@dataclass(slots=True)
+class _Target:
+    """The roots of one duplicate search: a pool, or the PATHs given (pool None)."""
+
+    pool: Pool | None
+    roots: list[str]
+    offline: set[str] = field(default_factory=set)
+
+    @property
+    def name(self) -> str | None:
+        return self.pool.name if self.pool else None
+
+
+@dataclass(slots=True)
+class _CoveragePlan:
+    """Check `target` against pool `other`, whose roots come from the index."""
+
+    target: _Target
+    other: Pool
+    direction: str
+    roots: list[str]
+    never_scanned: list[str]
+    in_run: _Target | None = None  # the other pool, when it is also searched in this run
+
+
+@dataclass(slots=True)
+class _PoolRun:
+    target: _Target
+    groups: list[DuplicateGroup]
+    result: GroupingResult
+    summary: dict
+
+
+def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Namespace) -> int:
+    from dpf.coverage import check_coverage
     from dpf.grouping import group_duplicates
     from dpf.match_name import find_name_duplicates
 
@@ -304,23 +363,30 @@ def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namesp
         print("dpf: mode 2/3 (content comparison) is not implemented yet", file=sys.stderr)
         return 2
 
+    plans = _coverage_plans(idx, targets, pools, args)
+    if plans is None:
+        return 1
     out = args.out or _default_out_dir(mode)
+    roots = [r for t in targets for r in t.roots]
+    other = [r for p in plans if p.in_run is None for r in p.roots]
     _check_output_location(
-        out, roots, "reports", allow_same_drive=args.allow_same_drive, offline=offline
-    )
+        out, roots + other, "reports", allow_same_drive=args.allow_same_drive,
+        offline={r for t in targets for r in t.offline} | set(other),
+    )  # fmt: skip
 
     started = time.monotonic()
-    online = [r for r in roots if r not in offline]
     if not args.quiet:
-        for r in roots:
-            if r in offline:
-                when = idx.containing_root(r)
-                print(
-                    f"using index for {r} (not connected; last scanned "
-                    f"{scan_date(when and when.scanned_at)})",
-                    file=sys.stderr,
-                )  # fmt: skip
+        for t in targets:
+            for r in t.roots:
+                if r in t.offline:
+                    when = idx.containing_root(r)
+                    print(
+                        f"using index for {r} (not connected; last scanned "
+                        f"{scan_date(when and when.scanned_at)})",
+                        file=sys.stderr,
+                    )  # fmt: skip
     scanned: dict[str, RootStats] = {}
+    online = [r for t in targets for r in t.roots if r not in t.offline]
     if args.no_scan:
         for r in online:
             if not idx.indexed(r):
@@ -329,56 +395,207 @@ def _find(idx: Index, roots: list[str], offline: set[str], args: argparse.Namesp
     elif online:
         stats, kept = _scan(idx, online, args)
         scanned = {s.root: s for s in stats}
-        offline |= kept.keys()  # taken from the index, like an unplugged drive
+        for t in targets:  # taken from the index, like an unplugged drive
+            t.offline |= kept.keys() & set(t.roots)
 
-    groups = list(
-        find_name_duplicates(
-            idx, roots,
-            mtime_tolerance=args.mtime_tolerance,
-            ignore_size=args.ignore_size,
-            ignore_mtime=args.ignore_mtime,
-            exact_names=args.exact_names,
-        )
-    )  # fmt: skip
-    result = group_duplicates(
-        groups, idx.list_dir, idx.subdirs, idx.dir_extras,
-        roots=roots, near=args.near, tree_totals=lambda d: idx.totals([d]),
-    )  # fmt: skip
-    files, nbytes = idx.totals(roots)
+    runs: list[_PoolRun] = []
+    for t in targets:
+        groups = list(
+            find_name_duplicates(
+                idx, t.roots,
+                mtime_tolerance=args.mtime_tolerance,
+                ignore_size=args.ignore_size,
+                ignore_mtime=args.ignore_mtime,
+                exact_names=args.exact_names,
+            )
+        )  # fmt: skip
+        result = group_duplicates(
+            groups, idx.list_dir, idx.subdirs, idx.dir_extras,
+            roots=t.roots, near=args.near, tree_totals=lambda d: idx.totals([d]),
+        )  # fmt: skip
+        files, nbytes = idx.totals(t.roots)
+        summary = {
+            "mode": MODE_TITLES[mode],
+            "basis": _basis(args),
+            **({"pool": t.name} if t.name else {}),
+            "roots": t.roots,
+            "root_status": _root_status(idx, t.roots, t.offline, scanned),
+            "files": files,
+            "bytes": nbytes,
+        }
+        runs.append(_PoolRun(t, groups, result, summary))
+
+    coverages: list[Coverage] = []
+    for plan in plans:
+        began = time.monotonic()
+        cov = check_coverage(
+            idx, plan.target.roots, plan.roots,
+            pool=plan.target.name, other=plan.other.name, direction=plan.direction,
+            mtime_tolerance=args.mtime_tolerance, ignore_size=args.ignore_size,
+            ignore_mtime=args.ignore_mtime, exact_names=args.exact_names,
+        )  # fmt: skip
+        offline = plan.in_run.offline if plan.in_run else {
+            r for r in plan.roots if not os.path.isdir(r)
+        }  # fmt: skip
+        cov.other_status = _root_status(idx, plan.roots, offline, scanned)
+        cov.never_scanned = plan.never_scanned
+        cov.elapsed = time.monotonic() - began
+        coverages.append(cov)
 
     os.makedirs(out, exist_ok=True)
-    csv_path = os.path.join(out, "files.csv")
-    json_path = os.path.join(out, "report.json")
-    text_path = os.path.join(out, "report.txt")
-    write_csv(groups, csv_path)
-    summary = {
-        "mode": MODE_TITLES[mode],
-        "basis": _basis(args),
-        **({"pool": args.pool} if args.pool else {}),
-        "roots": roots,
-        "root_status": _root_status(idx, roots, offline, scanned),
-        "files": files,
-        "bytes": nbytes,
-        "elapsed": time.monotonic() - started,
-        "csv_path": csv_path,
-        "json_path": json_path,
+    paths = {
+        "csv_path": os.path.join(out, "files.csv"),
+        "json_path": os.path.join(out, "report.json"),
     }
+    missing_path = os.path.join(out, "missing.csv")
+    if coverages:
+        write_missing_csv(coverages, missing_path)
+        paths["missing_csv_path"] = missing_path
+    elif os.path.exists(missing_path):
+        os.remove(missing_path)  # stale, from an earlier run into the same --out
     xlsx_path = os.path.join(out, "report.xlsx")
-    if not args.no_xlsx and _write_xlsx(result, groups, summary, xlsx_path):
-        summary["xlsx_path"] = xlsx_path
-    elif os.path.exists(xlsx_path):
-        os.remove(xlsx_path)  # a stale workbook from an earlier run into the same --out
-    write_json(result, summary, json_path)
-    text = format_text(
-        result, summary,
-        top=args.top, min_files=args.min_files, max_runs=args.max_runs, tree_top=args.tree_top,
-    )  # fmt: skip
+    text_path = os.path.join(out, "report.txt")
+    elapsed = time.monotonic() - started
+    for r in runs:
+        r.summary["elapsed"] = elapsed
+    text_opts = {
+        "top": args.top, "min_files": args.min_files, "max_runs": args.max_runs,
+        "tree_top": args.tree_top, "footer": False,
+    }  # fmt: skip
+
+    if len(runs) == 1:
+        run = runs[0]
+        write_csv(run.groups, paths["csv_path"])
+        summary = {**run.summary, **paths}
+        if not args.no_xlsx and _write_xlsx(
+            xlsx_path, run.result, run.groups, summary, coverages=coverages
+        ):
+            summary["xlsx_path"] = xlsx_path
+        elif os.path.exists(xlsx_path):
+            os.remove(xlsx_path)  # a stale workbook from an earlier run into the same --out
+        write_json(run.result, summary, paths["json_path"], coverage=coverages)
+        parts = [format_text(run.result, summary, **text_opts)]
+    else:
+        write_pool_csv([(r.target.name or "", r.groups) for r in runs], paths["csv_path"])
+        summary = {
+            "mode": MODE_TITLES[mode],
+            "basis": _basis(args),
+            "pools": [r.target.name for r in runs],
+            "elapsed": elapsed,
+            **paths,
+        }
+        if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
+                                            coverages=coverages):  # fmt: skip
+            summary["xlsx_path"] = xlsx_path
+        elif os.path.exists(xlsx_path):
+            os.remove(xlsx_path)
+        write_pools_json(
+            [(r.target.name or "", r.result, r.summary) for r in runs], coverages, summary,
+            paths["json_path"],
+        )  # fmt: skip
+        parts = [
+            f"dpf duplicate report: {', '.join(f'pool {r.target.name}' for r in runs)}\n"
+            "Duplicates are searched within each pool, never between pools.\n"
+        ]
+        for r in runs:
+            parts.append(_banner(f"Pool {r.target.name}"))
+            parts.append(format_text(r.result, r.summary, **text_opts))
+        if coverages:
+            parts.append(_banner("Backup coverage"))
+    for cov in coverages:
+        parts.append(format_coverage(cov, top=args.coverage_top, max_runs=args.max_runs))
+    parts.append("\n".join(footer_lines(summary)))
+    text = "\n\n".join(p.rstrip("\n") for p in parts) + "\n"
     with open(text_path, "w", encoding="utf-8") as fh:
         fh.write(text)
     print(text, end="" if text.endswith("\n") else "\n")
     if not args.quiet:
         print(f"report saved to {text_path}", file=sys.stderr)
     return 0
+
+
+def _banner(title: str) -> str:
+    return f"===== {title} =====\n"
+
+
+def _coverage_plans(
+    idx: Index, targets: list[_Target], pools: Pools, args: argparse.Namespace
+) -> list[_CoveragePlan] | None:
+    """The coverage checks this run makes; None (after an error message) if one can't run.
+
+    Without --coverage-against, each pool of the run is checked against the pools linked
+    to it by [backups]; a link that can't be used is skipped with a warning.
+    """
+    if args.no_coverage or MODES[args.mode] != "name":
+        return []
+    in_run = {t.pool.name.casefold(): t for t in targets if t.pool}
+    wanted: list[tuple[_Target, Pool, str]] = []
+    if args.coverage_against:
+        try:
+            other = get_pool(pools, args.coverage_against)
+        except PoolError as e:
+            print(f"dpf: {e}", file=sys.stderr)
+            return None
+        t = targets[0]
+        partners = coverage_partners(pools, t.pool) if t.pool else []
+        roles = {p.name: role for p, role in partners}
+        if t.pool is not None and t.pool.name == other.name:
+            print(f"dpf: --coverage-against {other.name}: that is the pool being searched",
+                  file=sys.stderr)  # fmt: skip
+            return None
+        wanted.append((t, other, _direction(roles.get(other.name))))
+    else:
+        for t in targets:
+            if t.pool is not None:
+                wanted += [(t, p, _direction(role)) for p, role in coverage_partners(pools, t.pool)]
+
+    plans: list[_CoveragePlan] = []
+    for t, other, direction in wanted:
+        problem, plan = _plan(idx, t, other, direction, in_run.get(other.name.casefold()))
+        if problem is None:
+            plans.append(plan)
+            continue
+        if args.coverage_against:
+            print(f"dpf: {problem}", file=sys.stderr)
+            return None
+        print(f"dpf: warning: {problem}; coverage check skipped", file=sys.stderr)
+    return plans
+
+
+def _direction(role: str | None) -> str:
+    if role is None:
+        return NOT_IN_OTHER
+    return NOT_BACKED_UP if role == BACKUP else ONLY_IN_BACKUP
+
+
+def _plan(
+    idx: Index, target: _Target, other: Pool, direction: str, in_run: _Target | None
+) -> tuple[str | None, _CoveragePlan | None]:
+    """(problem, None) or (None, plan) for checking `target` against pool `other`."""
+    from dpf.scanner import drop_nested
+
+    never: list[str] = []
+    if in_run is not None:
+        roots = list(in_run.roots)
+    else:
+        try:
+            paths = pool_paths(other, [r.root for r in idx.roots()])
+        except PoolError:
+            paths = []
+        found = [p for p in paths if idx.indexed(p)]
+        roots = drop_nested(found)
+        never = [
+            p for p in paths
+            if p not in found and not any(p.startswith(r.rstrip("/") + "/") for r in roots)
+        ]  # fmt: skip
+    if not roots:
+        return f"pool {other.name} has nothing in the index (scan it first)", None
+    for r in target.roots:
+        for o in roots:
+            if r == o or r.startswith(o.rstrip("/") + "/") or o.startswith(r.rstrip("/") + "/"):
+                what = f"pool {target.name}" if target.name else "the PATHs"
+                return f"{what} and pool {other.name} overlap at {r} / {o}", None
+    return None, _CoveragePlan(target, other, direction, roots, never, in_run)
 
 
 def _root_status(
@@ -655,6 +872,9 @@ def _pools(args: argparse.Namespace) -> int:
         print(f"Pools from {args.pools_file or default_pools_path()}")
         for pool in pools.values():
             print(f"\nPool {pool.name}")
+            for other, role in coverage_partners(pools, pool):
+                link = "backed up by" if role == BACKUP else "backup of"
+                print(f"  {link}: pool {other.name}")
             for i, pattern in enumerate(pool.patterns):
                 print(f"  {'patterns:' if i == 0 else '':<11}{pattern}")
             members = _pool_members(pool, idx)
@@ -707,16 +927,16 @@ def _offline_or_abs(idx: Index | None, path: str) -> str:
     return os.path.abspath(path)
 
 
-def _resolve_pool(args: argparse.Namespace) -> tuple[Pools, Pool, list[str]]:
-    """All pools, the pool named by --pool, and the paths it stands for (pools.pool_paths)."""
+def _resolve_pools(args: argparse.Namespace) -> tuple[Pools, list[tuple[Pool, list[str]]]]:
+    """All pools, and each --pool with the paths it stands for (pools.pool_paths)."""
     pools = load_pools(args.pools_file)
-    pool = get_pool(pools, args.pool)
+    chosen = [get_pool(pools, name) for name in args.pool]
     db = args.db or default_db_path()
     indexed: list[str] = []
     if os.path.exists(db):
         with Index(db) as idx:
             indexed = [r.root for r in idx.roots()]
-    return pools, pool, pool_paths(pool, indexed)
+    return pools, [(pool, pool_paths(pool, indexed)) for pool in chosen]
 
 
 def _check_one_pool(pools: Pools, roots: list[str], args: argparse.Namespace) -> bool:
@@ -768,13 +988,23 @@ def _forget(idx: Index, known: list[RootStats], paths: list[str]) -> int:
 
 
 def _write_xlsx(
-    result: GroupingResult, groups: list[DuplicateGroup], summary: dict, path: str
+    path: str,
+    result: GroupingResult | None = None,
+    groups: list[DuplicateGroup] | None = None,
+    summary: dict | None = None,
+    *,
+    runs: list[_PoolRun] | None = None,
+    coverages: list[Coverage] | None = None,
 ) -> bool:
-    """Write report.xlsx; False (with a hint) when the optional XlsxWriter is missing."""
-    from dpf.xlsx_report import write_xlsx
+    """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
+    from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
 
     try:
-        write_xlsx(result, groups, summary, path)
+        if runs is None:
+            write_xlsx(result, groups or [], summary or {}, path, coverages or [])
+        else:
+            sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
+            write_combined_xlsx(sheets, coverages or [], summary or {}, path)
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":
             raise
@@ -827,53 +1057,70 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"{args.command}: give either PATHs or --pool, not both")
     if not args.pool and not args.roots:
         parser.error(f"{args.command}: give PATHs or --pool NAME")
-    paths = args.roots
-    pools: Pools = {}
     if args.pool:
-        try:
-            pools, pool, paths = _resolve_pool(args)
-        except PoolError as e:
-            print(f"dpf: {e}", file=sys.stderr)
-            return 1
-        args.pool = pool.name
+        names = [n.casefold() for n in args.pool]
+        twice = next((n for n in args.pool if names.count(n.casefold()) > 1), None)
+        if twice:
+            parser.error(f"{args.command}: --pool {twice} is given twice")
+    if args.command == "find":
+        if args.no_coverage and args.coverage_against:
+            parser.error("find: --no-coverage and --coverage-against exclude each other")
+        if args.coverage_against and args.pool and len(args.pool) > 1:
+            parser.error("find: --coverage-against goes with a single --pool or with PATHs")
+    pools: Pools = {}
+    chosen: list[tuple[Pool | None, list[str]]] = [(None, args.roots)]
     try:
-        online, missing = split_roots(paths)
-    except ValueError as e:
+        if args.pool:
+            pools, chosen = _resolve_pools(args)
+        elif getattr(args, "coverage_against", None):
+            pools = load_pools(args.pools_file)
+    except PoolError as e:
         print(f"dpf: {e}", file=sys.stderr)
         return 1
-    if args.command == "scan" and missing:
-        if not args.pool:
-            print(f"dpf: {missing[0]} is not connected; nothing to scan", file=sys.stderr)
+    split: list[tuple[Pool | None, list[str], list[str]]] = []
+    for pool, paths in chosen:
+        try:
+            online, missing = split_roots(paths)
+        except ValueError as e:
+            print(f"dpf: {e}", file=sys.stderr)
             return 1
-        if not online:
-            print(f"dpf: no drives in pool {args.pool} are connected", file=sys.stderr)
-            return 1
-        if not args.quiet:
-            absent = [os.path.abspath(p) for p in missing]
-            for p in drop_nested(online + absent):
-                if p not in online:
-                    print(f"skipping {p} (pool {args.pool}, not connected)", file=sys.stderr)
-        missing = []
+        if args.command == "scan" and missing:
+            if pool is None:
+                print(f"dpf: {missing[0]} is not connected; nothing to scan", file=sys.stderr)
+                return 1
+            if not online:
+                print(f"dpf: no drives in pool {pool.name} are connected", file=sys.stderr)
+                return 1
+            if not args.quiet:
+                absent = [os.path.abspath(p) for p in missing]
+                for p in drop_nested(online + absent):
+                    if p not in online:
+                        print(f"skipping {p} (pool {pool.name}, not connected)", file=sys.stderr)
+            missing = []
+        split.append((pool, online, missing))
+    every_online = [r for _, online, _ in split for r in online]
+    every_missing = [os.path.abspath(p) for _, _, missing in split for p in missing]
     _check_output_location(
-        args.db or default_db_path(), online + [os.path.abspath(p) for p in missing],
-        "the index", allow_same_drive=args.allow_same_drive,
-        offline={os.path.abspath(p) for p in missing},
+        args.db or default_db_path(), every_online + every_missing,
+        "the index", allow_same_drive=args.allow_same_drive, offline=set(every_missing),
     )  # fmt: skip
     try:
         with Index(args.db) as idx:
-            try:
-                offline = {_offline_root(idx, p) for p in missing}
-            except ValueError as e:
-                print(f"dpf: {e}", file=sys.stderr)
-                return 1
-            roots = drop_nested([*online, *offline])
-            offline &= set(roots)
-            if args.pool and not _check_one_pool(pools, roots, args):
-                return 1
+            targets: list[_Target] = []
+            for pool, online, missing in split:
+                try:
+                    offline = {_offline_root(idx, p) for p in missing}
+                except ValueError as e:
+                    print(f"dpf: {e}", file=sys.stderr)
+                    return 1
+                roots = drop_nested([*online, *offline])
+                if pool is not None and not _check_one_pool(pools, roots, args):
+                    return 1
+                targets.append(_Target(pool, roots, offline & set(roots)))
             if args.command == "scan":
-                _scan(idx, roots, args)
+                _scan(idx, drop_nested(r for t in targets for r in t.roots), args)
                 return 0
-            return _find(idx, roots, offline, args)
+            return _find(idx, targets, pools, args)
     except KeyboardInterrupt:
         _end_progress(False)
         print("dpf: interrupted", file=sys.stderr)

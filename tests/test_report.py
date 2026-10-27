@@ -1,10 +1,12 @@
 import csv
+import dataclasses
 import json
 import os
 import tempfile
 import unittest
 from datetime import datetime
 
+from dpf.coverage import NOT_BACKED_UP, NOT_IN_OTHER, ONLY_IN_BACKUP, check_coverage
 from dpf.grouping import group_duplicates
 from dpf.index import Index
 from dpf.models import DuplicateGroup, FileRecord
@@ -14,8 +16,12 @@ from dpf.report import (
     human_bytes,
     parse_bytes,
     root_lines,
+    format_coverage,
     write_csv,
     write_json,
+    write_missing_csv,
+    write_pool_csv,
+    write_pools_json,
 )
 
 from tests.test_grouping import by_name, imgs, rec
@@ -355,6 +361,145 @@ class FileOutputTest(unittest.TestCase):
     def test_csv_empty(self):
         path = os.path.join(self.tmp.name, "e.csv")
         self.assertEqual(write_csv([], path), 0)
+
+
+def build_coverage(direction=NOT_BACKED_UP, pool="A", other="B"):
+    """Pool A (/a) against pool B (/b): a whole missing tree, a partial folder, an empty file."""
+    a = [rec("/a/Trip/day1", f"IMG_{n}.JPG", 1_000_000) for n in range(1, 4)]
+    a += [rec("/a/Trip/day2", f"IMG_{n}.JPG", 2_000_000) for n in range(1, 3)]
+    a += [rec("/a/DCIM", f"DSC{n:05d}.ARW", 100) for n in range(1, 11)]
+    a += [rec("/a/DCIM", "empty.jpg", 0)]
+    b = [rec("/b/x", f"DSC{n:05d}.ARW", 100) for n in (1, 2, 6)]
+    b.append(rec("/b/x", "DSC00010.ARW", 108))  # same name, other size
+    idx = Index(":memory:")
+    idx.replace_root("/a", a)
+    idx.replace_root("/b", b)
+    try:
+        return check_coverage(idx, ["/a"], ["/b"], pool=pool, other=other, direction=direction)
+    finally:
+        idx.close()
+
+
+class CoverageReportTest(unittest.TestCase):
+    def setUp(self):
+        self.cov = build_coverage()
+
+    def test_text(self):
+        text = format_coverage(self.cov)
+        lines = text.splitlines()
+        self.assertEqual(lines[:2], ["Not backed up — no copy anywhere in pool B", "=" * 42])
+        self.assertIn("Compared:       pool B is the backup of pool A; similar name+size", text)
+        self.assertIn(
+            "Matched by similar name, size and date, not by contents; a renamed-and-re-saved "
+            "copy counts as missing.",
+            text,
+        )
+        self.assertIn(
+            "Not backed up:  12 files, 7.0 MB, in 3 folders (+ 1 empty file not compared)\n"
+            "                80% of the 15 files compared in pool A\n"
+            "                1 of them has a file with a similar name in pool B",
+            text,
+        )
+        self.assertIn(
+            "[1]    7.0 MB  /a/Trip   (whole tree missing from B: 2 folders, 5 files, 7.0 MB)",
+            text,
+        )
+        self.assertIn(
+            "[2]     700 B  /a/DCIM   (7 of 10 files missing from B; 1 with a similar name there)\n"
+            "       DSC00003.ARW … DSC00005.ARW  3 files\n"
+            "       DSC00007.ARW … DSC00010.ARW  4 files\n",
+            text,
+        )
+        top = format_coverage(self.cov, top=1, max_runs=1)
+        self.assertIn("… 1 more folder (7 files, 700 B) not shown (coverage top 1)", top)
+        self.assertNotIn("DSC00003", top)
+
+    def test_other_directions(self):
+        back = build_coverage(ONLY_IN_BACKUP, "B", "A")
+        text = format_coverage(back)
+        self.assertTrue(text.startswith("Only in the backup — no copy anywhere in pool A\n"))
+        self.assertIn("Compared:       pool B is the backup of pool A;", text)
+        self.assertIn("Only in backup: 12 files", text)
+        paths = format_coverage(build_coverage(NOT_IN_OTHER, None, "B"))
+        self.assertTrue(paths.startswith("Not in pool B — no copy anywhere in pool B\n"))
+        self.assertIn("Compared:       these folders compared with pool B;", paths)
+        self.assertIn("Not in B:       12 files", paths)
+
+    def test_floored_percent_and_never_scanned(self):
+        cov = dataclasses.replace(self.cov, files=1_201, never_scanned=["/m/Storage 9B"])
+        cov.missing = cov.missing[:1]
+        text = format_coverage(cov)
+        self.assertIn("<1% of the 1,201 files compared", text)
+        self.assertIn("1 drive of pool B never scanned", text)
+        self.assertIn("\n                  /m/Storage 9B\n", text)
+        full = dataclasses.replace(self.cov, files=13)
+        full.missing = full.missing + [rec("/a/x", "y.jpg")]
+        self.assertIn("100% of the 13 files", format_coverage(full))
+        nearly = dataclasses.replace(self.cov, files=1_300)
+        nearly.missing = [rec("/a/x", f"{n}.jpg") for n in range(1_299)]
+        self.assertIn("99% of the 1,300 files", format_coverage(nearly))
+
+    def test_nothing_missing(self):
+        cov = dataclasses.replace(self.cov, missing=[], folders=[], similar=set())
+        self.assertIn("Every compared file has a copy in pool B.", format_coverage(cov))
+
+    def test_json_and_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.json")
+            result, _ = build()
+            write_json(result, SUMMARY, path, coverage=[self.cov])
+            with open(path) as fh:
+                data = json.load(fh)
+            cov = data["coverage"]["A not in B"]
+            self.assertEqual(
+                (cov["missing_files"], cov["missing_bytes"], cov["missing_folders"],
+                 cov["empty_files"], cov["files_compared"], cov["similar_name_files"]),
+                (12, 7_000_700, 3, 1, 15, 1),
+            )  # fmt: skip
+            self.assertEqual(cov["direction"], NOT_BACKED_UP)
+            self.assertEqual(cov["folders"][0]["dir"], "/a/Trip")
+            self.assertTrue(cov["folders"][0]["whole_tree"])
+            write_json(result, SUMMARY, path)
+            with open(path) as fh:
+                self.assertNotIn("coverage", json.load(fh))
+
+            csv_path = os.path.join(tmp, "missing.csv")
+            back = build_coverage(ONLY_IN_BACKUP, "B", "A")
+            self.assertEqual(write_missing_csv([self.cov, back], csv_path), 24)
+            with open(csv_path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(len(rows), 24)
+            self.assertEqual(
+                {k: rows[0][k] for k in ("pool", "missing_from", "path", "size", "kind")},
+                {"pool": "A", "missing_from": "B", "path": "/a/DCIM/DSC00003.ARW",
+                 "size": "100", "kind": "image"},
+            )  # fmt: skip
+            self.assertEqual(datetime.fromisoformat(rows[0]["mtime"]).timestamp(), 1_000_000)
+            similar = [r["path"] for r in rows if r["similar_name_there"] == "yes"]
+            self.assertEqual(similar, ["/a/DCIM/DSC00010.ARW"] * 2)
+            self.assertEqual(rows[-1]["pool"], "B")
+
+    def test_pool_csv_and_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result, groups = build()
+            path = os.path.join(tmp, "files.csv")
+            self.assertEqual(write_pool_csv([("A", groups), ("B", groups[:1])], path),
+                             len(groups) + 1)  # fmt: skip
+            with open(path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            self.assertEqual(list(rows[0])[:2], ["pool", "group_id"])
+            self.assertEqual({r["pool"] for r in rows}, {"A", "B"})
+            self.assertEqual([r["group_id"] for r in rows if r["pool"] == "B"], ["1", "1"])
+            path = os.path.join(tmp, "report.json")
+            write_pools_json(
+                [("A", result, {**SUMMARY, "pool": "A"}), ("B", result, SUMMARY)], [self.cov],
+                {"pools": ["A", "B"]}, path,
+            )  # fmt: skip
+            with open(path) as fh:
+                data = json.load(fh)
+            self.assertEqual(list(data["pools"]), ["A", "B"])
+            self.assertEqual(data["pools"]["A"]["summary"]["pool"], "A")
+            self.assertEqual(list(data["coverage"]), ["A not in B"])
 
 
 if __name__ == "__main__":

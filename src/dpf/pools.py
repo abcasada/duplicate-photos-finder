@@ -3,10 +3,15 @@
 A pool is a list of paths or glob patterns (`*`, `?`, `[..]`, matched per path segment
 as in a shell). Patterns match both the directories mounted now and the roots in the
 index, so a pool also covers drives that are unplugged but were scanned before.
+
+An optional `[backups]` table links pools: `B = "A"` says pool B is the backup of pool A.
+Duplicates are never searched across pools; a link only enables the backup coverage
+check (which files of one pool have no copy anywhere in the other).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
 import glob
 import os
@@ -25,8 +30,15 @@ class PoolError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class Pool:
+    """A named set of drives. `backs_up` is the casefolded name of the pool it backs up."""
+
     name: str
     patterns: tuple[str, ...]
+    backs_up: str | None = None
+
+
+BACKUP = "backup"  # the other pool is a backup of this one
+PRIMARY = "primary"  # this pool is a backup of the other one
 
 
 Pools = Mapping[str, Pool]
@@ -48,6 +60,9 @@ def sample_config() -> str:
         "[pools]\n"
         f'A = ["{media}/Storage 1TB", "{media}/Storage [0-9]A *"]\n'
         f'B = ["{media}/Storage [0-9]B *"]\n'
+        "# Optional: pool B is the backup of pool A (enables the backup coverage check).\n"
+        "[backups]\n"
+        'B = "A"\n'
     )
 
 
@@ -84,7 +99,62 @@ def parse_pools(data: Mapping[str, object], path: str = "pools file") -> dict[st
         if key in pools:
             raise PoolError(f"{path}: pools {pools[key].name} and {name} differ only in case")
         pools[key] = Pool(name, patterns)
+    for key, primary in parse_backups(data, pools, path).items():
+        pools[key] = dataclasses.replace(pools[key], backs_up=primary)
     return pools
+
+
+def parse_backups(
+    data: Mapping[str, object], pools: Pools, path: str = "pools file"
+) -> dict[str, str]:
+    """The optional [backups] table as {backup pool: pool it backs up}, casefolded.
+
+    Both pools must be defined, a pool cannot back up itself, and links cannot form a
+    cycle (B backs up A, A backs up B).
+    """
+    table = data.get("backups")
+    if table is None:
+        return {}
+    if not isinstance(table, dict):
+        raise PoolError(f'{path}: [backups] must be a table of BACKUP = "POOL" entries')
+    links: dict[str, str] = {}
+    for backup, primary in table.items():
+        if not isinstance(primary, str) or not primary:
+            raise PoolError(f'{path}: [backups] {backup} must name one pool, e.g. {backup} = "A"')
+        for name in (backup, primary):
+            if name.casefold() not in pools:
+                defined = ", ".join(p.name for p in pools.values())
+                raise PoolError(
+                    f"{path}: [backups] names unknown pool {name}; defined pools: {defined}"
+                )
+        key = backup.casefold()
+        if key in links:
+            raise PoolError(f"{path}: [backups] lists pool {pools[key].name} twice")
+        if primary.casefold() == key:
+            raise PoolError(f"{path}: [backups] pool {backup} cannot back up itself")
+        links[key] = primary.casefold()
+    for start in links:
+        seen, cur = [start], links[start]
+        while cur in links:
+            if cur in seen:
+                cycle = " → ".join(pools[k].name for k in [*seen[seen.index(cur):], cur])
+                raise PoolError(f"{path}: [backups] links form a cycle: {cycle}")
+            seen.append(cur)
+            cur = links[cur]
+    return links
+
+
+def coverage_partners(pools: Pools, pool: Pool) -> list[tuple[Pool, str]]:
+    """Pools linked to `pool` by [backups], with the other pool's role.
+
+    (P, PRIMARY) when `pool` backs up P; (Q, BACKUP) for every Q that backs up `pool`.
+    """
+    found: list[tuple[Pool, str]] = []
+    if pool.backs_up is not None and pool.backs_up in pools:
+        found.append((pools[pool.backs_up], PRIMARY))
+    key = pool.name.casefold()
+    found += [(p, BACKUP) for p in pools.values() if p.backs_up == key]
+    return found
 
 
 def get_pool(pools: Pools, name: str) -> Pool:

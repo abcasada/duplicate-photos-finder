@@ -1,3 +1,4 @@
+import dataclasses
 import importlib.util
 import os
 import re
@@ -10,10 +11,11 @@ from xml.etree import ElementTree
 from dpf.grouping import A_IN_B, NEAR_IDENTICAL, PARTIAL, FolderPair, GroupingResult, Run
 from dpf.models import DuplicateGroup
 from dpf.report import OFFLINE_NOTE
-from dpf.xlsx_report import SHEETS, write_xlsx
+from dpf.coverage import ONLY_IN_BACKUP
+from dpf.xlsx_report import SHEETS, PoolSheets, sheet_name, write_combined_xlsx, write_xlsx
 
 from tests.test_grouping import rec
-from tests.test_report import SUMMARY, build, build_trees
+from tests.test_report import SUMMARY, build, build_coverage, build_trees
 
 HAVE_XLSXWRITER = importlib.util.find_spec("xlsxwriter") is not None
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -236,6 +238,102 @@ class XlsxReportTest(unittest.TestCase):
         wb = self.write(GroupingResult([], [], 0, 0, 0))
         self.assertEqual(wb.names, list(SHEETS))
         self.assertEqual({k[1:] for k in wb.cells("Folder pairs")}, {"1"})
+
+
+class SheetNameTest(unittest.TestCase):
+    def test_valid_and_unique(self):
+        used = {"summary"}
+        self.assertEqual(sheet_name("A Trees", used), "A Trees")
+        self.assertEqual(sheet_name("a trees", used), "a trees (2)")
+        self.assertEqual(
+            sheet_name("Pool [x]: a/b?*\\'q' Files", used), "Pool _x__ a_b____q_ Files"
+        )
+        long = sheet_name("Photographs archive Folder pairs", used)
+        self.assertEqual((long, len(long)), ("Photographs archive Folder pair", 31))
+        again = sheet_name("Photographs archive Folder pairs", used)
+        self.assertEqual((again, len(again)), ("Photographs archive Folder (2)", 30))
+        self.assertEqual(sheet_name("Summary", used), "Summary (2)")
+
+
+@unittest.skipUnless(HAVE_XLSXWRITER, "XlsxWriter is not installed")
+class CoverageXlsxTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "report.xlsx")
+
+    def open(self):
+        wb = Workbook(self.path)
+        self.addCleanup(wb.close)
+        return wb
+
+    def test_single_pool_with_coverage(self):
+        result, groups = build()
+        cov = build_coverage()
+        summary = {**SUMMARY, "pool": "A", "missing_csv_path": "/tmp/missing.csv"}
+        write_xlsx(result, groups, summary, self.path, [cov])
+        wb = self.open()
+        self.assertEqual(wb.names, [*SHEETS, "A not in B"])
+        cells = wb.cells("A not in B")
+        self.assertEqual(
+            [cells[f"{c}1"] for c in "ABCDEFGHIJKL"],
+            ["#", "Missing size", "Folder", "Whole tree", "Folders", "Missing files",
+             "Total files", "Missing %", "Similar name there", "Other files not compared",
+             "Runs", "First missing run"],
+        )  # fmt: skip
+        self.assertEqual(
+            [cells[f"{c}2"] for c in "BCDEFGH"], [7_000_000, "/a/Trip", "yes", 2, 5, 5, 1.0]
+        )
+        self.assertEqual([cells[f"{c}3"] for c in "CEFGHIK"], ["/a/DCIM", 1, 7, 10, 0.7, 1, 2])
+        self.assertEqual(cells["L3"], "DSC00003.ARW … DSC00005.ARW  3 files  (+1 more runs)")
+        self.assertNotIn("D3", cells)
+        self.assertIn("file:///a/Trip", wb.links("A not in B"))
+        summary_cells = wb.cells("Summary")
+        values = list(summary_cells.values())
+        self.assertIn("Backup coverage", values)
+        self.assertIn(f"{cov.title}: pool B is the backup of pool A.", values)
+        self.assertIn("Missing files CSV", values)
+        self.assertIn("/tmp/missing.csv", values)
+        row = next(k[1:] for k, v in summary_cells.items() if (k[0], v) == ("A", "A not in B"))
+        self.assertEqual(
+            [summary_cells[f"{c}{row}"] for c in "BCDEFGH"], [12, 7_000_700, 0.8, 3, 15, 1, 1]
+        )
+
+    def test_tiny_share_is_not_zero(self):
+        cov = build_coverage()
+        cov.folders[1] = dataclasses.replace(cov.folders[1], missing=1, total=1_000)
+        write_xlsx(GroupingResult([], [], 0, 0, 0), [], SUMMARY, self.path, [cov])
+        self.assertEqual(self.open().cells("A not in B")["H3"], 0.001)  # shown as "<1%"
+
+    def test_combined_workbook(self):
+        result_a, groups_a = build()
+        result_b = build_trees()
+        a_cov, b_cov = build_coverage(), build_coverage(ONLY_IN_BACKUP, "B", "A")
+        pools = [
+            PoolSheets("A", result_a, groups_a, {**SUMMARY, "pool": "A"}),
+            PoolSheets("B", result_b, [], {**SUMMARY, "pool": "B", "roots": ["/d1", "/d2"]}),
+        ]
+        summary = {"mode": "1", "basis": "x", "pools": ["A", "B"], "elapsed": 1.0}
+        write_combined_xlsx(pools, [a_cov, b_cov], summary, self.path)
+        wb = self.open()
+        self.assertEqual(wb.names, [
+            "Summary",
+            "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
+            "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
+            "A not in B", "B not in A",
+        ])  # fmt: skip
+        self.assertEqual(wb.cells("A Folder pairs")["F2"], "/drives/one/DCIM/100CANON")
+        self.assertEqual(wb.cells("B Trees")["D2"], "/d1/Photos")
+        self.assertEqual(wb.cells("B not in A")["C2"], "/a/Trip")
+        values = list(wb.cells("Summary").values())
+        for text in ("Pool A", "Pool B", "Pool A sheets", "Coverage sheets", "B Files",
+                     "B not in A", f"{a_cov.title}: pool B is the backup of pool A."):  # fmt: skip
+            self.assertIn(text, values)
+        self.assertEqual(values.count("Roots"), 2)
+        n = wb.names.index("Summary") + 1
+        xml = wb.zip.read(f"xl/worksheets/sheet{n}.xml").decode()
+        for name in wb.names[1:]:
+            self.assertIn(f"location=\"'{name}'!A1\"", xml)
 
 
 if __name__ == "__main__":

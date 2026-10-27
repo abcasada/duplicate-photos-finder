@@ -1,8 +1,9 @@
 # dpf drive pools. Copy to ~/.config/dpf/pools.toml (or $XDG_CONFIG_HOME/dpf/pools.toml),
 # or point dpf at another file with `dpf --pools-file PATH ...`.
 #
-# A pool is a set of drives that are compared with each other and never with another
-# pool: `dpf find --pool A`, `dpf scan --pool B`, `dpf pools`.
+# A pool is a set of drives searched for duplicates among themselves, never with another
+# pool: `dpf find --pool A`, `dpf scan --pool B`, `dpf pools`. The [backups] table below
+# adds the one cross-pool check: files with no copy in the backup pool.
 #
 # Each pool is a list of paths or glob patterns (* ? [..]), matched one path segment at
 # a time, so * never spans a '/'. A pattern matches the drives mounted now and the drives
@@ -14,3 +15,13 @@ A = ["/run/media/adam/Storage 1TB", "/run/media/adam/Storage [0-9]A *"]
 # Backups: every "Storage <N>B ..." drive, each a backup of the matching A drive
 # (this also matches "Storage 1B 4TB (2)").
 B = ["/run/media/adam/Storage [0-9]B *"]
+
+# Optional: which pool backs up which. `B = "A"` says pool B is the backup of pool A.
+# `dpf find --pool A` then also lists the media files of A with no copy anywhere in B
+# ("Not backed up"), and `--pool B` the files only in B ("Only in the backup"); the other
+# pool is read from the index, never scanned. `--no-coverage` skips the check. This is the
+# only comparison between pools: duplicates are still searched within one pool only.
+# `dpf find --pool A --pool B` writes both pools' reports and both directions into one
+# report folder (one report.xlsx with a sheet set per pool).
+[backups]
+B = "A"

@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
 
+from dpf.coverage import Coverage, caveat
 from dpf.grouping import (
     A_IN_B,
+    DEFAULT_NEAR,
     B_IN_A,
     IDENTICAL,
     IDENTICAL_TREE,
@@ -32,6 +36,7 @@ from dpf.report import (
     OFFLINE_NOTE,
     PAIR_LABELS,
     any_offline,
+    coverage_relation,
     duration,
     floor_percent,
     human_bytes,
@@ -69,32 +74,118 @@ _WORKBOOK_OPTIONS = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class PoolSheets:
+    """One pool's duplicate report for a combined workbook."""
+
+    name: str
+    result: GroupingResult
+    groups: Sequence[DuplicateGroup]
+    summary: dict
+
+
 def write_xlsx(
     result: GroupingResult,
     groups: Sequence[DuplicateGroup],
     summary: dict,
     path: str,
+    coverage: Sequence[Coverage] = (),
 ) -> None:
     """Write report.xlsx. Raises ModuleNotFoundError if XlsxWriter is not installed.
 
     Unlike the text report, every tree and folder pair is listed (the sheets filter).
+    Each coverage section gets a sheet named after it (e.g. "A not in B").
     """
     import xlsxwriter
 
     with xlsxwriter.Workbook(path, _WORKBOOK_OPTIONS) as wb:
         fmt = _Formats(wb)
         summary_ws = wb.add_worksheet(SHEETS[0])
-        tags = tree_tags(result.trees)
-        tables = [
-            _trees(wb, fmt, result.trees),
-            _pairs(wb, fmt, result.pairs, tags, result.near),
-            _sequences(wb, fmt, result.pairs),
-            _same_folder(wb, fmt, result.same_folder),
-            _files(wb, fmt, groups),
-        ]
+        used = {SHEETS[0].casefold()}
+        tables = _pool_tables(wb, fmt, result, groups, "", used)
+        tables += _coverage_tables(wb, fmt, coverage, used)
         for t in tables:
             t.finish()
-        _summary(summary_ws, fmt, result, summary, tables)
+        w = _SummaryWriter(summary_ws, fmt)
+        w.title("dpf duplicate report")
+        _pool_block(w, result, summary, elapsed=True)
+        _coverage_block(w, coverage, tables)
+        _sheet_list(w, tables)
+        _how_to_read(w, result.near, bool(coverage))
+        _other_reports(w, summary)
+
+
+def write_combined_xlsx(
+    pools: Sequence[PoolSheets], coverage: Sequence[Coverage], summary: dict, path: str
+) -> None:
+    """One workbook for several pools: each pool's sheets prefixed with its name.
+
+    Sheet order: Summary, then Trees … Files of each pool in turn ("A Trees", …,
+    "B Files"), then one sheet per coverage section ("A not in B", "B not in A"). Each
+    pool's duplicates come from its own search; pools are never compared for duplicates.
+    """
+    import xlsxwriter
+
+    with xlsxwriter.Workbook(path, _WORKBOOK_OPTIONS) as wb:
+        fmt = _Formats(wb)
+        summary_ws = wb.add_worksheet(SHEETS[0])
+        used = {SHEETS[0].casefold()}
+        per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
+        cov_tables = _coverage_tables(wb, fmt, coverage, used)
+        tables = [t for ts in per_pool for t in ts] + cov_tables
+        for t in tables:
+            t.finish()
+        w = _SummaryWriter(summary_ws, fmt)
+        w.title("dpf duplicate report: " + ", ".join(f"pool {p.name}" for p in pools))
+        w.line("Mode", str(summary.get("mode", "?")))
+        w.line("Matched on", str(summary.get("basis", "?")))
+        w.line("Elapsed", duration(summary.get("elapsed", 0.0)))
+        w.line("", "Duplicates are searched within each pool, never between pools.")
+        w.skip()
+        for p, ts in zip(pools, per_pool):
+            w.heading(f"Pool {p.name}")
+            _pool_block(w, p.result, p.summary, elapsed=False, basis=False)
+            _sheet_list(w, ts, title=f"Pool {p.name} sheets")
+        _coverage_block(w, coverage, cov_tables)
+        if cov_tables:
+            _sheet_list(w, cov_tables, title="Coverage sheets")
+        near = pools[0].result.near if pools else DEFAULT_NEAR
+        _how_to_read(w, near, bool(coverage))
+        _other_reports(w, summary)
+
+
+_FORBIDDEN_SHEET_CHARS = re.compile(r"[\[\]:*?/\\']")
+
+
+def sheet_name(text: str, used: set[str]) -> str:
+    """`text` as a valid, unique worksheet name (max 31 chars, no []:*?/\\ or ')."""
+    base = _FORBIDDEN_SHEET_CHARS.sub("_", text).strip() or "Sheet"
+    name, n = base[:31].rstrip(), 1
+    while name.casefold() in used:
+        n += 1
+        suffix = f" ({n})"
+        name = base[: 31 - len(suffix)].rstrip() + suffix
+    used.add(name.casefold())
+    return name
+
+
+def _pool_tables(
+    wb, fmt: _Formats, result: GroupingResult, groups: Sequence[DuplicateGroup],
+    prefix: str, used: set[str],
+) -> list[_Table]:  # fmt: skip
+    """The Trees … Files sheets of one pool, their names prefixed with `prefix`."""
+
+    def name(kind: str) -> str:
+        return sheet_name(f"{prefix} {kind}" if prefix else kind, used)
+
+    tags = tree_tags(result.trees)
+    return [
+        _trees(wb, fmt, result.trees, name("Trees")),
+        _pairs(wb, fmt, result.pairs, tags, result.near, name("Folder pairs")),
+        _sequences(wb, fmt, result.pairs, name("Sequences")),
+        _same_folder(wb, fmt, result.same_folder, name("Same folder")),
+        _files(wb, fmt, groups, name("Files")),
+    ]
 
 
 class _Formats:
@@ -109,6 +200,8 @@ class _Formats:
         self.size = add(num_format=SIZE_FORMAT)
         self.file_size = add(num_format=FILE_SIZE_FORMAT)
         self.pct = add(num_format="0%")
+        self.share = add(num_format='[<0.01]"<1%";0%')
+        self.heading = add(bold=True, font_size=12, bottom=1)
         self.tree = add(num_format='"T"0')
         self.date = add(num_format="yyyy-mm-dd hh:mm:ss")
         self.amber = add(num_format="#,##0", bg_color=AMBER, font_color="#9C5700")
@@ -127,16 +220,21 @@ class _Table:
     `columns` are (header, width); a width of None fits the content, up to PATH_WIDTH.
     """
 
-    def __init__(self, wb, fmt: _Formats, name: str, columns, freeze_cols: int = 0) -> None:
+    def __init__(
+        self, wb, fmt: _Formats, name: str, columns, freeze_cols: int = 0, *,
+        kind: str | None = None, note: str | None = None,
+    ) -> None:  # fmt: skip
         self.ws = wb.add_worksheet(name)
         self.fmt = fmt
         self.name = name
+        self.note = note or _SHEET_NOTES[kind or name]
         self.columns = columns
         self.freeze_cols = freeze_cols
         self.widths = [len(h) for h, _ in columns]
         self.row = 0
         self.links = 0
         self.dropped = 0
+        self.coverage: int | None = None  # id() of the Coverage a coverage sheet shows
         for c, (header, _) in enumerate(columns):
             self.ws.write_string(0, c, header, fmt.header)
 
@@ -161,6 +259,14 @@ class _Table:
         """Rounded down, so 100% always means every file."""
         if whole > 0:
             self.ws.write_number(self.row, col, floor_percent(part, whole) / 100, self.fmt.pct)
+
+    def share(self, col: int, part: int, whole: int) -> None:
+        """Like pct, but a share between 0 and 1% shows "<1%" rather than 0%."""
+        if whole > 0:
+            value = floor_percent(part, whole) / 100
+            if part > 0 and value == 0:
+                value = 0.001
+            self.ws.write_number(self.row, col, value, self.fmt.share)
 
     def folder(self, col: int, path: str) -> None:
         """A file:// link to the folder showing the plain path; plain text past Excel's limits."""
@@ -229,13 +335,13 @@ _SIDE_COLUMNS = [
 ]  # fmt: skip
 
 
-def _trees(wb, fmt: _Formats, trees: list[TreePair]) -> _Table:
+def _trees(wb, fmt: _Formats, trees: list[TreePair], name: str = "Trees") -> _Table:
     columns = [
         ("#", 6), ("Shared size", 13), ("Relation", None), ("Folder A", None),
         ("Folder B", None), *_SIDE_COLUMNS, ("Folder pairs", 9),
         ("Other files not compared", 12),
     ]  # fmt: skip
-    t = _Table(wb, fmt, "Trees", columns, freeze_cols=1)
+    t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Trees")
     for n, tree in enumerate(trees, 1):
         if not t.next_row():
             continue
@@ -273,15 +379,16 @@ def _names(p: FolderPair) -> str:
 
 
 def _pairs(
-    wb, fmt: _Formats, pairs: list[FolderPair], tags: dict, near: float
-) -> _Table:
+    wb, fmt: _Formats, pairs: list[FolderPair], tags: dict, near: float,
+    name: str = "Folder pairs",
+) -> _Table:  # fmt: skip
     columns = [
         ("#", 7), ("Tree", 6), ("Shared size", 13), ("Relation", None), ("Names", 9),
         ("Folder A", None), ("Folder B", None), *_SIDE_COLUMNS, ("Only in A", 9),
         ("Only in B", 9), ("Other files not compared", 12), ("Runs", 7),
         ("First sequence", 60),
     ]  # fmt: skip
-    t = _Table(wb, fmt, "Folder pairs", columns, freeze_cols=2)
+    t = _Table(wb, fmt, name, columns, freeze_cols=2, kind="Folder pairs")
     for n, p in enumerate(pairs, 1):
         if not t.next_row():
             continue
@@ -309,13 +416,15 @@ def _pairs(
     return t
 
 
-def _sequences(wb, fmt: _Formats, pairs: list[FolderPair]) -> _Table:
+def _sequences(
+    wb, fmt: _Formats, pairs: list[FolderPair], name: str = "Sequences"
+) -> _Table:
     columns = [
         ("Pair #", 7), ("Folder A", None), ("Folder B", None), ("First (A)", None),
         ("Last (A)", None), ("First (B)", None), ("Last (B)", None), ("Files", 8),
         ("Size", 12), ("Not matched inside", 12), ("Not matched names", None),
     ]  # fmt: skip
-    t = _Table(wb, fmt, "Sequences", columns, freeze_cols=1)
+    t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Sequences")
     for n, p in enumerate(pairs, 1):
         for r in p.runs:
             if not t.next_row():
@@ -336,9 +445,11 @@ def _sequences(wb, fmt: _Formats, pairs: list[FolderPair]) -> _Table:
     return t
 
 
-def _same_folder(wb, fmt: _Formats, groups: list[DuplicateGroup]) -> _Table:
+def _same_folder(
+    wb, fmt: _Formats, groups: list[DuplicateGroup], name: str = "Same folder"
+) -> _Table:
     columns = [("Folder", None), ("Groups", 9), ("Extra copies", 9), ("Redundant size", 12)]
-    t = _Table(wb, fmt, "Same folder", columns)
+    t = _Table(wb, fmt, name, columns, kind="Same folder")
     _, ranked = same_folder_stats(groups)
     ranked.sort(key=lambda r: (-r[3], -r[1], r[0]))
     for d, n_groups, extra, nbytes in ranked:
@@ -352,12 +463,14 @@ def _same_folder(wb, fmt: _Formats, groups: list[DuplicateGroup]) -> _Table:
     return t
 
 
-def _files(wb, fmt: _Formats, groups: Sequence[DuplicateGroup]) -> _Table:
+def _files(
+    wb, fmt: _Formats, groups: Sequence[DuplicateGroup], name: str = "Files"
+) -> _Table:
     columns = [
         ("Group", 8), ("Basis", None), ("Folder", None), ("Name", None), ("Size", 11),
         ("Modified", 19), ("Kind", 7), ("Names", 9),
     ]  # fmt: skip
-    t = _Table(wb, fmt, "Files", columns, freeze_cols=1)
+    t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Files")
     for n, g in enumerate(groups, 1):
         names = "exact" if g.same_names else "similar"
         for f in g.files:
@@ -375,6 +488,49 @@ def _files(wb, fmt: _Formats, groups: Sequence[DuplicateGroup]) -> _Table:
                 t.ws.write_datetime(t.row, 5, modified, fmt.date)
             t.text(6, f.kind)
             t.text(7, names)
+    return t
+
+
+def _coverage_tables(
+    wb, fmt: _Formats, coverage: Sequence[Coverage], used: set[str]
+) -> list[_Table]:
+    return [_coverage_sheet(wb, fmt, cov, sheet_name(cov.label, used)) for cov in coverage]
+
+
+def _coverage_sheet(wb, fmt: _Formats, cov: Coverage, name: str) -> _Table:
+    """One row per folder (or whole missing tree) with files that have no copy."""
+    columns = [
+        ("#", 6), ("Missing size", 13), ("Folder", None), ("Whole tree", 8), ("Folders", 9),
+        ("Missing files", 10), ("Total files", 9), ("Missing %", 9),
+        ("Similar name there", 10), ("Other files not compared", 12), ("Runs", 7),
+        ("First missing run", 60),
+    ]  # fmt: skip
+    mine = f"pool {cov.pool}" if cov.pool else "these folders"
+    note = f"files of {mine} with no copy anywhere in pool {cov.other}, one row per folder"
+    t = _Table(wb, fmt, name, columns, freeze_cols=1, note=note)
+    t.coverage = id(cov)
+    for n, m in enumerate(cov.folders, 1):
+        if not t.next_row():
+            continue
+        t.num(0, n)
+        t.num(1, m.bytes, fmt.size)
+        t.folder(2, m.dir)
+        if m.whole_tree:
+            t.text(3, "yes", fmt.fills[LIGHT_BLUE])
+        t.num(4, m.folders)
+        t.num(5, m.missing)
+        t.num(6, m.total)
+        t.share(7, m.missing, m.total)
+        t.num(8, m.similar, fmt.amber if m.similar else None)
+        _not_compared(t, 9, m.unindexed)
+        if not m.whole_tree:
+            t.num(10, len(m.runs))
+            if m.runs:
+                label = f"with a copy in {cov.other}"
+                first = run_lines(m.runs[:1], 1, indent="", align=False, skipped_label=label)[0]
+                more = len(m.runs) - 1
+                t.text(11, f"{first}  (+{more:,} more runs)" if more else first)
+    t.data_bar(1)
     return t
 
 
@@ -396,52 +552,74 @@ _SHEET_NOTES = {
 }
 
 
-def _summary(ws, fmt: _Formats, result: GroupingResult, summary: dict, tables) -> None:
-    ws.set_column(0, 0, 30)
-    ws.set_column(1, 1, 24)
-    ws.set_column(2, 2, 14)
-    row = 0
+class _SummaryWriter:
+    """Writes the Summary sheet top to bottom: label in column A, value in column B."""
 
-    def line(label: str = "", value=None, value_format=None, label_format=None) -> None:
-        nonlocal row
+    def __init__(self, ws, fmt: _Formats) -> None:
+        self.ws = ws
+        self.fmt = fmt
+        self.row = 0
+        ws.set_column(0, 0, 30)
+        ws.set_column(1, 1, 24)
+        ws.set_column(2, 7, 14)
+
+    def title(self, text: str) -> None:
+        self.ws.write_string(self.row, 0, text, self.fmt.title)
+        self.row += 2
+
+    def heading(self, text: str) -> None:
+        self.ws.write_string(self.row, 0, text, self.fmt.heading)
+        self.row += 1
+
+    def skip(self, n: int = 1) -> None:
+        self.row += n
+
+    def line(self, label: str = "", value=None, value_format=None, label_format=None) -> None:
         if label:
-            ws.write_string(row, 0, label, label_format or fmt.bold)
+            self.ws.write_string(self.row, 0, label, label_format or self.fmt.bold)
         if isinstance(value, str):
-            ws.write_string(row, 1, value, value_format or fmt.text)
+            self.ws.write_string(self.row, 1, value, value_format or self.fmt.text)
         elif value is not None:
-            ws.write_number(row, 1, value, value_format or fmt.left_int)
-        row += 1
+            self.ws.write_number(self.row, 1, value, value_format or self.fmt.left_int)
+        self.row += 1
 
-    ws.write_string(row, 0, "dpf duplicate report", fmt.title)
-    row += 2
-    line("Mode", str(summary.get("mode", "?")))
-    line("Matched on", str(summary.get("basis", "?")))
+
+def _pool_block(
+    w: _SummaryWriter, result: GroupingResult, summary: dict, *, elapsed: bool,
+    basis: bool = True,
+) -> None:  # fmt: skip
+    """Header lines, totals and relation counts of one duplicate report."""
+    fmt = w.fmt
+    if basis:
+        w.line("Mode", str(summary.get("mode", "?")))
+        w.line("Matched on", str(summary.get("basis", "?")))
     if summary.get("pool"):
-        line("Pool", str(summary["pool"]))
+        w.line("Pool", str(summary["pool"]))
     for i, root in enumerate(root_lines(summary, align=False)):
-        line("Roots" if i == 0 else "", root)
+        w.line("Roots" if i == 0 else "", root)
     if any_offline(summary):
-        line("", OFFLINE_NOTE, fmt.warning)
-    line("Files scanned", summary.get("files", 0))
-    line("Total size", summary.get("bytes", 0), fmt.left_size)
-    line("Duplicate groups", result.groups)
-    line("Could free (keeping one copy)", result.redundant_bytes, fmt.left_size)
+        w.line("", OFFLINE_NOTE, fmt.warning)
+    w.line("Files scanned", summary.get("files", 0))
+    w.line("Total size", summary.get("bytes", 0), fmt.left_size)
+    w.line("Duplicate groups", result.groups)
+    w.line("Could free (keeping one copy)", result.redundant_bytes, fmt.left_size)
     if result.capped_groups:
-        line(
+        w.line(
             "",
             f"{plural(result.capped_groups, 'group')} spread over very many folders "
             "were paired only with their first folder",
         )
-    line("Elapsed", duration(summary.get("elapsed", 0.0)))
-    line("Near-identical threshold", f"{result.near * 100:g}% of each side")
-    row += 1
+    if elapsed:
+        w.line("Elapsed", duration(summary.get("elapsed", 0.0)))
+    w.line("Near-identical threshold", f"{result.near * 100:g}% of each side")
+    w.skip()
 
     by_tree = Counter(tree_label(t) for t in result.trees)
     tree_bytes = Counter()
     for t in result.trees:
         tree_bytes[tree_label(t)] += t.bytes
-    _counts(ws, fmt, row, "Tree pairs", by_tree, tree_bytes)
-    row += len(by_tree) + 3
+    _counts(w.ws, fmt, w.row, "Tree pairs", by_tree, tree_bytes)
+    w.skip(len(by_tree) + 3)
 
     by_pair = Counter(PAIR_LABELS.get(p.relation, p.relation) for p in result.pairs)
     pair_bytes = Counter()
@@ -451,38 +629,110 @@ def _summary(ws, fmt: _Formats, result: GroupingResult, summary: dict, tables) -
                                       PARTIAL)]  # fmt: skip
     ranked = {k: by_pair[k] for k in order if k in by_pair}
     ranked.update({k: v for k, v in by_pair.items() if k not in ranked})
-    _counts(ws, fmt, row, "Folder pairs", ranked, pair_bytes)
-    row += len(ranked) + 3
+    _counts(w.ws, fmt, w.row, "Folder pairs", ranked, pair_bytes)
+    w.skip(len(ranked) + 3)
 
-    ws.write_string(row, 0, "Sheets", fmt.bold)
-    row += 1
+
+_COVERAGE_SUMMARY = (
+    "Missing files", "Missing size", "Missing %", "Folders", "Files compared",
+    "Empty files not compared", "Similar name there",
+)  # fmt: skip
+
+
+def _coverage_block(w: _SummaryWriter, coverage: Sequence[Coverage], tables) -> None:
+    """Totals of each coverage section, linked to its sheet."""
+    if not coverage:
+        return
+    fmt, ws = w.fmt, w.ws
+    w.heading("Backup coverage")
+    ws.write_string(w.row, 0, "Files with no copy in the other pool", fmt.bold)
+    for c, header in enumerate(_COVERAGE_SUMMARY, 1):
+        ws.write_string(w.row, c, header, fmt.bold)
+    w.skip()
+    sheets = {t.coverage: t.name for t in tables if t.coverage is not None}
+    for cov in coverage:
+        name = sheets.get(id(cov))
+        if name:
+            ws.write_url(w.row, 0, f"internal:'{name}'!A1", fmt.link, string=cov.label)
+        else:
+            ws.write_string(w.row, 0, cov.label, fmt.text)
+        ws.write_number(w.row, 1, len(cov.missing), fmt.int)
+        ws.write_number(w.row, 2, cov.missing_bytes, fmt.size)
+        if cov.files:
+            value = floor_percent(len(cov.missing), cov.files) / 100
+            ws.write_number(w.row, 3, 0.001 if cov.missing and not value else value, fmt.share)
+        ws.write_number(w.row, 4, cov.missing_dirs, fmt.int)
+        ws.write_number(w.row, 5, cov.files, fmt.int)
+        ws.write_number(w.row, 6, cov.empty, fmt.amber if cov.empty else fmt.int)
+        ws.write_number(w.row, 7, len(cov.similar), fmt.amber if cov.similar else fmt.int)
+        w.skip()
+    for cov in coverage:
+        w.line("", f"{cov.title}: {coverage_relation(cov)}.")
+        for line in root_lines({"root_status": cov.other_status, "roots": cov.other_roots},
+                               align=False):  # fmt: skip
+            w.line("", f"  pool {cov.other}: {line}")
+        if cov.never_scanned:
+            w.line(
+                "",
+                f"  {plural(len(cov.never_scanned), 'drive')} of pool {cov.other} never "
+                f"scanned (not compared): {', '.join(cov.never_scanned)}",
+                fmt.warning,
+            )  # fmt: skip
+    w.line("", caveat(coverage[0].basis_words), fmt.warning)
+    w.skip()
+
+
+def _sheet_list(w: _SummaryWriter, tables, title: str = "Sheets") -> None:
+    fmt, ws = w.fmt, w.ws
+    ws.write_string(w.row, 0, title, fmt.bold)
+    w.skip()
     for t in tables:
-        ws.write_url(row, 0, f"internal:'{t.name}'!A1", fmt.link, string=t.name)
-        ws.write_string(row, 1, _SHEET_NOTES[t.name], fmt.text)
-        row += 1
+        ws.write_url(w.row, 0, f"internal:'{t.name}'!A1", fmt.link, string=t.name)
+        ws.write_string(w.row, 1, t.note, fmt.text)
+        w.skip()
         if t.dropped:
             ws.write_string(
-                row, 1,
+                w.row, 1,
                 f"{plural(t.dropped, 'row')} left out: Excel's row limit. See the CSV/JSON.",
                 fmt.amber,
             )  # fmt: skip
-            row += 1
-    row += 1
+            w.skip()
+    w.skip()
 
-    ws.write_string(row, 0, "How to read this", fmt.bold)
-    row += 1
-    for note in _notes(result.near):
-        ws.write_string(row, 0, note, fmt.text)
-        row += 1
-    row += 1
 
-    outputs = [(k, summary.get(f"{k.lower()}_path")) for k in ("CSV", "JSON")]
+def _how_to_read(w: _SummaryWriter, near: float, coverage: bool) -> None:
+    w.ws.write_string(w.row, 0, "How to read this", w.fmt.bold)
+    w.skip()
+    for note in _notes(near) + (_COVERAGE_NOTES if coverage else []):
+        w.ws.write_string(w.row, 0, note, w.fmt.text)
+        w.skip()
+    w.skip()
+
+
+def _other_reports(w: _SummaryWriter, summary: dict) -> None:
+    keys = (("CSV", "csv_path"), ("JSON", "json_path"), ("Missing files CSV", "missing_csv_path"))
+    outputs = [(k, summary.get(key)) for k, key in keys]
     outputs = [(k, v) for k, v in outputs if v]
     if outputs:
-        ws.write_string(row, 0, "Other reports", fmt.bold)
-        row += 1
+        w.ws.write_string(w.row, 0, "Other reports", w.fmt.bold)
+        w.skip()
         for k, v in outputs:
-            line(k, v, label_format=fmt.text)
+            w.line(k, v, label_format=w.fmt.text)
+
+
+_COVERAGE_NOTES = [
+    "Coverage sheets (e.g. \"A not in B\"): photos/videos of one pool with no copy anywhere "
+    "in the other pool, one row per folder, largest first.",
+    "  A copy is a file mode 1 would match (similar name, size, date within the tolerance), "
+    "wherever it sits; file contents are not compared.",
+    "  A renamed-and-re-saved copy counts as missing. Whole tree = every compared file under "
+    "the folder is missing; Missing % is rounded down (\"<1%\" when above 0).",
+    "  0-byte files are not compared; other files (non-photo/video) are counted per folder, "
+    "not checked.",
+    "  Similar name there (amber): missing files whose name does occur in the other pool, "
+    "with another size or date: an edited or re-saved version, or another photo with the "
+    "same number. Check them before relying on either copy.",
+]
 
 
 def _counts(ws, fmt: _Formats, row: int, title: str, counts: dict, sizes: Counter) -> None:

@@ -441,6 +441,61 @@ class Index:
         for _, group in itertools.groupby(rows, key=keyfn):
             yield [_record(r) for r in group]
 
+    def coverage_buckets(
+        self,
+        roots: Sequence[str],
+        other_roots: Sequence[str],
+        *,
+        by_size: bool = True,
+        exact_names: bool = False,
+    ) -> Iterator[tuple[str, list[tuple[FileRecord, bool]]]]:
+        """Yield (key, bucket) for the name buckets (as name_buckets) of files under `roots`.
+
+        Only non-empty files are included. Each bucket entry is (file, True if it lies
+        under `other_roots`). Every non-empty file
+        under `roots` is in exactly one bucket, with every file under `other_roots`
+        sharing its key; buckets without a file under `roots` are skipped. The two sets
+        of roots must not overlap. Streams from SQLite in key order.
+        """
+        where, params = _prefix_clause(roots)
+        other, other_params = _prefix_clause(other_roots)
+        column = "name_key" if exact_names else "match_key"
+        order = "6, 3, 1, 2" if by_size else "6, 1, 2"
+        sql = f"""
+            SELECT dir, name, size, mtime, kind, {column}, 0 FROM files
+            WHERE {where} AND size > 0
+            UNION ALL
+            SELECT dir, name, size, mtime, kind, {column}, 1 FROM files
+            WHERE {other} AND size > 0
+            ORDER BY {order}
+        """
+        rows = self.conn.execute(sql, params + other_params)
+        keyfn = (lambda r: (r[5], r[2])) if by_size else (lambda r: r[5])
+        for _, group in itertools.groupby(rows, key=keyfn):
+            bucket = list(group)
+            if any(not r[6] for r in bucket):
+                yield bucket[0][5], [(_record(r), bool(r[6])) for r in bucket]
+
+    def name_keys(self, roots: Sequence[str], *, exact_names: bool = False) -> set[str]:
+        """The match keys (or with `exact_names` the name keys) of non-empty files under `roots`."""
+        where, params = _prefix_clause(roots)
+        column = "name_key" if exact_names else "match_key"
+        rows = self.conn.execute(f"SELECT {column} FROM files WHERE {where} AND size > 0", params)
+        return {k for (k,) in rows}
+
+    def empty_files(self, roots: Sequence[str]) -> int:
+        """Number of 0-byte files indexed under `roots`."""
+        where, params = _prefix_clause(roots)
+        return self.conn.execute(
+            f"SELECT count(*) FROM files WHERE {where} AND size = 0", params
+        ).fetchone()[0]
+
+    def extras_under(self, roots: Sequence[str]) -> dict[str, int]:
+        """dir -> entries not indexed (other + errors), for every such dir under `roots`."""
+        where, params = _prefix_clause(roots)
+        rows = self.conn.execute(f"SELECT dir, other + errors FROM dirs WHERE {where}", params)
+        return {d: n for d, n in rows if n}
+
     def list_dir(self, dir: str) -> list[FileRecord]:
         """All indexed files directly inside `dir` (not subfolders), sorted by name."""
         rows = self.conn.execute(

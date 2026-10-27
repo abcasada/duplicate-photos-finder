@@ -23,7 +23,7 @@ scan, match, group, report — takes about 30 seconds.
 dpf is **read-only**: it never modifies, moves, or deletes anything, and never writes to
 the drives it scans. Its index and reports live on the local disk under `~/.cache/dpf/`.
 
-## Project status (2026-10-25)
+## Project status (2026-10-27)
 
 | Area | State |
 |---|---|
@@ -33,6 +33,8 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Drives that aren't plugged in (compared from the index) | ✅ Done |
 | Named drive pools (`--pool A`) | ✅ Done |
 | Smarter mode 1 names (copy suffixes, camera numbers in renamed files) | ✅ Done |
+| Backup coverage between pools (`[backups]`; files with no copy in the backup) | ✅ Done |
+| Several pools in one run and one workbook (`--pool A --pool B`) | ✅ Done |
 | Mode 1b: EXIF (camera serial + shutter count) | 📋 Next: researched and benchmarked, not built |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
@@ -65,7 +67,15 @@ cd duplicate-photos-finder
 ## Usage
 
 Only the drives you pass are compared against each other. To keep backup drives out of
-the comparison, define **drive pools** and run one report per pool.
+the comparison, define **drive pools**: each pool is searched for duplicates on its own.
+If one pool is the backup of another, dpf can also list the files that have no copy in
+the backup ([Backup coverage](#backup-coverage)).
+
+The recommended run, with everything in one report folder and one `report.xlsx`:
+
+```sh
+dpf find --mode 1 --pool A --pool B
+```
 
 ### Drive pools
 
@@ -80,6 +90,10 @@ pool names are case-insensitive:
 A = ["/run/media/adam/Storage 1TB", "/run/media/adam/Storage [0-9]A *"]
 # Backups: every "Storage <N>B ..." drive
 B = ["/run/media/adam/Storage [0-9]B *"]
+
+# Optional: pool B is the backup of pool A (see "Backup coverage")
+[backups]
+B = "A"
 ```
 
 A pattern matches both the drives mounted now and the drives in the index, so a pool
@@ -92,7 +106,11 @@ rather than silently left out. See [docs/pools.example.toml](docs/pools.example.
 # Which drives each pool stands for, connected or not, and when each was last scanned
 dpf pools
 
-# Duplicates within the primary drives, then within the backups (never between them)
+# Duplicates within the primary drives and within the backups (never between them),
+# plus backup coverage both ways, all in one report folder and one workbook
+dpf find --mode 1 --pool A --pool B
+
+# Or one pool per run (each with its own coverage section)
 dpf find --mode 1 --pool A
 dpf find --mode 1 --pool B
 
@@ -126,6 +144,65 @@ dpf space --pool B             # or: dpf space PATH...; no argument = all connec
 A report run with `--pool` names the pool in its header. `dpf drives` shows each drive's
 pool in a Pool column; a drive matching several pools lists them all, which means the
 patterns overlap and should be fixed: `scan`/`find --pool` refuse to run until it is.
+
+### Backup coverage
+
+Pool B is the backup of pool A, so the useful question across pools is not "which files
+are duplicated" but "which files exist on only one side". Say so in the pools file:
+
+```toml
+[backups]
+B = "A"      # pool B is the backup of pool A
+```
+
+Then `dpf find --pool A` ends with a section **Not backed up — no copy anywhere in pool
+B**, and `dpf find --pool B` with **Only in the backup — no copy anywhere in pool A**.
+`dpf find --pool A --pool B` gives both. This is the only comparison between pools:
+duplicates are still searched within one pool at a time.
+
+- **What counts as a copy:** the mode 1 rule, applied across the two pools. Same similar
+  name (or exact name with `--exact-names`), same size (unless `--ignore-size`), mtime
+  within `--mtime-tolerance` (unless `--ignore-mtime`), and the same copy-number rules
+  (`X (1)` is never a copy of `X (2)`). Where the copy sits in the other pool does not
+  matter. Contents are not compared, so a renamed-and-re-saved copy counts as missing.
+- **The other pool comes from the index**, never scanned by this run, so its drives can
+  stay unplugged. The section lists its drives with their scan dates. A member that was
+  never scanned (a connected drive or a literal path not in the index) is named in the
+  header: files only there are not counted as copies. If the other pool has nothing in
+  the index, the check is skipped with a warning.
+- **Grouped by folder, largest first:** a tree whose compared files are all missing is
+  one line (`whole tree missing from B: 12 folders, 3,400 files, 210.0 GB`), never rolled
+  up past the scanned drives; other folders show `missing/total` and runs of consecutive
+  missing files, like the duplicate report. The backed-up JPG of a missing RAW does not
+  split a run; it is named on the run's line (`+1 inside with a copy in B: …`).
+  `--coverage-top N` (default 50) limits the folders listed in `report.txt`; the workbook
+  lists them all.
+- **"with a similar name there"**: missing files whose name *does* occur in the other
+  pool, but with another size or date. They are usually an edited version (e.g. RAW/DNG
+  files re-saved with metadata, a few kB larger), a copy whose time stamp moved by whole
+  hours (time-zone/DST handling of the copying tool), or simply another photo with the
+  same camera number. Check them before relying on either side.
+- 0-byte files are not compared and are counted separately. Percentages are rounded
+  down.
+
+```
+Not backed up — no copy anywhere in pool B
+==========================================
+Compared:       pool B is the backup of pool A; similar name+size+mtime ±2s
+Pool B:         /run/media/adam/Storage 2B 8TB   (from index, scanned 2026-10-25 15:46, not connected)
+                …
+Not backed up:  292,454 files, 5.0 TB, in 43,497 folders (+ 93 empty files not compared)
+                58% of the 501,521 files compared in pool A
+
+[1]   553.9 GB  /…/Storage 4A 8TB/Plex New/_dl   (whole tree missing from B: 28 folders, 659 files, 553.9 GB)
+[6]   133.8 GB  /…/Storage 1A 4TB/Photography/2021/7-NDII   (3,060 of 3,124 files missing from B; 3,060 with a similar name there)
+       IMGQ0194.DNG … IMGQ0563.DNG  370 files
+```
+
+Options: `--no-coverage` skips the check; `--coverage-against POOL` picks the other pool
+explicitly (also for a run on plain PATHs, e.g. "which files of this card dump are not in
+pool A yet?"). Each coverage run adds `missing.csv`: one row per missing file with its
+pool, the pool it is missing from, path, size, mtime, kind and `similar_name_there`.
 
 ### Drive space
 
@@ -210,11 +287,21 @@ Each `find` writes these files to `~/.cache/dpf/reports/<timestamp>-<mode>/` (or
 - `report.txt` — the grouped report (also printed to the terminal)
 - `report.xlsx` — the same as a workbook for Excel or LibreOffice: summary, tree overview,
   every folder pair, sequences, same-folder duplicates and every duplicate file, on
-  sortable, filterable sheets with colour-coded relations and clickable folder links.
+  sortable, filterable sheets with colour-coded relations and clickable folder links,
+  plus one sheet per coverage direction (`A not in B`, `B not in A`).
   Sizes and percentages are real numbers (percentages rounded down, as in the text).
   Needs XlsxWriter; `--no-xlsx` skips it
 - `report.json` — the same, structured, for scripting
 - `files.csv` — every duplicate file, one row each, for when you need per-file detail
+- `missing.csv` — every file with no copy in the other pool (when coverage ran)
+
+With several pools (`--pool A --pool B`) the folder holds one combined report:
+`report.txt` has a `===== Pool A =====` section per pool, then the coverage sections;
+`report.xlsx` has one Summary (a block per pool, then coverage totals), then each pool's
+sheets prefixed with its name (`A Trees` … `A Files`, `B Trees` … `B Files`), then the
+coverage sheets; `report.json` is `{"summary", "pools": {"A": …, "B": …}, "coverage": …}`;
+`files.csv` and `missing.csv` have a `pool` column. Each pool is still searched on its
+own: no duplicate pair ever spans two pools.
 
 ### Reading the report
 

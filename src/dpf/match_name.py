@@ -88,6 +88,30 @@ def _number_split(cluster: list[FileRecord]) -> list[list[FileRecord]]:
     return list(parts.values())
 
 
+def bucket_groups(
+    bucket: list[FileRecord],
+    *,
+    mtime_tolerance: float = 2.0,
+    ignore_mtime: bool = False,
+    exact_names: bool = False,
+) -> Iterator[list[FileRecord]]:
+    """Split one name bucket (as from Index.name_buckets) into groups of copies.
+
+    Applies the renamed-series fallback, mtime clustering and the copy-number split.
+    Only groups of two or more files are yielded.
+    """
+    # Equal names (up to case) have equal copy numbers: nothing to split.
+    uniform = exact_names or _one_name(bucket)
+    for part in [bucket] if uniform else _series_split(bucket):
+        if len(part) < 2:
+            continue
+        clusters = [part] if ignore_mtime else _mtime_clusters(part, mtime_tolerance)
+        for cluster in clusters:
+            for group in [cluster] if uniform else _number_split(cluster):
+                if len(group) >= 2:
+                    yield group
+
+
 def find_name_duplicates(
     index: Index,
     roots: list[str],
@@ -100,13 +124,8 @@ def find_name_duplicates(
     """Yield groups of indexed files under `roots` that look like copies by metadata."""
     how = basis(exact_names=exact_names, ignore_size=ignore_size, ignore_mtime=ignore_mtime)
     for bucket in index.name_buckets(roots, by_size=not ignore_size, exact_names=exact_names):
-        # Equal names (up to case) have equal copy numbers: nothing to split.
-        uniform = exact_names or _one_name(bucket)
-        for part in [bucket] if uniform else _series_split(bucket):
-            if len(part) < 2:
-                continue
-            clusters = [part] if ignore_mtime else _mtime_clusters(part, mtime_tolerance)
-            for cluster in clusters:
-                for group in [cluster] if uniform else _number_split(cluster):
-                    if len(group) >= 2:
-                        yield DuplicateGroup(tuple(sorted(group, key=lambda f: f.path)), how)
+        for group in bucket_groups(
+            bucket, mtime_tolerance=mtime_tolerance, ignore_mtime=ignore_mtime,
+            exact_names=exact_names,
+        ):  # fmt: skip
+            yield DuplicateGroup(tuple(sorted(group, key=lambda f: f.path)), how)
