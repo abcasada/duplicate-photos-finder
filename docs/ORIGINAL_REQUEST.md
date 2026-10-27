@@ -63,6 +63,9 @@ planning, so later sessions don't lose them. See [PLAN.md](PLAN.md) for the desi
 | Excel report (2026-10-24) | Wanted a nicer-to-read Excel file. Uses XlsxWriter (optional dependency, installed via apt) and is opened in LibreOffice on this PC and Excel on Windows, so folder cells are `file://` links. |
 | Offline drives (2026-10-25) | The user has more drives than can be connected at once, so drives are scanned in batches and compared later from the index. |
 | Documentation (2026-10-25) | The project must be documented well enough to resume with a different LLM: see `CLAUDE.md` (also `AGENTS.md`). |
+| Storage 4A (2026-10-27) | **Storage 4A 8TB may be failing: do not read it** (no scans, no `dpf` commands that touch it, no benchmarks) unless the user explicitly asks. It was scanned once by the user (in the index). Its space, taken with `df` on 2026-10-27 before this was known: **5.09 TB used of 8.00 TB** (≈2.91 TB free). Record it with `dpf space --set`, never by reading the drive. |
+| Drive space (2026-10-27) | Record each drive's **used and total space** only: no per-file sizes of non-media files. It must be possible to record space **without rescanning files** (`dpf space`). |
+| New drives (2026-10-27) | Storage 4A 8TB (pool A), Storage 4B 10TB (pool B) and Storage 1B were scanned by the user on 2026-10-26/27; the index now holds 9 drives. |
 | Report detail (added during Phase 1) | Wanted: a **tree overview** that rolls near-identical trees into headline lines, plus **near-identical folders** noted alongside identical ones. |
 | Speed (added during Phase 1) | **Speed is a priority for all modes.** The machine is a Ryzen 5 3600 (6 cores / 12 threads); use multithreading where the bottleneck allows. |
 | Plan approval | The user said to write the plan into the repo, commit it, and resume implementation in a later session. |
