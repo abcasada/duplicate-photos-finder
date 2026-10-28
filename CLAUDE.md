@@ -97,11 +97,13 @@ Data flows **scan → index → match → group → report**.
 | `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing), `drop_nested`, and `drive_space` (one `os.statvfs` + `ismount`, taken once per root after its walk). |
 | `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`, `set_space` (updates an existing roots row only). |
 | `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped; around a camera-number token only *neutral* text (dates, separators) is dropped, other text is kept; extension kept). `copy_numbers(name)` feeds the matcher's copy-number rules. `match_key` is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
-| `src/dpf/match_name.py` | Mode 1 matcher; `bucket_groups` holds the per-bucket rules and is shared with coverage. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance, and a cluster with several copy numbers is split by number. |
-| `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). |
+| `src/dpf/match_name.py` | Mode 1 matcher; `bucket_groups` holds the per-bucket rules and is shared with coverage. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance; then (unless `--strict-time`) whole clusters are merged across **whole-hour shifts** (`_hour_merge`: all residues mod 3600 within the tolerance, span ≤ 14 h + tol), so every pair in a group satisfies `times_match` and nothing chains; strict clusters are never split. A cluster with several copy numbers is then split by number. `DuplicateGroup.hours` holds each file's offset in hours. |
+| `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). Pairs, runs and trees carry `hour_shift` (offsets B after A that some match needed) and `category` (OTHER only when both folders are other media); roll-up never crosses a category boundary; `GroupingResult.only(cat)` filters. |
 | `src/dpf/report.py` | `report.txt` (`format_text`, `format_coverage`, `footer_lines`), `report.json` (`write_json`, combined `write_pools_json`), `files.csv` (`write_pool_csv` adds a pool column), `missing.csv` (`write_missing_csv`), and shared label/format helpers (`pair_label`, `tree_label`, `run_lines`, `floor_percent`, `human_bytes` (decimal units), root-status lines). |
 | `src/dpf/xlsx_report.py` | `report.xlsx` (optional, XlsxWriter). Sheets: Summary, Trees, Folder pairs, Sequences, Same folder, Files, plus one per coverage direction ("A not in B"). `write_combined_xlsx` writes several pools into one workbook with pool-prefixed sheet names (`sheet_name`: unique, ≤31 chars). Sizes are stored as bytes with a GB display format, percentages are floored, relations are colour-coded, and folders are `file://` links (stopping at Excel's link limits). |
 | `src/dpf/pools.py` | Loads `pools.toml` (stdlib `tomllib`), including the optional `[backups]` table (`B = "A"`: B backs up A; validated: known pools, no self-link, no cycles) into `Pool.backs_up`; `coverage_partners` lists a pool's linked pools. A pattern is matched against mounted dirs **and** indexed roots, so unplugged drives stay in their pool. Matching is per path segment (`*` never spans `/`); `cli` refuses a pool run when a root matches more than one pool. |
+| `src/dpf/categories.py` | Personal vs other media from the optional `[categories] other = [...]` table of pools.toml. `Categories.of(dir)` (memoised; ancestors count; per-segment patterns, case-insensitive; absolute = anchored, relative = any depth), `of_dirs` (OTHER only if every folder is), `tally` (via `Index.dir_totals`), `load_categories`/`parse_categories`. |
+| `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
 | `src/dpf/media.py` | Extension sets (images incl. RAW/HEIC, videos), `SKIP_DIRS` (`$RECYCLE.BIN`, `System Volume Information`, …), `is_junk` (`._*`, Thumbs.db, desktop.ini, .DS_Store). |
 | `src/dpf/models.py` | `FileRecord`, `DuplicateGroup`, `RootStats` (frozen dataclasses). |
 | `bin/dpf` | Launcher that adds `src/` to the path. It works through a symlink (e.g. `~/.local/bin/dpf`). |
@@ -188,9 +190,39 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
     there"): mostly DNG/ARW re-saved with metadata (a few kB larger, newer mtime), and
     6,442 same-name+size copies whose mtime differs by exactly whole hours (3,984 at
     −1 h, 2,453 at −6 h; e.g. 2025-11-12 Northern Lights vs 4B `_Dumps/2026-09-17`).
-    The user may want an option to accept whole-hour offsets; not built.
+    Whole-hour offsets are now accepted by default (see below).
   - A backup of the index was taken before the real-data runs
     (`~/.cache/dpf/index.v5-backup-20261027.db`); no migration was needed.
+- **Whole-hour time shifts (2026-10-27, user decision: on by default):** mtimes match when
+  `|d| <= tol` or `|d - k*3600| <= tol`, `1 <= |k| <= 14` (`match_name.times_match`),
+  for duplicates and coverage alike; `--strict-time` restores the old rule. Basis text
+  `similar name+size+mtime ±2s (or whole hours)`. Reported as `; time shifted +1 h` on
+  pairs/runs/trees (B after A), "N groups rely on a whole-hour time shift" in the header,
+  "N files count as copied only through a whole-hour time shift" in coverage, a Time shift
+  column in xlsx, `hour_shift` in files.csv/JSON.
+  - Real index, `--no-scan --pool A --pool B` (9 drives): A not in B 292,454 / 5.0 TB →
+    286,012 / 4.3 TB (6,442 files via a shift; big Sony C####.MP4 clips at +6 h); B not
+    in A 152,135 / 4.0 TB → 146,892 / 3.4 TB (5,243 via a shift). Duplicate groups: A
+    63,780 → 66,871 (10,526 rely on a shift; could free 3.8 → 4.6 TB), B 40,037 → 45,064
+    (10,171; 4.6 → 5.4 TB). Shift offsets seen: +6/+7/±1/±5/±2 h. Run ~43 s vs ~38 s
+    strict.
+  - Known risk: fixed-size formats (uncompressed RAW, BMP) with the same name can match
+    by a whole-hour coincidence; e.g. Cakewalk theme BMPs ("Green Meters/09" vs "Purple
+    Meters/02", −1 h) in pool B. In pool A, 41 partial folder pairs share exactly one
+    shifted file (some are genuine, e.g. one music video in 4 recovery folders).
+- **Categories (2026-10-27):** `[categories] other = [...]` in pools.toml splits media
+  into personal and other (README "Personal and other media"). The user's file has only
+  an empty, commented-out block so far: **the patterns await the user's confirmation.**
+  `find --category personal|other|all`; text report sections, xlsx Category columns,
+  CSV/JSON `category`, coverage totals split, `dpf drives` Personal / Other media columns
+  (its "Space as of" column becomes a footer line then, to stay within 150 columns).
+- **Coverage review fixes (2026-10-27):** coverage says "media files" and adds a line
+  "N other files (non-media) in M folders are not compared by this check …"; warnings
+  for a stale other-pool index (> 1 day older than this pool's newest scan; fires on
+  the real index today) and for two roots of one pool that look like the same drive;
+  `check_coverage` refuses overlapping roots itself. XlsxWriter `constant_memory` (optional
+  item) was skipped: peak memory of the real combined run is ~750 MB, and it switches to
+  inline strings, which the tests' workbook reader does not parse.
 - **Empty or unreadable mount folders:** a root that lists no entries at all, or cannot
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.

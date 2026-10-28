@@ -849,6 +849,142 @@ class CoverageCliTest(PoolsFixture):
         self.assertIn("Pool B\n  backup of: pool A\n", out)
 
 
+class HourShiftCliTest(CliFixture):
+    def test_hour_shifted_copies_match_unless_strict(self):
+        copies = os.path.join(self.drives, "three", "Zone")
+        os.makedirs(copies)
+        for i in range(1, 4):  # sizes as in the fixture (i bytes)
+            with open(os.path.join(copies, f"IMG_{i}.JPG"), "wb") as fh:
+                fh.write(b"x" * i)
+            os.utime(os.path.join(copies, f"IMG_{i}.JPG"), (0, 1_600_000_000 + i + 3600))
+        code, out, _ = self.run_cli("find", "-q", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("matched on similar name+size+mtime ±2s (or whole hours)", out)
+        self.assertIn("3 groups rely on a whole-hour time shift", out)
+        self.assertIn("three/Zone   (B is fully contained in A; time shifted +1 h)\n"
+                      "       IMG_1.JPG … IMG_3.JPG  3 files  (time shifted +1 h)", out)
+        self.assertIn("three/Zone  ↔  ", out)
+        self.assertIn("two/Backup   (A is fully contained in B; time shifted -1 h)", out)
+        with open(os.path.join(self.out, "files.csv"), newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual({r["hour_shift"] for r in rows if "Zone" in r["dir"]}, {"1"})
+        code, out, _ = self.run_cli("find", "-q", "--strict-time", "-o", self.out, self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("matched on similar name+size+mtime ±2s\n", out)
+        self.assertNotIn("Zone", out)
+        self.assertNotIn("time shift", out)
+
+
+class CategoriesCliTest(PoolsFixture):
+    read = CoverageCliTest.read
+
+    def setUp(self):
+        super().setUp()
+        write_photos(os.path.join(self.a1, "Plex", "Films"), ["film.mkv"], 5000)
+        write_photos(os.path.join(self.a2, "Plex", "Films"), ["film.mkv"], 5000)
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+            "[backups]",
+            'B = "A"',
+            "[categories]",
+            'other = ["*/Plex"]',
+        )
+
+    def test_find_sections_tallies_and_filter(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Categories:  personal 20 files, 110 B; other media 2 files, 10.0 kB", out)
+        personal = out.index("--- Personal photos/videos: 1 folder pair ---")
+        other = out.index("--- Other media (folders listed under [categories] other): 1 folder")
+        self.assertLess(personal, other)
+        self.assertIn(f"{self.a1}/Plex  ↔  {self.a2}/Plex   (matching tree", out[other:])
+        self.assertIn("other media: 2 files, 10.0 kB missing of 2 compared (100%)", out)
+        data = self.report_json()
+        self.assertEqual(data["summary"]["categories"]["other"], {"files": 2, "bytes": 10000})
+        self.assertEqual(data["summary"]["root_status"][0]["other_files"], 1)
+        self.assertEqual(data["coverage"]["A not in B"]["by_category"]["other"]["missing"], 2)
+
+        code, out, err = self.run_cli(
+            "find", "-q", "--pool", "A", "--category", "personal", "-o", self.out
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn("Plex", out)
+        self.assertIn("Showing:     personal photos/videos only (--category personal)", out)
+        rows = list(csv.DictReader(io.StringIO(self.read("files.csv"))))
+        self.assertEqual({r["category"] for r in rows}, {"personal"})
+        self.assertEqual(list(csv.DictReader(io.StringIO(self.read("missing.csv")))), [])
+
+        code, out, _ = self.run_cli(
+            "find", "-q", "--pool", "A", "--category", "other", "-o", self.out
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("DCIM", out)
+        self.assertIn("Not backed up:  2 files, 10.0 kB, in 2 folders", out)
+
+    def test_category_needs_patterns(self):
+        self.write_pools(f'A = ["{self.media}/Storage [0-9]A *"]')
+        code, _, err = self.run_cli("find", "-q", "--pool", "A", "--category", "other",
+                                    "-o", self.out)  # fmt: skip
+        self.assertEqual(code, 1)
+        self.assertIn("--category other needs [categories] other patterns in", err)
+        with open(self.pools_file, "a") as fh:
+            fh.write('[categories]\npersonal = ["x"]\n')
+        code, _, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 1)
+        self.assertIn("[categories] has unknown key personal", err)
+
+    def test_drives_category_columns(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.a1, self.b1)[0], 0)
+        code, out, err = self.run_cli("drives")
+        self.assertEqual((code, err), (0, ""))
+        header = out.splitlines()[0]
+        self.assertRegex(header, r"Media size\s+Personal\s+Other media\s+Used on drive")
+        row = next(line for line in out.splitlines() if line.startswith(self.a1))
+        self.assertRegex(row, r"5\.1 kB\s+55 B\s+5\.0 kB\s")
+        self.assertIn("Personal / Other media: media sizes by [categories]", out)
+        # With the real mount paths (at most 34 characters) the table stays within 150.
+        lines = out.splitlines()[:3]
+        first = max(len(self.a1), len(self.b1))
+        self.assertLessEqual(max(len(line) for line in lines) - first + 34, 150)
+
+
+class CoverageWarningsCliTest(PoolsFixture):
+    def setUp(self):
+        super().setUp()
+        self.write_pools(
+            f'A = ["{self.media}/Storage [0-9]A *"]',
+            f'B = ["{self.media}/Storage [0-9]B *"]',
+            "[backups]",
+            'B = "A"',
+        )
+
+    def test_stale_other_pool(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE roots SET scanned_at = scanned_at - 3 * 86400")
+        conn.close()
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0)
+        warning = f"pool B's index may be out of date: {self.b1} last scanned "
+        self.assertIn(f"dpf: warning: {warning}", err)
+        self.assertIn(f"Warning:        {warning}", out)
+        self.assertIn(warning, self.report_json()["coverage"]["A not in B"]["warnings"][0])
+
+    def test_same_drive_twice_in_pool(self):
+        twin = os.path.join(self.media, "Storage 1B 4TB")
+        shutil.copytree(self.b1, twin)
+        self.assertEqual(self.run_cli("scan", "-q", self.b1, twin)[0], 0)
+        code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0)
+        self.assertEqual(err.count("look like the same drive"), 1)
+        self.assertIn(f"pool B: {twin} and {self.b1} look like the same drive", out)
+        code, out, err = self.run_cli("find", "-q", "--pool", "B", "--no-coverage", "-o", self.out)
+        self.assertIn("Warning:     pool B: ", out)
+        self.assertEqual(err.count("look like the same drive"), 1)
+
+
 GB = 10**9
 
 

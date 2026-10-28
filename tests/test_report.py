@@ -390,13 +390,14 @@ class CoverageReportTest(unittest.TestCase):
         self.assertEqual(lines[:2], ["Not backed up — no copy anywhere in pool B", "=" * 42])
         self.assertIn("Compared:       pool B is the backup of pool A; similar name+size", text)
         self.assertIn(
-            "Matched by similar name, size and date, not by contents; a renamed-and-re-saved "
+            "Matched by similar name, size and date (or a date whole hours apart), not by "
+        "contents; a renamed-and-re-saved "
             "copy counts as missing.",
             text,
         )
         self.assertIn(
             "Not backed up:  12 files, 7.0 MB, in 3 folders (+ 1 empty file not compared)\n"
-            "                80% of the 15 files compared in pool A\n"
+            "                80% of the 15 media files compared in pool A\n"
             "                1 of them has a file with a similar name in pool B",
             text,
         )
@@ -429,19 +430,19 @@ class CoverageReportTest(unittest.TestCase):
         cov = dataclasses.replace(self.cov, files=1_201, never_scanned=["/m/Storage 9B"])
         cov.missing = cov.missing[:1]
         text = format_coverage(cov)
-        self.assertIn("<1% of the 1,201 files compared", text)
+        self.assertIn("<1% of the 1,201 media files compared", text)
         self.assertIn("1 drive of pool B never scanned", text)
         self.assertIn("\n                  /m/Storage 9B\n", text)
         full = dataclasses.replace(self.cov, files=13)
         full.missing = full.missing + [rec("/a/x", "y.jpg")]
-        self.assertIn("100% of the 13 files", format_coverage(full))
+        self.assertIn("100% of the 13 media files", format_coverage(full))
         nearly = dataclasses.replace(self.cov, files=1_300)
         nearly.missing = [rec("/a/x", f"{n}.jpg") for n in range(1_299)]
-        self.assertIn("99% of the 1,300 files", format_coverage(nearly))
+        self.assertIn("99% of the 1,300 media files", format_coverage(nearly))
 
     def test_nothing_missing(self):
         cov = dataclasses.replace(self.cov, missing=[], folders=[], similar=set())
-        self.assertIn("Every compared file has a copy in pool B.", format_coverage(cov))
+        self.assertIn("Every compared media file has a copy in pool B.", format_coverage(cov))
 
     def test_json_and_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -500,6 +501,131 @@ class CoverageReportTest(unittest.TestCase):
             self.assertEqual(list(data["pools"]), ["A", "B"])
             self.assertEqual(data["pools"]["A"]["summary"]["pool"], "A")
             self.assertEqual(list(data["coverage"]), ["A not in B"])
+
+
+
+def build_categories():
+    """Personal duplicates (Photos), other-media duplicates (Plex) and an hour-shifted pair."""
+    from dpf.categories import Categories
+    from dpf.match_name import find_name_duplicates
+
+    t = 1_600_000_000.0
+    records = [rec(f"/d/{side}/Photos", f"IMG_{n}.JPG", 1000 + n, mtime=t + n)
+               for side in ("one", "two") for n in range(1, 4)]  # fmt: skip
+    records += [rec(f"/d/{side}/Plex", f"m{n}.mkv", 5000 + n, mtime=t + n)
+                for side in ("one", "two") for n in range(1, 3)]  # fmt: skip
+    records += [rec("/d/one/Trip", "DSC00001.ARW", 70, mtime=t),
+                rec("/d/two/Trip", "DSC00001.ARW", 70, mtime=t + 3600)]  # fmt: skip
+    idx = Index(":memory:")
+    idx.replace_root("/d", records)
+    cats = Categories(["Plex"])
+    groups = list(find_name_duplicates(idx, ["/d"]))
+    result = group(groups, idx, ["/d"], category=cats, tree_totals=lambda d: idx.totals([d]))
+    idx.close()
+    summary = {
+        **SUMMARY,
+        "categories": {
+            "personal": {"files": 8, "bytes": 6076},
+            "other": {"files": 4, "bytes": 20006},
+        },
+    }
+    return result, groups, summary, cats
+
+
+class CategoryTextTest(unittest.TestCase):
+    def test_sections_and_hour_shift(self):
+        result, groups, summary, _ = build_categories()
+        text = format_text(result, summary, footer=False)
+        self.assertIn(
+            "Categories:  personal 8 files, 6.1 kB; other media 4 files, 20.0 kB\n", text
+        )
+        self.assertIn(
+            "             1 group relies on a whole-hour time shift (time zone or DST copies)\n",
+            text,
+        )
+        personal = text.index("--- Personal photos/videos: 2 folder pairs ---")
+        other = text.index(
+            "--- Other media (folders listed under [categories] other): 1 folder pair ---"
+        )
+        self.assertLess(personal, other)
+        self.assertIn("/d/one/Trip  ↔  /d/two/Trip   (all photos/videos match, 1 file; time "
+                      "shifted +1 h)", text[personal:other])  # fmt: skip
+        self.assertIn("/d/one/Plex  ↔  /d/two/Plex", text[other:])
+        self.assertNotIn("Plex", text[personal:other])
+        only = format_text(result.only("other"), {**summary, "category": "other"}, footer=False)
+        self.assertIn("Showing:     other media only (--category other)", only)
+        self.assertNotIn("--- Personal", only)
+        plain = format_text(result, SUMMARY, footer=False)
+        self.assertNotIn("---", plain)
+        self.assertNotIn("Categories:", plain)
+
+    def test_run_shift_note(self):
+        from dpf.grouping import Run
+        from dpf.report import run_lines
+
+        run = Run("a.jpg", "c.jpg", "a.jpg", "c.jpg", 3, 30, True, (), (-6, 1))
+        self.assertEqual(
+            run_lines((run,), 8), ["       a.jpg … c.jpg  3 files  (time shifted -6 h, +1 h)"]
+        )
+
+    def test_csv_and_json_columns(self):
+        result, groups, summary, cats = build_categories()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "files.csv")
+            write_csv(groups, path, cats)
+            with open(path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+            trip = [r for r in rows if r["name"] == "DSC00001.ARW"]
+            self.assertEqual([(r["dir"], r["hour_shift"]) for r in trip],
+                             [("/d/one/Trip", "0"), ("/d/two/Trip", "1")])  # fmt: skip
+            self.assertEqual({r["category"] for r in rows if r["name"].endswith(".mkv")}, {"other"})
+            self.assertEqual({r["category"] for r in rows if r["name"].endswith(".JPG")},
+                             {"personal"})  # fmt: skip
+            path = os.path.join(tmp, "report.json")
+            write_json(result, summary, path)
+            with open(path) as fh:
+                data = json.load(fh)
+        self.assertEqual(data["hour_shift_groups"], 1)
+        pairs = {p["dir_a"]: p for p in data["pairs"]}
+        self.assertEqual(pairs["/d/one/Trip"]["hour_shift"], [1])
+        self.assertEqual(pairs["/d/one/Plex"]["category"], "other")
+
+
+class CoverageExtrasTextTest(unittest.TestCase):
+    def test_lines(self):
+        from dpf.categories import Categories
+
+        a = [rec("/a/Photos", "p.jpg", 10), rec("/a/Photos", "s.jpg", 12, mtime=5_000.0),
+             rec("/a/Plex", "m.mkv", 20)]  # fmt: skip
+        b = [rec("/b", "s.jpg", 12, mtime=5_000.0 + 3600)]
+        idx = Index(":memory:")
+        idx.replace_root("/a", a, dir_stats={"/a/Photos": (3, 0)})
+        idx.replace_root("/b", b)
+        cov = check_coverage(idx, ["/a"], ["/b"], pool="A", other="B", direction=NOT_BACKED_UP,
+                             category=Categories(["Plex"]))  # fmt: skip
+        idx.close()
+        cov.warnings = ["pool B's index may be out of date: /b last scanned x"]
+        text = format_coverage(cov)
+        for line in (
+            "Warning:        pool B's index may be out of date: /b last scanned x\n",
+            "                personal: 1 file, 10 B missing of 2 compared (50%)\n",
+            "                other media: 1 file, 20 B missing of 1 compared (100%)\n",
+            "                1 file counts as copied only through a whole-hour time shift (time "
+            "zone or DST copies)\n",
+            "                3 other files (non-media) in 1 folder are not compared by this check "
+            "— sidecars/edits/catalogs may exist only on this side\n",
+            "--- Personal photos/videos: 1 folder ---\n",
+            "--- Other media (folders listed under [categories] other): 1 folder ---\n",
+        ):
+            self.assertIn(line, text)
+        self.assertLess(text.index("/a/Photos   ("), text.index("/a/Plex   ("))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing.csv")
+            write_missing_csv([cov], path, Categories(["Plex"]))
+            with open(path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        self.assertEqual({r["name"]: r["category"] for r in rows},
+                         {"p.jpg": "personal", "m.mkv": "other"})  # fmt: skip
 
 
 if __name__ == "__main__":

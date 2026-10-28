@@ -15,7 +15,7 @@ from dpf.coverage import ONLY_IN_BACKUP
 from dpf.xlsx_report import SHEETS, PoolSheets, sheet_name, write_combined_xlsx, write_xlsx
 
 from tests.test_grouping import rec
-from tests.test_report import SUMMARY, build, build_coverage, build_trees
+from tests.test_report import SUMMARY, build, build_categories, build_coverage, build_trees
 
 HAVE_XLSXWRITER = importlib.util.find_spec("xlsxwriter") is not None
 NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -238,6 +238,50 @@ class XlsxReportTest(unittest.TestCase):
         wb = self.write(GroupingResult([], [], 0, 0, 0))
         self.assertEqual(wb.names, list(SHEETS))
         self.assertEqual({k[1:] for k in wb.cells("Folder pairs")}, {"1"})
+
+
+@unittest.skipUnless(HAVE_XLSXWRITER, "XlsxWriter is not installed")
+class CategoryXlsxTest(unittest.TestCase):
+    def test_time_shift_and_category_columns(self):
+        result, groups, summary, _ = build_categories()
+        summary = {**summary, "root_status": [{
+            "root": "/d", "status": "scanned now", "files": 12, "bytes": 26082,
+            "personal_files": 8, "personal_bytes": 6076, "other_files": 4, "other_bytes": 20006,
+        }]}  # fmt: skip
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.xlsx")
+            write_xlsx(result, groups, summary, path)
+            wb = Workbook(path)
+            self.addCleanup(wb.close)
+            pairs = wb.cells("Folder pairs")
+            self.assertEqual((pairs["S1"], pairs["T1"]), ("Time shift", "Category"))
+            rows = {pairs[f"F{r}"]: r for r in range(2, 5)}
+            self.assertEqual(pairs[f"S{rows['/d/one/Trip']}"], "+1 h")
+            self.assertEqual(pairs[f"T{rows['/d/one/Plex']}"], "other")
+            self.assertEqual(pairs[f"T{rows['/d/one/Photos']}"], "personal")
+            seq = wb.cells("Sequences")
+            self.assertEqual((seq["L1"], seq["M1"]), ("Time shift", "Category"))
+            self.assertIn("+1 h", seq.values())
+            files = wb.cells("Files")
+            self.assertEqual((files["I1"], files["J1"]), ("Hours after first", "Category"))
+            self.assertIn(1.0, [v for k, v in files.items() if k[0] == "I"])
+            self.assertEqual(wb.cells("Trees")["N1"], "Time shift")
+            values = list(wb.cells("Summary").values())
+            for text in ("Categories", "Personal files", "Other size", "/d",
+                         "1 group relies on a whole-hour time shift (time zone or DST copies)"):
+                self.assertIn(text, values)  # fmt: skip
+
+    def test_no_category_values_without_categories(self):
+        result, groups = build()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.xlsx")
+            write_xlsx(result, groups, SUMMARY, path)
+            wb = Workbook(path)
+            self.addCleanup(wb.close)
+            pairs = wb.cells("Folder pairs")
+            self.assertEqual(pairs["T1"], "Category")
+            self.assertNotIn("T2", pairs)
+            self.assertNotIn("S2", pairs)
 
 
 class SheetNameTest(unittest.TestCase):

@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from urllib.parse import quote
 
+from dpf.categories import ALL, OTHER, TITLES, Category, of_dirs
 from dpf.coverage import Coverage, caveat
 from dpf.grouping import (
     A_IN_B,
@@ -36,9 +37,12 @@ from dpf.report import (
     OFFLINE_NOTE,
     PAIR_LABELS,
     any_offline,
+    category_tally,
+    coverage_category_lines,
     coverage_relation,
     duration,
     floor_percent,
+    hour_shift_note,
     human_bytes,
     pair_label,
     plural,
@@ -46,8 +50,11 @@ from dpf.report import (
     run_lines,
     same_folder_stats,
     name_list,
+    shift_cell,
+    shifted_note,
     tree_label,
     tree_tags,
+    unindexed_note,
 )
 
 SHEETS = ("Summary", "Trees", "Folder pairs", "Sequences", "Same folder", "Files")
@@ -179,12 +186,13 @@ def _pool_tables(
         return sheet_name(f"{prefix} {kind}" if prefix else kind, used)
 
     tags = tree_tags(result.trees)
+    cat = result.category
     return [
-        _trees(wb, fmt, result.trees, name("Trees")),
-        _pairs(wb, fmt, result.pairs, tags, result.near, name("Folder pairs")),
-        _sequences(wb, fmt, result.pairs, name("Sequences")),
-        _same_folder(wb, fmt, result.same_folder, name("Same folder")),
-        _files(wb, fmt, groups, name("Files")),
+        _trees(wb, fmt, result.trees, name("Trees"), cat is not None),
+        _pairs(wb, fmt, result.pairs, tags, result.near, name("Folder pairs"), cat is not None),
+        _sequences(wb, fmt, result.pairs, name("Sequences"), cat is not None),
+        _same_folder(wb, fmt, result.same_folder, name("Same folder"), cat),
+        _files(wb, fmt, groups, name("Files"), cat),
     ]
 
 
@@ -313,6 +321,20 @@ def _tree_fill(t: TreePair) -> str | None:
     return None
 
 
+def _shift(table: _Table, col: int, hours: Sequence[int]) -> None:
+    if hours:
+        table.text(col, shift_cell(hours), table.fmt.warning_text)
+
+
+def _category(table: _Table, col: int, category: str | None) -> None:
+    """The category cell (amber for other media); empty when no categories are set."""
+    if category:
+        table.text(col, category, table.fmt.warning_text if category == OTHER else None)
+
+
+_EXTRA_COLUMNS = [("Time shift", 11), ("Category", 10)]
+
+
 def _relation(table: _Table, col: int, label: str, fill: str | None) -> None:
     table.text(col, label, table.fmt.fills[fill] if fill else None)
 
@@ -335,11 +357,13 @@ _SIDE_COLUMNS = [
 ]  # fmt: skip
 
 
-def _trees(wb, fmt: _Formats, trees: list[TreePair], name: str = "Trees") -> _Table:
+def _trees(
+    wb, fmt: _Formats, trees: list[TreePair], name: str = "Trees", categories: bool = False
+) -> _Table:
     columns = [
         ("#", 6), ("Shared size", 13), ("Relation", None), ("Folder A", None),
         ("Folder B", None), *_SIDE_COLUMNS, ("Folder pairs", 9),
-        ("Other files not compared", 12),
+        ("Other files not compared", 12), *_EXTRA_COLUMNS,
     ]  # fmt: skip
     t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Trees")
     for n, tree in enumerate(trees, 1):
@@ -353,6 +377,8 @@ def _trees(wb, fmt: _Formats, trees: list[TreePair], name: str = "Trees") -> _Ta
         _sides(t, 5, tree.matched_a, tree.total_a, tree.matched_b, tree.total_b)
         t.num(11, tree.folders)
         _not_compared(t, 12, tree.unindexed)
+        _shift(t, 13, tree.hour_shift)
+        _category(t, 14, categories and tree.category)
     t.data_bar(1)
     return t
 
@@ -380,13 +406,13 @@ def _names(p: FolderPair) -> str:
 
 def _pairs(
     wb, fmt: _Formats, pairs: list[FolderPair], tags: dict, near: float,
-    name: str = "Folder pairs",
+    name: str = "Folder pairs", categories: bool = False,
 ) -> _Table:  # fmt: skip
     columns = [
         ("#", 7), ("Tree", 6), ("Shared size", 13), ("Relation", None), ("Names", 9),
         ("Folder A", None), ("Folder B", None), *_SIDE_COLUMNS, ("Only in A", 9),
         ("Only in B", 9), ("Other files not compared", 12), ("Runs", 7),
-        ("First sequence", 60),
+        ("First sequence", 60), *_EXTRA_COLUMNS,
     ]  # fmt: skip
     t = _Table(wb, fmt, name, columns, freeze_cols=2, kind="Folder pairs")
     for n, p in enumerate(pairs, 1):
@@ -412,17 +438,21 @@ def _pairs(
         text = _sequence_text(p)
         if text:
             t.text(17, text)
+        _shift(t, 18, p.hour_shift)
+        _category(t, 19, categories and p.category)
     t.data_bar(2)
     return t
 
 
 def _sequences(
-    wb, fmt: _Formats, pairs: list[FolderPair], name: str = "Sequences"
-) -> _Table:
+    wb, fmt: _Formats, pairs: list[FolderPair], name: str = "Sequences",
+    categories: bool = False,
+) -> _Table:  # fmt: skip
     columns = [
         ("Pair #", 7), ("Folder A", None), ("Folder B", None), ("First (A)", None),
         ("Last (A)", None), ("First (B)", None), ("Last (B)", None), ("Files", 8),
         ("Size", 12), ("Not matched inside", 12), ("Not matched names", None),
+        *_EXTRA_COLUMNS,
     ]  # fmt: skip
     t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Sequences")
     for n, p in enumerate(pairs, 1):
@@ -442,13 +472,19 @@ def _sequences(
             if r.skipped:
                 t.num(9, len(r.skipped), fmt.amber)
                 t.text(10, name_list(r.skipped, _SKIPPED_NAMES))
+            _shift(t, 11, r.hour_shift)
+            _category(t, 12, categories and p.category)
     return t
 
 
 def _same_folder(
-    wb, fmt: _Formats, groups: list[DuplicateGroup], name: str = "Same folder"
-) -> _Table:
-    columns = [("Folder", None), ("Groups", 9), ("Extra copies", 9), ("Redundant size", 12)]
+    wb, fmt: _Formats, groups: list[DuplicateGroup], name: str = "Same folder",
+    category: Category | None = None,
+) -> _Table:  # fmt: skip
+    columns = [
+        ("Folder", None), ("Groups", 9), ("Extra copies", 9), ("Redundant size", 12),
+        ("Category", 10),
+    ]  # fmt: skip
     t = _Table(wb, fmt, name, columns, kind="Same folder")
     _, ranked = same_folder_stats(groups)
     ranked.sort(key=lambda r: (-r[3], -r[1], r[0]))
@@ -459,21 +495,25 @@ def _same_folder(
         t.num(1, n_groups)
         t.num(2, extra)
         t.num(3, nbytes, fmt.size)
+        _category(t, 4, category and category(d))
     t.data_bar(3)
     return t
 
 
 def _files(
-    wb, fmt: _Formats, groups: Sequence[DuplicateGroup], name: str = "Files"
-) -> _Table:
+    wb, fmt: _Formats, groups: Sequence[DuplicateGroup], name: str = "Files",
+    category: Category | None = None,
+) -> _Table:  # fmt: skip
     columns = [
         ("Group", 8), ("Basis", None), ("Folder", None), ("Name", None), ("Size", 11),
-        ("Modified", 19), ("Kind", 7), ("Names", 9),
+        ("Modified", 19), ("Kind", 7), ("Names", 9), ("Hours after first", 10),
+        ("Category", 10),
     ]  # fmt: skip
     t = _Table(wb, fmt, name, columns, freeze_cols=1, kind="Files")
     for n, g in enumerate(groups, 1):
         names = "exact" if g.same_names else "similar"
-        for f in g.files:
+        cat = category and of_dirs(category, {f.dir for f in g.files})
+        for i, f in enumerate(g.files):
             if not t.next_row():
                 continue
             t.num(0, n)
@@ -488,6 +528,9 @@ def _files(
                 t.ws.write_datetime(t.row, 5, modified, fmt.date)
             t.text(6, f.kind)
             t.text(7, names)
+            if g.hours:
+                t.num(8, g.hours[i], fmt.amber if g.hours[i] else None)
+            _category(t, 9, cat)
     return t
 
 
@@ -503,10 +546,12 @@ def _coverage_sheet(wb, fmt: _Formats, cov: Coverage, name: str) -> _Table:
         ("#", 6), ("Missing size", 13), ("Folder", None), ("Whole tree", 8), ("Folders", 9),
         ("Missing files", 10), ("Total files", 9), ("Missing %", 9),
         ("Similar name there", 10), ("Other files not compared", 12), ("Runs", 7),
-        ("First missing run", 60),
+        ("First missing run", 60), ("Category", 10),
     ]  # fmt: skip
     mine = f"pool {cov.pool}" if cov.pool else "these folders"
-    note = f"files of {mine} with no copy anywhere in pool {cov.other}, one row per folder"
+    note = f"media files of {mine} with no copy anywhere in pool {cov.other}, one row per folder"
+    if cov.category != ALL:
+        note += f" ({TITLES[cov.category].lower()} only)"
     t = _Table(wb, fmt, name, columns, freeze_cols=1, note=note)
     t.coverage = id(cov)
     for n, m in enumerate(cov.folders, 1):
@@ -530,6 +575,7 @@ def _coverage_sheet(wb, fmt: _Formats, cov: Coverage, name: str) -> _Table:
                 first = run_lines(m.runs[:1], 1, indent="", align=False, skipped_label=label)[0]
                 more = len(m.runs) - 1
                 t.text(11, f"{first}  (+{more:,} more runs)" if more else first)
+        _category(t, 12, cov.by_category and m.category)
     t.data_bar(1)
     return t
 
@@ -601,8 +647,19 @@ def _pool_block(
         w.line("", OFFLINE_NOTE, fmt.warning)
     w.line("Files scanned", summary.get("files", 0))
     w.line("Total size", summary.get("bytes", 0), fmt.left_size)
+    tallies = summary.get("categories")
+    if tallies:
+        w.line("Categories", category_tally(tallies))
+        _drive_categories(w, summary)
+    only = summary.get("category", ALL)
+    if only != ALL:
+        w.line("Showing", f"{TITLES[only].lower()} only (--category {only})", fmt.warning)
     w.line("Duplicate groups", result.groups)
+    if result.hour_shift_groups:
+        w.line("", hour_shift_note(result.hour_shift_groups))
     w.line("Could free (keeping one copy)", result.redundant_bytes, fmt.left_size)
+    for warning in summary.get("warnings", ()):
+        w.line("Warning", warning, fmt.warning)
     if result.capped_groups:
         w.line(
             "",
@@ -631,6 +688,26 @@ def _pool_block(
     ranked.update({k: v for k, v in by_pair.items() if k not in ranked})
     _counts(w.ws, fmt, w.row, "Folder pairs", ranked, pair_bytes)
     w.skip(len(ranked) + 3)
+
+
+def _drive_categories(w: _SummaryWriter, summary: dict) -> None:
+    """Per drive: personal and other media, files and bytes (root_status entries)."""
+    status = [e for e in summary.get("root_status") or [] if "personal_files" in e]
+    if not status:
+        return
+    fmt, ws = w.fmt, w.ws
+    headers = ("Personal files", "Personal size", "Other files", "Other size")
+    ws.write_string(w.row, 0, "Drive / folder", fmt.bold)
+    for c, header in enumerate(headers, 1):
+        ws.write_string(w.row, c, header, fmt.bold)
+    w.skip()
+    for e in status:
+        ws.write_string(w.row, 0, e["root"], fmt.text)
+        ws.write_number(w.row, 1, e["personal_files"], fmt.int)
+        ws.write_number(w.row, 2, e["personal_bytes"], fmt.size)
+        ws.write_number(w.row, 3, e["other_files"], fmt.int)
+        ws.write_number(w.row, 4, e["other_bytes"], fmt.size)
+        w.skip()
 
 
 _COVERAGE_SUMMARY = (
@@ -668,6 +745,16 @@ def _coverage_block(w: _SummaryWriter, coverage: Sequence[Coverage], tables) -> 
         w.skip()
     for cov in coverage:
         w.line("", f"{cov.title}: {coverage_relation(cov)}.")
+        if cov.category != ALL:
+            w.line("", f"  {TITLES[cov.category].lower()} only", fmt.warning)
+        for line in coverage_category_lines(cov):
+            w.line("", f"  {line}")
+        if cov.shifted:
+            w.line("", f"  {shifted_note(cov)}")
+        if cov.unindexed:
+            w.line("", f"  {unindexed_note(cov)}", fmt.warning)
+        for warning in cov.warnings:
+            w.line("", f"  Warning: {warning}", fmt.warning)
         for line in root_lines({"root_status": cov.other_status, "roots": cov.other_roots},
                                align=False):  # fmt: skip
             w.line("", f"  pool {cov.other}: {line}")
@@ -723,8 +810,10 @@ def _other_reports(w: _SummaryWriter, summary: dict) -> None:
 _COVERAGE_NOTES = [
     "Coverage sheets (e.g. \"A not in B\"): photos/videos of one pool with no copy anywhere "
     "in the other pool, one row per folder, largest first.",
-    "  A copy is a file mode 1 would match (similar name, size, date within the tolerance), "
-    "wherever it sits; file contents are not compared.",
+    "  A copy is a file mode 1 would match (similar name, size, date within the tolerance or "
+    "whole hours apart), wherever it sits; file contents are not compared.",
+    "  Only media files are compared: sidecars, edits and catalogs (other files) may exist "
+    "only on one side.",
     "  A renamed-and-re-saved copy counts as missing. Whole tree = every compared file under "
     "the folder is missing; Missing % is rounded down (\"<1%\" when above 0).",
     "  0-byte files are not compared; other files (non-photo/video) are counted per folder, "
@@ -776,5 +865,10 @@ def _notes(near: float) -> list[str]:
         "path; A/B % are of all photos/videos indexed under each tree.",
         "  The Tree column of Folder pairs shows the tree a pair belongs to. Read the pairs "
         "before deleting: the overview hides unmatched subfolders and other files.",
+        "Time shift (amber): some matches differ by whole hours (copies made across time "
+        "zones or a DST change); +1 h = B's dates are one hour later than A's. "
+        "--strict-time turns this off.",
+        "Category: personal, or other (folders listed under [categories] other in the pools "
+        "file); empty when no categories are set. A pair is other only when both folders are.",
         "Folder cells link to the folder on this computer (file:// links).",
     ]

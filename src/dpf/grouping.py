@@ -15,10 +15,16 @@ subfolders on both sides.
 Trees that differ in a few files cannot be rolled up, so a second, looser view groups
 folder pairs by the trees they sit in (`TreePair`), with each tree's coverage measured
 against everything indexed under it.
+
+Copies whose dates differ by whole hours (time zones, DST; see match_name) are marked:
+pairs, runs and trees carry the offsets used (`hour_shift`, hours of B after A). With a
+category function (categories.Categories), pairs and trees are tagged PERSONAL or OTHER,
+and a matching tree is never rolled up across a category boundary.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 from collections import defaultdict
@@ -26,6 +32,7 @@ from collections.abc import Callable, Container, Iterable, Sequence
 from dataclasses import dataclass, field
 from itertools import combinations
 
+from dpf.categories import OTHER, PERSONAL, Category, of_dirs
 from dpf.models import DuplicateGroup, FileRecord
 from dpf.names import match_stem
 
@@ -65,6 +72,7 @@ class Run:
     of a matched RAW) is passed over rather than ending the run. It lies inside the
     run's range without a copy, so it is listed in `skipped`; `count` and `bytes` cover
     matches only. `same_names` is True when every A name equals its B name exactly.
+    `hour_shift` lists the whole-hour offsets (B after A) that some matches relied on.
     """
 
     a_first: str
@@ -75,6 +83,7 @@ class Run:
     bytes: int
     same_names: bool
     skipped: tuple[str, ...] = ()
+    hour_shift: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +102,8 @@ class FolderPair:
     folders: int = 1
     unindexed: int = 0  # entries on either side that were not indexed, so not compared
     similar_names: bool = False  # some matched files have different names on the two sides
+    hour_shift: tuple[int, ...] = ()  # whole-hour offsets (B after A) some matches relied on
+    category: str = PERSONAL  # OTHER only when both folders are other media
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +125,8 @@ class TreePair:
     bytes: int
     relation: str  # TREE_NEAR, TREE_A_MOSTLY_IN_B, TREE_B_MOSTLY_IN_A or TREE_OVERLAP
     unindexed: int = 0  # unindexed entries in the paired folders (not the whole trees)
+    hour_shift: tuple[int, ...] = ()  # whole-hour offsets used by its folder pairs
+    category: str = PERSONAL  # OTHER only when every folder pair in it is
 
 
 @dataclass(slots=True)
@@ -125,6 +138,21 @@ class GroupingResult:
     capped_groups: int
     trees: list[TreePair] = field(default_factory=list)
     near: float = DEFAULT_NEAR
+    category: Category | None = None  # folder -> PERSONAL/OTHER, if categories are set
+    hour_shift_groups: int = 0  # groups whose copies differ by whole hours
+
+    def category_of(self, group: DuplicateGroup) -> str:
+        """OTHER if every file of `group` lies in an other-media folder, else PERSONAL."""
+        return of_dirs(self.category, {f.dir for f in group.files})
+
+    def only(self, category: str) -> GroupingResult:
+        """The trees, pairs and same-folder groups of one category (counts left as they are)."""
+        return dataclasses.replace(
+            self,
+            pairs=[p for p in self.pairs if p.category == category],
+            trees=[t for t in self.trees if t.category == category],
+            same_folder=[g for g in self.same_folder if self.category_of(g) == category],
+        )
 
 
 def group_duplicates(
@@ -137,6 +165,7 @@ def group_duplicates(
     max_dirs_per_group: int = 16,
     near: float = DEFAULT_NEAR,
     tree_totals: Callable[[str], tuple[int, int]] | None = None,
+    category: Category | None = None,
 ) -> GroupingResult:
     """Turn duplicate groups into folder pairs sorted by duplicated bytes, largest first.
 
@@ -149,19 +178,27 @@ def group_duplicates(
     A partial pair is NEAR_IDENTICAL when at least `near` of each side matched (1.0
     disables it). With `tree_totals` (dir -> (files, bytes) indexed under it, normally
     `lambda d: index.totals([d])`) the result also lists tree pairs; see tree_pairs.
+
+    `category` (folder -> PERSONAL/OTHER) tags pairs and trees and keeps matching-tree
+    roll-ups within one category. A file whose copies in the other folder all differ from
+    it by whole hours (DuplicateGroup.hours) marks its run and pair with that offset.
     """
     # (dir_a, dir_b) -> (A name -> matching B name, matched B names)
     matches: dict[tuple[str, str], tuple[dict[str, str], set[str]]] = {}
     similar: set[tuple[str, str]] = set()  # pairs where some matched names differ
+    shifted: defaultdict[tuple[str, str], dict[str, int]] = defaultdict(dict)  # A name -> hours
     same_folder: list[DuplicateGroup] = []
-    count = redundant = capped = 0
+    count = redundant = capped = shift_groups = 0
 
     for group in groups:
         count += 1
         redundant += group.redundant_bytes
+        shift_groups += group.hour_shift
         by_dir: dict[str, list[str]] = {}
-        for f in group.files:
+        hours: dict[str, list[int]] = {}
+        for i, f in enumerate(group.files):
             by_dir.setdefault(f.dir, []).append(f.name)
+            hours.setdefault(f.dir, []).append(group.hour_of(i))
         if len(by_dir) < len(group.files):
             same_folder.append(group)
         if len(by_dir) < 2:
@@ -180,9 +217,11 @@ def group_duplicates(
             b_names = by_dir[b]
             if len(set(by_dir[a]).union(b_names)) > 1:
                 similar.add((a, b))
-            for name in by_dir[a]:
+            for name, hour in zip(by_dir[a], hours[a]):
                 if name not in a_map:
                     a_map[name] = _counterpart(name, b_names)
+                if group.hours and hour not in hours[b]:
+                    shifted[(a, b)][name] = min((h - hour for h in hours[b]), key=abs)
             b_set.update(b_names)
 
     counts: dict[str, int] = {}
@@ -213,13 +252,19 @@ def group_duplicates(
             a_map, b_set = matches.pop((a, b))
             pairs[(a, b)] = _build_pair(
                 a, b, listing, a_map, b_set, dir_count(b), unindexed(a) + unindexed(b), near,
-                (a, b) in similar,
+                (a, b) in similar, shifted.get((a, b), {}),
             )  # fmt: skip
 
-    _roll_up(pairs, dir_count, unindexed, subdirs, roots)
+    _roll_up(pairs, dir_count, unindexed, subdirs, roots, category)
+    if category is not None:
+        for k, p in pairs.items():
+            if category(p.dir_a) == OTHER and category(p.dir_b) == OTHER:
+                pairs[k] = dataclasses.replace(p, category=OTHER)
     ordered = sorted(pairs.values(), key=lambda p: (-p.bytes, p.dir_a, p.dir_b))
     trees = tree_pairs(ordered, roots, tree_totals, near=near) if tree_totals else []
-    return GroupingResult(ordered, same_folder, count, redundant, capped, trees, near)
+    return GroupingResult(
+        ordered, same_folder, count, redundant, capped, trees, near, category, shift_groups
+    )
 
 
 def is_near(matched: int, total: int, near: float) -> bool:
@@ -249,9 +294,11 @@ def _build_pair(
     unindexed: int,
     near: float = DEFAULT_NEAR,
     similar_names: bool = False,
+    shifted: dict[str, int] | None = None,
 ) -> FolderPair:
+    shifted = shifted or {}
     runs: list[Run] = []
-    # [a_first, a_last, b_first, b_last, count, bytes, same, b_key, skipped]
+    # [a_first, a_last, b_first, b_last, count, bytes, same, b_key, skipped, hour shifts]
     cur: list | None = None
     passed: list[str] = []  # siblings passed over since the run's last match
     matched = nbytes = 0
@@ -275,13 +322,15 @@ def _build_pair(
             runs.append(_run(cur))
             cur = None
         if cur is None:
-            cur = [rec.name, rec.name, other, other, 1, rec.size, same, b_key, []]
+            cur = [rec.name, rec.name, other, other, 1, rec.size, same, b_key, [], set()]
         else:
             cur[1], cur[3], cur[7] = rec.name, other, b_key
             cur[4] += 1
             cur[5] += rec.size
             cur[6] = cur[6] and same
             cur[8] += passed
+        if rec.name in shifted:
+            cur[9].add(shifted[rec.name])
         passed = []
     if cur is not None:
         runs.append(_run(cur))
@@ -298,14 +347,15 @@ def _build_pair(
         relation = NEAR_IDENTICAL
     else:
         relation = PARTIAL
+    pair_shift = tuple(sorted({h for r in runs for h in r.hour_shift}))
     return FolderPair(
         a, b, tuple(runs), matched, total_a, matched_b, total_b, nbytes, relation, 1, unindexed,
-        similar_names,
+        similar_names, pair_shift,
     )  # fmt: skip
 
 
 def _run(cur: list) -> Run:
-    return Run(*cur[:7], tuple(cur[8]))
+    return Run(*cur[:7], tuple(cur[8]), tuple(sorted(cur[9])))
 
 
 def beside_sibling(
@@ -354,6 +404,7 @@ class _Tree:
     bytes: int
     children: int
     similar: bool = False
+    hour_shift: frozenset[int] = frozenset()
 
 
 def _roll_up(
@@ -362,12 +413,14 @@ def _roll_up(
     unindexed: Callable[[str], int],
     subdirs: Callable[[str], list[str]],
     roots: Sequence[str],
+    category: Category | None = None,
 ) -> None:
     """Replace identical folder pairs that make up matching trees by one tree pair.
 
     Every folder of both trees must be an identical pair with nothing unindexed, or
     hold no files and nothing unindexed on either side, and both trees must lie
-    inside the scanned roots.
+    inside the scanned roots. With `category`, every folder of a tree must have the
+    category of its top.
     """
     identical = {
         k: p for k, p in pairs.items() if p.relation == IDENTICAL and p.unindexed == 0
@@ -401,8 +454,14 @@ def _roll_up(
         cx, cy = children(x), children(y)
         if cx.keys() != cy.keys() or (own is None and not cx):
             return None
+        if category is not None and any(
+            category(sub) != category(top) for top, kids in ((x, cx), (y, cy))
+            for sub in kids.values()
+        ):  # fmt: skip
+            return None
         folders, files, nbytes = (1, own.matched_a, own.bytes) if own else (0, 0, 0)
         similar = own is not None and own.similar_names
+        shift = set(own.hour_shift) if own else set()
         for name, sub in cx.items():
             t = tree(sub, cy[name])
             if t is None:
@@ -411,7 +470,8 @@ def _roll_up(
             files += t.files
             nbytes += t.bytes
             similar = similar or t.similar
-        result = memo[k] = _Tree(folders, files, nbytes, len(cx), similar)
+            shift |= t.hour_shift
+        result = memo[k] = _Tree(folders, files, nbytes, len(cx), similar, frozenset(shift))
         return result
 
     for x, y in identical:
@@ -436,7 +496,7 @@ def _roll_up(
         elif t.children:
             pairs[k] = FolderPair(
                 k[0], k[1], (), t.files, t.files, t.files, t.files, t.bytes,
-                IDENTICAL_TREE, t.folders, 0, t.similar,
+                IDENTICAL_TREE, t.folders, 0, t.similar, tuple(sorted(t.hour_shift)),
             )  # fmt: skip
 
 
@@ -516,6 +576,8 @@ def tree_pairs(
             relation = TREE_B_MOSTLY_IN_A
         else:
             relation = TREE_OVERLAP
+        shift = {-h if flipped else h for p, flipped in members for h in p.hour_shift}
+        other = all(p.category == OTHER for p, _ in members)
         trees.append(
             TreePair(
                 ta, tb,
@@ -525,6 +587,8 @@ def tree_pairs(
                 sum(members[i][0].bytes for i in kept_a),
                 relation,
                 sum(p.unindexed for p, _ in members),
+                tuple(sorted(shift)),
+                OTHER if other else PERSONAL,
             )
         )  # fmt: skip
     trees.sort(key=lambda t: (-t.bytes, t.dir_a, t.dir_b))

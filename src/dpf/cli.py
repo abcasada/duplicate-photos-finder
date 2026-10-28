@@ -11,9 +11,26 @@ from collections.abc import Collection
 from dataclasses import dataclass, field
 
 from dpf import __version__
+from dpf.categories import (
+    ALL,
+    CATEGORIES,
+    OTHER,
+    PERSONAL,
+    Categories,
+    load_categories,
+    of_dirs,
+    tally,
+)
 from dpf.index import Index, default_db_path
 from dpf.grouping import DEFAULT_NEAR, GroupingResult
-from dpf.coverage import NOT_BACKED_UP, NOT_IN_OTHER, ONLY_IN_BACKUP, Coverage
+from dpf.coverage import (
+    NOT_BACKED_UP,
+    NOT_IN_OTHER,
+    ONLY_IN_BACKUP,
+    Coverage,
+    same_drive_warnings,
+    stale_warnings,
+)
 from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
     BACKUP,
@@ -126,6 +143,16 @@ def _build_parser() -> argparse.ArgumentParser:
     f.add_argument(
         "--mtime-tolerance", type=float, default=2.0, metavar="SEC",
         help="max modification-time difference for a name/date match (default: 2)",
+    )  # fmt: skip
+    f.add_argument(
+        "--strict-time", action="store_true",
+        help="mode 1: dates must match within the tolerance; by default copies whose dates "
+        "differ by whole hours (1-14 h, time zones/DST) also match",
+    )  # fmt: skip
+    f.add_argument(
+        "--category", choices=[*CATEGORIES, ALL], default=ALL,
+        help="report only personal media, only other media (folders listed under "
+        "[categories] other in the pools file), or all (default: all)",
     )  # fmt: skip
     f.add_argument("--ignore-size", action="store_true", help="mode 1: don't require equal size")
     f.add_argument("--ignore-mtime", action="store_true", help="mode 1: don't compare dates")
@@ -363,6 +390,17 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         print("dpf: mode 2/3 (content comparison) is not implemented yet", file=sys.stderr)
         return 2
 
+    cats = _load_categories(args)
+    if cats is None:
+        return 1
+    if args.category != ALL and not cats:
+        print(
+            f"dpf: --category {args.category} needs [categories] other patterns in "
+            f"{args.pools_file or default_pools_path()}",
+            file=sys.stderr,
+        )  # fmt: skip
+        return 1
+    category = cats if cats else None
     plans = _coverage_plans(idx, targets, pools, args)
     if plans is None:
         return 1
@@ -398,7 +436,17 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         for t in targets:  # taken from the index, like an unplugged drive
             t.offline |= kept.keys() & set(t.roots)
 
+    warned: set[str] = set()
+
+    def warn(messages: list[str]) -> list[str]:
+        for m in messages:
+            if m not in warned:
+                warned.add(m)
+                print(f"dpf: warning: {m}", file=sys.stderr)
+        return messages
+
     runs: list[_PoolRun] = []
+    status_of: dict[int, list[dict]] = {}
     for t in targets:
         groups = list(
             find_name_duplicates(
@@ -407,22 +455,39 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
                 ignore_size=args.ignore_size,
                 ignore_mtime=args.ignore_mtime,
                 exact_names=args.exact_names,
+                hour_shift=not args.strict_time,
             )
         )  # fmt: skip
+        if args.category != ALL:
+            groups = [g for g in groups if _group_category(cats, g) == args.category]
         result = group_duplicates(
             groups, idx.list_dir, idx.subdirs, idx.dir_extras,
             roots=t.roots, near=args.near, tree_totals=lambda d: idx.totals([d]),
+            category=category,
         )  # fmt: skip
+        if args.category != ALL:
+            result = result.only(args.category)
         files, nbytes = idx.totals(t.roots)
+        status = _root_status(idx, t.roots, t.offline, scanned, category)
+        status_of[id(t)] = status
         summary = {
             "mode": MODE_TITLES[mode],
             "basis": _basis(args),
             **({"pool": t.name} if t.name else {}),
             "roots": t.roots,
-            "root_status": _root_status(idx, t.roots, t.offline, scanned),
+            "root_status": status,
             "files": files,
             "bytes": nbytes,
         }
+        if category is not None:
+            summary["categories"] = _sum_tallies(status)
+            summary["category_patterns"] = list(cats.other)
+        if args.category != ALL:
+            summary["category"] = args.category
+        if t.pool is not None:
+            found = warn(same_drive_warnings(t.roots, t.name))
+            if found:
+                summary["warnings"] = found
         runs.append(_PoolRun(t, groups, result, summary))
 
     coverages: list[Coverage] = []
@@ -433,12 +498,17 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             pool=plan.target.name, other=plan.other.name, direction=plan.direction,
             mtime_tolerance=args.mtime_tolerance, ignore_size=args.ignore_size,
             ignore_mtime=args.ignore_mtime, exact_names=args.exact_names,
+            hour_shift=not args.strict_time, category=category, only=args.category,
         )  # fmt: skip
         offline = plan.in_run.offline if plan.in_run else {
             r for r in plan.roots if not os.path.isdir(r)
         }  # fmt: skip
         cov.other_status = _root_status(idx, plan.roots, offline, scanned)
         cov.never_scanned = plan.never_scanned
+        cov.warnings = warn(
+            stale_warnings(status_of[id(plan.target)], cov)
+            + same_drive_warnings(plan.roots, plan.other.name)
+        )
         cov.elapsed = time.monotonic() - began
         coverages.append(cov)
 
@@ -449,7 +519,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
     }
     missing_path = os.path.join(out, "missing.csv")
     if coverages:
-        write_missing_csv(coverages, missing_path)
+        write_missing_csv(coverages, missing_path, category)
         paths["missing_csv_path"] = missing_path
     elif os.path.exists(missing_path):
         os.remove(missing_path)  # stale, from an earlier run into the same --out
@@ -465,7 +535,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
 
     if len(runs) == 1:
         run = runs[0]
-        write_csv(run.groups, paths["csv_path"])
+        write_csv(run.groups, paths["csv_path"], category)
         summary = {**run.summary, **paths}
         if not args.no_xlsx and _write_xlsx(
             xlsx_path, run.result, run.groups, summary, coverages=coverages
@@ -476,12 +546,15 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         write_json(run.result, summary, paths["json_path"], coverage=coverages)
         parts = [format_text(run.result, summary, **text_opts)]
     else:
-        write_pool_csv([(r.target.name or "", r.groups) for r in runs], paths["csv_path"])
+        write_pool_csv(
+            [(r.target.name or "", r.groups) for r in runs], paths["csv_path"], category
+        )
         summary = {
             "mode": MODE_TITLES[mode],
             "basis": _basis(args),
             "pools": [r.target.name for r in runs],
             "elapsed": elapsed,
+            **({"category": args.category} if args.category != ALL else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
@@ -599,9 +672,16 @@ def _plan(
 
 
 def _root_status(
-    idx: Index, roots: list[str], offline: set[str], scanned: dict[str, RootStats]
+    idx: Index,
+    roots: list[str],
+    offline: set[str],
+    scanned: dict[str, RootStats],
+    category: Categories | None = None,
 ) -> list[dict]:
-    """Per root: whether it was scanned now or taken from the index, and when."""
+    """Per root: whether it was scanned now or taken from the index, and when.
+
+    With `category`, also its personal and other media (files and bytes).
+    """
     status = []
     for r in roots:
         files, nbytes = idx.totals([r])
@@ -610,11 +690,39 @@ def _root_status(
         else:
             stats = idx.containing_root(r)
             source, when = FROM_INDEX, stats and stats.scanned_at
-        status.append({
+        entry = {
             "root": r, "status": source, "connected": r not in offline,
             "scanned_at": when, "files": files, "bytes": nbytes,
-        })  # fmt: skip
+        }  # fmt: skip
+        if category is not None:
+            for c, (n, b) in tally(idx, [r], category).items():
+                entry[f"{c}_files"], entry[f"{c}_bytes"] = n, b
+        status.append(entry)
     return status
+
+
+def _sum_tallies(status: list[dict]) -> dict[str, dict[str, int]]:
+    """{category: {"files", "bytes"}} summed over root_status entries."""
+    return {
+        c: {
+            "files": sum(e[f"{c}_files"] for e in status),
+            "bytes": sum(e[f"{c}_bytes"] for e in status),
+        }
+        for c in CATEGORIES
+    }
+
+
+def _group_category(cats: Categories, group: DuplicateGroup) -> str:
+    return of_dirs(cats, {f.dir for f in group.files})
+
+
+def _load_categories(args: argparse.Namespace) -> Categories | None:
+    """[categories] of the pools file (empty without one); None after an error message."""
+    try:
+        return load_categories(args.pools_file)
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return None
 
 
 def _drives(idx: Index, args: argparse.Namespace) -> int:
@@ -628,11 +736,14 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         print("nothing indexed yet; run `dpf scan PATH`")
         return 0
     pools = _pools_for_drives(args.pools_file)
+    cats = _categories_for_drives(args.pools_file) if pools else Categories()
     spaces = [r.space for r in known]
     by_hand = any(sp and sp.source == SPACE_MANUAL for sp in spaces)
-    dated = any(_space_date(r) for r in known)
-    header = ["Drive / folder", "Files", "Media size", "Used on drive", "Capacity"]
-    header += ["Space as of"] if dated else []
+    dated = [r for r in known if _space_date(r)]
+    space_column = bool(dated) and not cats  # no room for it beside the category columns
+    header = ["Drive / folder", "Files", "Media size"]
+    header += ["Personal", "Other media"] if cats else []
+    header += ["Used on drive", "Capacity"] + (["Space as of"] if space_column else [])
     header += ["Last scanned", "Connected"] + (["Pool"] if pools else [])
     rows = [tuple(header)]
     connected = 0
@@ -640,8 +751,12 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         files, nbytes = idx.totals([r.root])
         online = os.path.isdir(r.root)
         connected += online
-        row = [r.root, f"{files:,}", human_bytes(nbytes), *_space_cells(sp, by_hand)]
-        row += [_space_date(r)] if dated else []
+        row = [r.root, f"{files:,}", human_bytes(nbytes)]
+        if cats:
+            split = tally(idx, [r.root], cats)
+            row += [human_bytes(split[PERSONAL][1]), human_bytes(split[OTHER][1])]
+        row += _space_cells(sp, by_hand)
+        row += [_space_date(r)] if space_column else []
         row += [scan_date(r.scanned_at), "yes" if online else "no"]
         row += [", ".join(pools_of(pools, r.root)) or "—"] if pools else []
         rows.append(tuple(row))
@@ -659,6 +774,15 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         line += f"; {used} used of {capacity} on {plural(len(drives), 'drive')}"
         line += " (partial)" if missing else ""
     print(f"\n{line}")
+    if cats:
+        print("Personal / Other media: media sizes by [categories] in the pools file")
+        if dated:  # the Space as of column made way for the category columns
+            dates = sorted(_space_date(r) for r in dated)
+            span = dates[0] if dates[0] == dates[-1] else f"{dates[0]} to {dates[-1]}"
+            print(
+                f"Used/Capacity of {plural(len(dated), 'drive')} recorded after the last scan "
+                f"({span})"
+            )
     if by_hand:
         print("* entered by hand (dpf space --set)")
     if any(sp and sp.is_mount is False for sp in spaces):
@@ -848,6 +972,15 @@ def _pools_for_drives(path: str | None) -> Pools:
         return {}
 
 
+def _categories_for_drives(path: str | None) -> Categories:
+    """[categories] for the drives table; empty (no columns) when unset or unreadable."""
+    try:
+        return load_categories(path)
+    except PoolError as e:
+        print(f"dpf: warning: {e}", file=sys.stderr)
+        return Categories()
+
+
 def _print_table(rows: list[tuple[str, ...]], left: Collection[int], indent: str = "") -> None:
     """Print aligned columns; columns in `left` are left-aligned, the rest right-aligned."""
     widths = [max(len(row[c]) for row in rows) for c in range(len(rows[0]))]
@@ -1016,10 +1149,11 @@ def _write_xlsx(
 def _basis(args: argparse.Namespace) -> str:
     from dpf.match_name import basis
 
-    text = basis(
-        exact_names=args.exact_names, ignore_size=args.ignore_size, ignore_mtime=args.ignore_mtime
-    )
-    return text if args.ignore_mtime else f"{text} ±{args.mtime_tolerance:g}s"
+    return basis(
+        exact_names=args.exact_names, ignore_size=args.ignore_size,
+        ignore_mtime=args.ignore_mtime, tolerance=args.mtime_tolerance,
+        hour_shift=not args.strict_time,
+    )  # fmt: skip
 
 
 def _offline_root(idx: Index, path: str) -> str:

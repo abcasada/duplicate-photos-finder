@@ -3,27 +3,33 @@
 This is the one comparison between pools (duplicates are never searched across pools).
 A file "has a copy" in the other pool when mode 1, run over both pools together, would
 group it with a file of the other pool: same match_key (or exact name), same size and
-mtime within the tolerance, under the same copy-number and renamed-series rules
-(match_name.bucket_groups). Where the file sits in the other pool does not matter.
+mtime within the tolerance (or whole hours apart, give or take the tolerance), under the
+same copy-number and renamed-series rules (match_name.bucket_groups). Where the file
+sits in the other pool does not matter.
 
-Clusters are anchored as in mode 1, so a file is only called backed up when a file of
-the other pool is within the tolerance of it; in doubt it is reported missing. Contents
-are not compared: a renamed-and-re-saved copy (different size) counts as missing.
+Groups are built as in mode 1, so a file is only called backed up when a file of the
+other pool matches it directly; in doubt it is reported missing. Contents are not
+compared: a renamed-and-re-saved copy (different size) counts as missing. Only media
+files are compared; other files (sidecars, edits, catalogs) are counted, never checked.
 
 Missing files are reported per folder, in runs of consecutive missing files (natural
 order), and a tree whose compared files are all missing becomes one line. Roll-up never
-climbs above the scanned roots. 0-byte files are not compared and only counted.
+climbs above the scanned roots, nor across a category boundary (categories), so each
+entry is wholly personal or wholly other media. 0-byte files are not compared and only
+counted.
 """
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
+from dpf.categories import ALL, CATEGORIES, OTHER, PERSONAL, Category
 from dpf.grouping import Run, beside_sibling, natural_key
 from dpf.index import Index
-from dpf.match_name import basis, bucket_groups
+from dpf.match_name import basis, bucket_groups, hour_offsets, shifts_hours
 from dpf.models import FileRecord
 
 NOT_BACKED_UP = "not_backed_up"  # the other pool is the backup of this one
@@ -49,6 +55,7 @@ class MissingFolder:
     whole_tree: bool = False
     unindexed: int = 0  # entries not indexed (non-media, unreadable) in the folder or tree
     similar: int = 0  # missing files with a similarly named file of another size/date there
+    category: str = PERSONAL
 
 
 @dataclass(slots=True)
@@ -72,6 +79,12 @@ class Coverage:
     other_status: list[dict] = field(default_factory=list)  # report.root_lines entries
     never_scanned: list[str] = field(default_factory=list)  # other-pool members not indexed
     elapsed: float = 0.0
+    shifted: int = 0  # files counted as copied only through a whole-hour time shift
+    unindexed: int = 0  # entries not indexed (non-media, unreadable) under roots: not compared
+    unindexed_dirs: int = 0  # folders holding them
+    by_category: dict[str, dict[str, int]] = field(default_factory=dict)  # see check_coverage
+    category: str = ALL  # the category shown (--category); ALL for both
+    warnings: list[str] = field(default_factory=list)  # e.g. a stale index of the other pool
 
     @property
     def missing_dirs(self) -> int:
@@ -93,14 +106,18 @@ class Coverage:
 
 
 def basis_words(
-    *, exact_names: bool = False, ignore_size: bool = False, ignore_mtime: bool = False
+    *,
+    exact_names: bool = False,
+    ignore_size: bool = False,
+    ignore_mtime: bool = False,
+    hour_shift: bool = False,
 ) -> str:
     """E.g. "similar name, size and date" for the caveat line."""
     parts = ["name" if exact_names else "similar name"]
     if not ignore_size:
         parts.append("size")
     if not ignore_mtime:
-        parts.append("date")
+        parts.append("date (or a date whole hours apart)" if hour_shift else "date")
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
@@ -120,16 +137,19 @@ def find_missing(
     ignore_size: bool = False,
     ignore_mtime: bool = False,
     exact_names: bool = False,
-) -> tuple[list[FileRecord], Counter[str], set[str]]:
+    hour_shift: bool = True,
+) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str]]:
     """Non-empty files under `roots` with no copy under `other_roots`.
 
     Returns (missing files, compared files per dir, paths of the missing files whose
-    name key does occur under `other_roots`, with another size or date). `roots` and
-    `other_roots` must not overlap.
+    name key does occur under `other_roots` with another size or date, and per dir the
+    files whose only copies differ from them by whole hours). `roots` and `other_roots`
+    must not overlap.
     """
     missing: list[FileRecord] = []
     similar: set[str] = set()
     totals: Counter[str] = Counter()
+    shifted: Counter[str] = Counter()
     other_keys = index.name_keys(other_roots, exact_names=exact_names)
     buckets = index.coverage_buckets(
         roots, other_roots, by_size=not ignore_size, exact_names=exact_names
@@ -147,15 +167,22 @@ def find_missing(
         covered: set[int] = set()
         for group in bucket_groups(
             [f for f, _ in bucket], mtime_tolerance=mtime_tolerance,
-            ignore_mtime=ignore_mtime, exact_names=exact_names,
+            ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift,
         ):  # fmt: skip
-            if any(id(f) in others for f in group):
-                covered.update(id(f) for f in group)
+            if not any(id(f) in others for f in group):
+                continue
+            covered.update(id(f) for f in group)
+            hours = () if ignore_mtime else hour_offsets(group)
+            if hours:
+                there = {h for f, h in zip(group, hours) if id(f) in others}
+                for f, h in zip(group, hours):
+                    if id(f) not in others and h not in there:
+                        shifted[f.dir] += 1
         left = [f for f in mine if id(f) not in covered]
         missing += left
         similar.update(f.path for f in left)
     missing.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
-    return missing, totals, similar
+    return missing, totals, similar, shifted
 
 
 def roll_up(
@@ -165,6 +192,7 @@ def roll_up(
     list_dir: Callable[[str], list[FileRecord]],
     extras: dict[str, int] | None = None,
     similar: set[str] | None = None,
+    category: Category | None = None,
 ) -> list[MissingFolder]:
     """Missing files as folder entries, largest first.
 
@@ -173,11 +201,15 @@ def roll_up(
     scanned `roots`. Every other folder with missing files gets an entry with its runs.
     `totals` counts compared files per folder (as find_missing returns); `extras` maps
     folders to entries that were not indexed; `similar` holds the paths of missing files
-    with a similarly named file in the other pool (counted per entry).
+    with a similarly named file in the other pool (counted per entry). With `category`,
+    a whole tree holds folders of one category only, and each entry carries it.
     """
     extras = extras or {}
     similar = similar or set()
     chain = _Ancestry(roots)
+
+    def cat(d: str) -> str:
+        return category(d) if category is not None else PERSONAL
 
     miss: Counter[str] = Counter()
     miss_bytes: Counter[str] = Counter()
@@ -196,6 +228,7 @@ def roll_up(
     sub_folders: Counter[str] = Counter()
     sub_extra: Counter[str] = Counter()
     sub_near: Counter[str] = Counter()
+    mixed: set[str] = set()  # trees holding compared files of another category than their top
     for d in set(totals) | set(extras):
         for a in chain(d):
             if totals[d]:
@@ -204,10 +237,12 @@ def roll_up(
                 sub_bytes[a] += miss_bytes[d]
                 sub_folders[a] += 1
                 sub_near[a] += near[d]
+                if category is not None and cat(d) != cat(a):
+                    mixed.add(a)
             sub_extra[a] += extras.get(d, 0)
 
     def full(a: str) -> bool:
-        return sub_total[a] > 0 and sub_miss[a] == sub_total[a]
+        return sub_total[a] > 0 and sub_miss[a] == sub_total[a] and a not in mixed
 
     tops = set()
     for a in sub_total:
@@ -220,7 +255,7 @@ def roll_up(
     entries = [
         MissingFolder(
             a, sub_miss[a], sub_total[a], sub_bytes[a], (), sub_folders[a], True, sub_extra[a],
-            sub_near[a],
+            sub_near[a], cat(a),
         )  # fmt: skip
         for a in tops
     ]
@@ -231,7 +266,7 @@ def roll_up(
         entries.append(
             MissingFolder(
                 d, miss[d], totals[d], miss_bytes[d], _runs(list_dir(d), only),
-                unindexed=extras.get(d, 0), similar=near[d],
+                unindexed=extras.get(d, 0), similar=near[d], category=cat(d),
             )
         )  # fmt: skip
     entries.sort(key=lambda e: (-e.bytes, e.dir))
@@ -329,20 +364,115 @@ def check_coverage(
     ignore_size: bool = False,
     ignore_mtime: bool = False,
     exact_names: bool = False,
+    hour_shift: bool = True,
+    category: Category | None = None,
+    only: str = ALL,
 ) -> Coverage:
-    """Find and roll up the files under `roots` that have no copy under `other_roots`."""
-    missing, totals, similar = find_missing(
+    """Find and roll up the files under `roots` that have no copy under `other_roots`.
+
+    Raises ValueError when a root of one side equals or lies inside a root of the other.
+    With `category`, `by_category` holds per category the compared, missing and shifted
+    files and missing bytes; `only` (PERSONAL or OTHER) keeps the files of one category.
+    """
+    for r in roots:
+        for o in other_roots:
+            if _related(r, o):
+                raise ValueError(f"coverage roots overlap: {r} and {o}")
+    missing, totals, similar, shifted = find_missing(
         index, roots, other_roots, mtime_tolerance=mtime_tolerance, ignore_size=ignore_size,
-        ignore_mtime=ignore_mtime, exact_names=exact_names,
+        ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift,
     )  # fmt: skip
-    folders = roll_up(
-        missing, totals, roots, index.list_dir, index.extras_under(roots), similar
-    )
+    extras = index.extras_under(roots)
+
+    def cat(d: str) -> str:
+        return category(d) if category is not None else PERSONAL
+
+    by_category = {c: {"files": 0, "missing": 0, "missing_bytes": 0, "shifted": 0}
+                   for c in CATEGORIES}  # fmt: skip
+    for d, n in totals.items():
+        by_category[cat(d)]["files"] += n
+    for f in missing:
+        by_category[cat(f.dir)]["missing"] += 1
+        by_category[cat(f.dir)]["missing_bytes"] += f.size
+    for d, n in shifted.items():
+        by_category[cat(d)]["shifted"] += n
+    if only != ALL:
+        missing = [f for f in missing if cat(f.dir) == only]
+        totals = Counter({d: n for d, n in totals.items() if cat(d) == only})
+        shifted = Counter({d: n for d, n in shifted.items() if cat(d) == only})
+        extras = {d: n for d, n in extras.items() if cat(d) == only}
+        similar = {p for p in similar if cat(p.rsplit("/", 1)[0] or "/") == only}
+    folders = roll_up(missing, totals, roots, index.list_dir, extras, similar, category)
     nbytes = index.totals(roots)[1]
+    shift = not ignore_mtime and shifts_hours(mtime_tolerance, hour_shift)
     flags = {"exact_names": exact_names, "ignore_size": ignore_size, "ignore_mtime": ignore_mtime}
-    how = basis(**flags) + ("" if ignore_mtime else f" ±{mtime_tolerance:g}s")
-    return Coverage(
-        pool, other, direction, list(roots), list(other_roots), how, basis_words(**flags),
-        sum(totals.values()), nbytes, missing, similar, sum(f.size for f in missing),
-        index.empty_files(roots), folders,
+    how = basis(**flags, tolerance=mtime_tolerance, hour_shift=hour_shift)
+    cov = Coverage(
+        pool, other, direction, list(roots), list(other_roots), how,
+        basis_words(**flags, hour_shift=shift), sum(totals.values()), nbytes, missing,
+        similar, sum(f.size for f in missing), index.empty_files(roots), folders,
     )  # fmt: skip
+    cov.shifted = sum(shifted.values())
+    cov.unindexed = sum(extras.values())
+    cov.unindexed_dirs = len(extras)
+    cov.by_category = by_category if category is not None else {}
+    cov.category = only
+    return cov
+
+
+def _related(x: str, y: str) -> bool:
+    x, y = x.rstrip("/") or "/", y.rstrip("/") or "/"
+    return x == y or "/" in (x, y) or x.startswith(y + "/") or y.startswith(x + "/")
+
+
+STALE_AFTER = 86_400  # seconds between scans before the other pool is called out of date
+
+
+def stale_warnings(target_status: Sequence[dict], cov: Coverage) -> list[str]:
+    """Warnings for roots of the other pool scanned over a day before this pool's newest scan.
+
+    Files deleted from them since still count as copies, so coverage may look better
+    than it is. Entries are report.root_lines dicts (root, scanned_at).
+    """
+    times = [e["scanned_at"] for e in target_status if e.get("scanned_at") is not None]
+    if not times:
+        return []
+    from dpf.report import scan_date
+
+    newest = max(times)
+    return [
+        f"pool {cov.other}'s index may be out of date: {e['root']} last scanned "
+        f"{scan_date(e['scanned_at'])}; files deleted since then still count as copies"
+        for e in cov.other_status
+        if e.get("scanned_at") is not None and newest - e["scanned_at"] > STALE_AFTER
+    ]
+
+
+_COPY_SUFFIX = re.compile(r" \(\d+\)$")
+
+
+def drive_label(root: str) -> str:
+    """A root's last path segment, casefolded, minus a trailing " (N)" (a re-mounted label)."""
+    name = (root.rstrip("/") or "/").rsplit("/", 1)[-1]
+    return _COPY_SUFFIX.sub("", name).casefold()
+
+
+def same_drive_warnings(roots: Sequence[str], pool: str | None) -> list[str]:
+    """Warnings for indexed roots of one pool that look like the same drive.
+
+    "Storage 1B 4TB" and "Storage 1B 4TB (2)" are usually one drive mounted under two
+    labels: both indexes count, so deleted files may linger in the older one.
+    """
+    seen: dict[str, str] = {}
+    out = []
+    what = f"pool {pool}" if pool else "these folders"
+    for r in roots:
+        label = drive_label(r)
+        if label in seen and seen[label] != r:
+            out.append(
+                f"{what}: {seen[label]} and {r} look like the same drive (labels differ only "
+                "by case or a trailing \" (N)\"); forget the stale one with `dpf drives --forget`"
+            )
+        else:
+            seen.setdefault(label, r)
+    return out

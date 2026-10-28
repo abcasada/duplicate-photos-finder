@@ -25,3 +25,18 @@ B = ["/run/media/adam/Storage [0-9]B *"]
 # report folder (one report.xlsx with a sheet set per pool).
 [backups]
 B = "A"
+
+# Optional: media that is not personal (films, TV recordings, downloads, Plex libraries).
+# Every indexed photo/video is "personal" unless its folder, or a folder above it, matches
+# an `other` pattern. Patterns use the pool syntax (* never spans '/') but ignore case. An
+# absolute pattern is anchored at '/'; a relative one matches at any depth: "*/Plex*" is
+# any folder named Plex... below another folder, "_Torrents" any folder named _Torrents.
+# Reports then tally personal and other media, list other media in its own section (and a
+# Category column in report.xlsx), and `dpf find --category personal` shows only personal
+# media. `dpf drives` gains Personal / Other media columns.
+[categories]
+other = [
+    "*/Plex*",
+    "*/_Torrents",
+    "/run/media/adam/Storage 2A 8TB/Films",
+]

@@ -35,6 +35,8 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Smarter mode 1 names (copy suffixes, camera numbers in renamed files) | ✅ Done |
 | Backup coverage between pools (`[backups]`; files with no copy in the backup) | ✅ Done |
 | Several pools in one run and one workbook (`--pool A --pool B`) | ✅ Done |
+| Copies whose dates moved by whole hours (time zones, DST) match (`--strict-time` turns it off) | ✅ Done |
+| Personal vs other media (`[categories]`, `--category`) | ✅ Done |
 | Mode 1b: EXIF (camera serial + shutter count) | 📋 Next: researched and benchmarked, not built |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
@@ -46,7 +48,7 @@ Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md
 
 | Mode | What counts as a duplicate | Speed | Status |
 |---|---|---|---|
-| `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; files renamed with a date before their camera number still match), same extension, same size, modification time within 2 s. `--exact-names` requires identical names | Seconds: reads only folder listings | ✅ available |
+| `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; files renamed with a date before their camera number still match), same extension, same size, modification time within 2 s or whole hours apart (time zones, DST). `--exact-names` requires identical names, `--strict-time` no hour shifts | Seconds: reads only folder listings | ✅ available |
 | `1b` (planned) | Same camera body serial + shutter count (from EXIF), so renamed or re-downloaded copies are caught and RAW+JPG pairs are recognised as one shot | ~50 min per large drive the first time (reads each file's header), cached afterwards | 📋 next |
 | `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 📋 planned |
 | `3` / `both` | Mode 1 report first, then mode 2 automatically | | 📋 planned |
@@ -129,11 +131,17 @@ dpf find --mode 1 --ignore-size --pool A
 # Stricter matching: identical names only (no copy-mark / camera-number matching)
 dpf find --mode 1 --exact-names --pool A
 
+# Stricter dates: no whole-hour (time zone / DST) shifts
+dpf find --mode 1 --strict-time --pool A
+
+# Personal photos/videos only (needs [categories] in the pools file), or other media only
+dpf find --mode 1 --category personal --pool A --pool B
+
 # Plain paths work too, instead of --pool (not together with it)
 dpf find --mode 1 /run/media/adam/Storage\ 1TB
 
-# What's in the index: files, media size, used/total space of each drive, last scan,
-# which drives are plugged in, and which pool each belongs to
+# What's in the index: files, media size (personal / other with [categories]), used/total
+# space of each drive, last scan, which drives are plugged in, and which pool each belongs to
 dpf drives
 
 # Record used/total space of connected indexed drives without scanning them
@@ -144,6 +152,45 @@ dpf space --pool B             # or: dpf space PATH...; no argument = all connec
 A report run with `--pool` names the pool in its header. `dpf drives` shows each drive's
 pool in a Pool column; a drive matching several pools lists them all, which means the
 patterns overlap and should be fixed: `scan`/`find --pool` refuse to run until it is.
+
+When two indexed drives of one pool look like the same drive (labels equal apart from case
+or a trailing ` (N)`, e.g. `Storage 1B 4TB` and `Storage 1B 4TB (2)`), `find` warns on
+stderr and in the report: both indexes count, so remove the stale one with
+`dpf drives --forget`.
+
+### Personal and other media
+
+Films, TV recordings, downloads and Plex libraries are not part of the photo archive. List
+their folders in the pools file and dpf keeps them apart:
+
+```toml
+[categories]
+other = ["*/Plex*", "*/_Torrents", "/run/media/adam/Storage 2A 8TB/Films"]
+```
+
+Every indexed photo/video is **personal** unless its folder, or a folder above it, matches
+an `other` pattern. Patterns use the pool syntax (`*` never spans a `/`) but ignore case;
+an absolute pattern is anchored at `/`, a relative one matches at any depth (`*/Plex*` is
+any folder named `Plex…` below another folder). Without the table everything is personal
+and the reports look as before. With it:
+
+- The report header tallies both: `Categories:  personal 440,548 files, 20.7 TB; other
+  media 61,066 files, 1.4 TB` (per drive on the workbook's Summary sheet).
+- The text report lists personal duplicates first and other media in its own section
+  (`--- Other media (folders listed under [categories] other): … ---`), each with its own
+  tree overview, folder pairs and same-folder groups. A folder pair is other media only
+  when **both** folders are, so a personal photo copied into a media folder stays
+  personal. A matching tree is never rolled up across a category boundary.
+- Coverage sections split their totals (`personal: … missing of … compared`, `other
+  media: …`) and list personal folders first; a whole missing tree is always one
+  category.
+- report.xlsx has a filterable **Category** column on the Trees, Folder pairs, Sequences,
+  Same folder, Files and coverage sheets; files.csv, missing.csv and report.json carry a
+  `category` too.
+- `--category personal` (or `other`) limits a `find` to one category; the tallies still
+  show both.
+- `dpf drives` adds **Personal** and **Other media** size columns. To keep the table
+  within 150 columns its "Space as of" column is then replaced by one footer line.
 
 ### Backup coverage
 
@@ -162,9 +209,17 @@ duplicates are still searched within one pool at a time.
 
 - **What counts as a copy:** the mode 1 rule, applied across the two pools. Same similar
   name (or exact name with `--exact-names`), same size (unless `--ignore-size`), mtime
-  within `--mtime-tolerance` (unless `--ignore-mtime`), and the same copy-number rules
-  (`X (1)` is never a copy of `X (2)`). Where the copy sits in the other pool does not
-  matter. Contents are not compared, so a renamed-and-re-saved copy counts as missing.
+  within `--mtime-tolerance` or whole hours apart (unless `--strict-time`; see [How mode 1
+  compares dates](#how-mode-1-compares-dates)), and the same copy-number rules (`X (1)` is
+  never a copy of `X (2)`). Where the copy sits in the other pool does not matter.
+  Contents are not compared, so a renamed-and-re-saved copy counts as missing. The totals
+  say how many files only count as copied through an hour shift.
+- **Media files only.** Sidecars, edits, catalogs and other non-media files are never
+  compared; the totals end with `955,175 other files (non-media) in 202,969 folders are
+  not compared by this check — sidecars/edits/catalogs may exist only on this side`.
+- **Out-of-date index warning:** when a drive of the other pool was last scanned more than
+  a day before this pool's newest scan, the section (and stderr) warns that files deleted
+  from it since still count as copies. Rescan it to be sure.
 - **The other pool comes from the index**, never scanned by this run, so its drives can
   stay unplugged. The section lists its drives with their scan dates. A member that was
   never scanned (a connected drive or a literal path not in the index) is named in the
@@ -179,20 +234,22 @@ duplicates are still searched within one pool at a time.
   lists them all.
 - **"with a similar name there"**: missing files whose name *does* occur in the other
   pool, but with another size or date. They are usually an edited version (e.g. RAW/DNG
-  files re-saved with metadata, a few kB larger), a copy whose time stamp moved by whole
-  hours (time-zone/DST handling of the copying tool), or simply another photo with the
-  same camera number. Check them before relying on either side.
+  files re-saved with metadata, a few kB larger), or simply another photo with the same
+  camera number. Check them before relying on either side.
 - 0-byte files are not compared and are counted separately. Percentages are rounded
   down.
 
 ```
 Not backed up — no copy anywhere in pool B
 ==========================================
-Compared:       pool B is the backup of pool A; similar name+size+mtime ±2s
+Compared:       pool B is the backup of pool A; similar name+size+mtime ±2s (or whole hours)
 Pool B:         /run/media/adam/Storage 2B 8TB   (from index, scanned 2026-10-25 15:46, not connected)
                 …
-Not backed up:  292,454 files, 5.0 TB, in 43,497 folders (+ 93 empty files not compared)
-                58% of the 501,521 files compared in pool A
+Warning:        pool B's index may be out of date: /run/media/adam/Storage 3B 8TB last scanned 2026-10-24 21:20; files deleted since then still count as copies
+Not backed up:  286,012 files, 4.3 TB, in 43,480 folders (+ 93 empty files not compared)
+                57% of the 501,521 media files compared in pool A
+                6,442 files count as copied only through a whole-hour time shift (time zone or DST copies)
+                955,175 other files (non-media) in 202,969 folders are not compared by this check — sidecars/edits/catalogs may exist only on this side
 
 [1]   553.9 GB  /…/Storage 4A 8TB/Plex New/_dl   (whole tree missing from B: 28 folders, 659 files, 553.9 GB)
 [6]   133.8 GB  /…/Storage 1A 4TB/Photography/2021/7-NDII   (3,060 of 3,124 files missing from B; 3,060 with a similar name there)
@@ -202,7 +259,8 @@ Not backed up:  292,454 files, 5.0 TB, in 43,497 folders (+ 93 empty files not c
 Options: `--no-coverage` skips the check; `--coverage-against POOL` picks the other pool
 explicitly (also for a run on plain PATHs, e.g. "which files of this card dump are not in
 pool A yet?"). Each coverage run adds `missing.csv`: one row per missing file with its
-pool, the pool it is missing from, path, size, mtime, kind and `similar_name_there`.
+pool, the pool it is missing from, path, size, mtime, kind, `similar_name_there` and
+`category`.
 
 ### Drive space
 
@@ -217,7 +275,8 @@ call after its walk. In the table:
   not shown, and it is left out of the totals.
 - `*`: entered by hand (see below).
 - A **Space as of** column appears when a drive's space was recorded at a different time
-  than its last scan.
+  than its last scan (a footer line instead when [categories](#personal-and-other-media)
+  add the Personal / Other media columns).
 
 The totals line sums media size over all roots, and used/capacity over the drives that
 have space data, marked `(partial)` while some drives have none.
@@ -378,7 +437,7 @@ summarised separately.
 
 #### How mode 1 compares names
 
-The report header says `matched on similar name+size+mtime ±2s`. "Similar name" means:
+The report header says `matched on similar name+size+mtime ±2s (or whole hours)`. "Similar name" means:
 
 - **Case is ignored.**
 - **Copy marks are ignored:** ` (1)`, ` - Copy`, ` - Copy (2)`, ` copy`, `Copy of `, `~2`,
@@ -397,6 +456,31 @@ The report header says `matched on similar name+size+mtime ±2s`. "Similar name"
 Camera file numbers repeat: Sony `DSC` numbering restarts every 10,000 shots and is shared
 by two bodies. That is why size and date must still match. Empty (0-byte) files are never
 matched. `--exact-names` switches back to identical names only.
+
+#### How mode 1 compares dates
+
+Two files' modification times match when they differ by at most `--mtime-tolerance`
+(default 2 s), **or by a whole number of hours, 1 to 14, give or take the tolerance**
+(header: `±2s (or whole hours)`). Copies made across time zones or a DST change keep the
+photo but shift its mtime by whole hours: on the author's archive thousands of copies are
++1 h, −1 h or −6 h apart (e.g. Sony clips stamped in UTC on the card and in local time on
+the computer). `--strict-time` turns the hour rule off.
+
+- **No chaining.** Every two files of a group must match under the rule, not just
+  neighbours. Files within the tolerance of each other always stay together; such
+  clusters are then merged across whole hours only when all their files' times, taken
+  modulo one hour, lie within the tolerance of each other and the group spans at most
+  14 hours. So `t`, `t+1h` and `t+2h` form one group (each pair is a whole-hour shift),
+  while `t`, `t+1h+1.5s` and `t+2h+3s` do not: the third is 3 s off from `t`.
+- **Marked in the report.** A pair or run whose matches needed a shift says so:
+  `; time shifted +1 h` (B's dates are one hour later than A's), the header counts the
+  groups that rely on a shift, and report.xlsx has a **Time shift** column on Trees,
+  Folder pairs and Sequences (and "Hours after first" per file on the Files sheet;
+  `hour_shift` in files.csv).
+- **Risk.** Formats whose size is fixed by the image dimensions (uncompressed RAW, BMP)
+  give different photos with the same number and size; a whole-hour coincidence then
+  reads as a copy (e.g. theme bitmaps of two colours, one hour apart). Check one-file
+  `time shifted` runs before deleting.
 
 ## Why another tool? (research summary, Oct 2026)
 

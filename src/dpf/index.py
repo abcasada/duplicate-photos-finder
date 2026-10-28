@@ -416,6 +416,14 @@ class Index:
         ).fetchone()
         return count, total
 
+    def dir_totals(self, roots: Sequence[str]) -> Iterator[tuple[str, int, int]]:
+        """(dir, file count, total bytes) for every folder holding indexed files under `roots`."""
+        where, params = _prefix_clause(roots)
+        yield from self.conn.execute(
+            f"SELECT dir, count(*), coalesce(sum(size), 0) FROM files WHERE {where} GROUP BY dir",
+            params,
+        )
+
     def name_buckets(
         self, roots: Sequence[str], *, by_size: bool = True, exact_names: bool = False
     ) -> Iterator[list[FileRecord]]:

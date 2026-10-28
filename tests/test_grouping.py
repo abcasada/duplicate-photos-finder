@@ -764,3 +764,91 @@ class SimilarNamesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HourShiftGroupingTest(unittest.TestCase):
+    """Pairs and runs carry the whole-hour offsets (B after A) their matches relied on."""
+
+    def test_pair_and_run_offsets(self):
+        a = [rec("/a", f"IMG_{n}.JPG", 10 + n) for n in range(1, 7)]
+        b = [rec("/b", f"IMG_{n}.JPG", 10 + n, mtime=1_000_000.0 + (3600 if n > 3 else 0))
+             for n in range(1, 7)]  # fmt: skip
+        f = Fixture(a + b)
+        groups = [
+            DuplicateGroup((x, y), "t", (0, 1) if y.mtime != x.mtime else ())
+            for x, y in zip(a, b)
+        ]
+        p = f.run(groups).pairs[0]
+        self.assertEqual(p.relation, IDENTICAL)
+        self.assertEqual(p.hour_shift, (1,))
+        self.assertEqual(p.runs[0].hour_shift, (1,))  # one run, files 4-6 shifted
+
+    def test_offset_sign_and_unshifted_copy(self):
+        x = rec("/a", "x.jpg", mtime=10_000.0)
+        y = rec("/b", "x.jpg", mtime=10_000.0 - 6 * 3600)
+        z = rec("/c", "x.jpg", mtime=10_000.0)
+        f = Fixture([x, y, z])
+        # sorted by path: /a (+6 h after /b's), /b (earliest), /c (+6 h)
+        result = f.run([DuplicateGroup((x, y, z), "t", (6, 0, 6))])
+        pairs = pair_map(result)
+        self.assertEqual(pairs[("/a", "/b")].hour_shift, (-6,))
+        self.assertEqual(pairs[("/b", "/c")].hour_shift, (6,))
+        self.assertEqual(pairs[("/a", "/c")].hour_shift, ())
+        self.assertEqual(result.hour_shift_groups, 1)
+
+    def test_shift_survives_tree_roll_up(self):
+        recs, groups = [], []
+        for sub in ("x", "y"):
+            for n in range(3):
+                a = rec(f"/a/T/{sub}", f"{n}.jpg", 10 + n)
+                b = rec(f"/b/T/{sub}", f"{n}.jpg", 10 + n, mtime=1_000_000.0 + 3600)
+                recs += [a, b]
+                groups.append(DuplicateGroup((a, b), "t", (0, 1)))
+        (p,) = Fixture(recs).run(groups).pairs
+        self.assertEqual((p.relation, p.dir_a, p.hour_shift), (IDENTICAL_TREE, "/a", (1,)))
+
+
+class CategoryGroupingTest(unittest.TestCase):
+    def setUp(self):
+        from dpf.categories import Categories
+
+        self.cats = Categories(["Plex"])
+
+    def test_pairs_tagged(self):
+        from dpf.categories import OTHER, PERSONAL
+
+        records = imgs("/a/Plex", range(3)) + imgs("/b/Plex/x", range(3)) + imgs("/c/Photos", [0])
+        result = Fixture(records).run(category=self.cats)
+        pairs = pair_map(result)
+        self.assertEqual(pairs[("/a/Plex", "/b/Plex/x")].category, OTHER)
+        self.assertEqual(pairs[("/a/Plex", "/c/Photos")].category, PERSONAL)
+        self.assertEqual(pairs[("/b/Plex/x", "/c/Photos")].category, PERSONAL)
+        other = result.only(OTHER)
+        self.assertEqual([(p.dir_a, p.dir_b) for p in other.pairs], [("/a/Plex", "/b/Plex/x")])
+        self.assertEqual(len(result.only(PERSONAL).pairs), 2)
+        self.assertEqual(Fixture(records).run().pairs[0].category, PERSONAL)
+
+    def test_roll_up_stops_at_category_boundary(self):
+        from dpf.categories import OTHER, PERSONAL
+
+        records = []
+        for top in ("/a/T", "/b/T"):
+            records += imgs(f"{top}/Photos", range(3)) + imgs(f"{top}/Plex", range(10, 13))
+        plain = Fixture(records).run()
+        self.assertEqual([p.relation for p in plain.pairs], [IDENTICAL_TREE])
+        result = Fixture(records).run(category=self.cats)
+        got = {(p.dir_a, p.relation, p.category) for p in result.pairs}
+        self.assertEqual(got, {
+            ("/a/T/Photos", IDENTICAL, PERSONAL),
+            ("/a/T/Plex", IDENTICAL, OTHER),
+        })  # fmt: skip
+
+    def test_same_folder_and_trees(self):
+        from dpf.categories import OTHER, PERSONAL
+
+        records = imgs("/d/Plex", [1]) + [rec("/d/Plex", "IMG_0001 (1).JPG")]
+        group = DuplicateGroup(tuple(records), "t")
+        result = Fixture(records).run([group], category=self.cats)
+        self.assertEqual(result.category_of(group), OTHER)
+        self.assertEqual(result.only(PERSONAL).same_folder, [])
+        self.assertEqual(result.only(OTHER).same_folder, [group])

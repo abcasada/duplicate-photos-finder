@@ -23,10 +23,23 @@ class FileRecord:
 
 @dataclass(frozen=True, slots=True)
 class DuplicateGroup:
-    """Files judged to be copies of each other. `basis` says how, e.g. "name+size+mtime"."""
+    """Files judged to be copies of each other. `basis` says how, e.g. "name+size+mtime".
+
+    `hours` gives, per file (in `files` order), the whole hours its mtime lies after the
+    earliest file's, when the copies differ by a whole-hour time shift; () when none do.
+    """
 
     files: tuple[FileRecord, ...]
     basis: str
+    hours: tuple[int, ...] = ()
+
+    @property
+    def hour_shift(self) -> bool:
+        """True if some files only match the others across a whole-hour time shift."""
+        return any(self.hours)
+
+    def hour_of(self, i: int) -> int:
+        return self.hours[i] if self.hours else 0
 
     @property
     def size(self) -> int:

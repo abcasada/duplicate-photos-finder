@@ -10,6 +10,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from datetime import datetime
 from decimal import Decimal
 
+from dpf.categories import ALL, CATEGORIES, OTHER, PERSONAL, TITLES, Category, of_dirs
 from dpf.coverage import (
     NOT_BACKED_UP,
     ONLY_IN_BACKUP,
@@ -43,6 +44,7 @@ TREE_TOP = 20
 
 CSV_FIELDS = (
     "group_id", "basis", "path", "dir", "name", "size", "mtime", "kind", "same_names",
+    "hour_shift", "category",
 )  # fmt: skip
 SKIPPED_SHOWN = 3
 SIMILAR_NAMES = "similar names"
@@ -91,6 +93,16 @@ PAIR_LABELS = {
 
 def plural(n: int, word: str) -> str:
     return f"{n:,} {word}" if n == 1 else f"{n:,} {word}s"
+
+
+def shift_text(hours: Sequence[int]) -> str:
+    """E.g. "time shifted +1 h" or "time shifted -6 h, +1 h" (B's dates after A's)."""
+    return "time shifted " + ", ".join(f"{h:+d} h" for h in hours)
+
+
+def shift_cell(hours: Sequence[int]) -> str:
+    """E.g. "+1 h" or "-6 h, +1 h"; "" for no shift."""
+    return ", ".join(f"{h:+d} h" for h in hours)
 
 
 
@@ -192,6 +204,8 @@ def _describe(p: FolderPair, near: float = DEFAULT_NEAR) -> str:
         text += f"; near-identical: {cover}, {plural(only[0], 'file')} only in {only[1]}"
     if p.similar_names:
         text += f"; {SIMILAR_NAMES}"
+    if p.hour_shift:
+        text += f"; {shift_text(p.hour_shift)}"
     if p.unindexed:
         text += f"; {plural(p.unindexed, 'other file')} not compared"
     return text
@@ -213,6 +227,8 @@ def _describe_tree(t: TreePair) -> str:
         f"{tree_label(t)}: {_coverage(t.matched_a, t.total_a, t.matched_b, t.total_b)}, "
         f"{plural(t.folders, 'folder pair')}, {plural(t.matched_a, 'file')}"
     )
+    if t.hour_shift:
+        text += f"; {shift_text(t.hour_shift)}"
     if t.unindexed:
         text += f"; {plural(t.unindexed, 'other file')} not compared"
     return text
@@ -271,6 +287,8 @@ def run_lines(
             line = f"{line.rstrip()}  ({skipped_note(r.skipped, skipped_label)})"
         if not r.same_names:
             line += f"  → in B: {_span(r.b_first, r.b_last)}"
+        if r.hour_shift:
+            line = f"{line.rstrip()}  ({shift_text(r.hour_shift)})"
         lines.append(line.rstrip())
     rest = runs[max_runs:]
     if rest:
@@ -364,7 +382,9 @@ def format_text(
     """Folder-level report. Never lists every file; the CSV/JSON hold that detail.
 
     A tree overview of up to `tree_top` tree pairs precedes the folder pairs. `footer`
-    adds the lines naming the per-file reports (footer_lines).
+    adds the lines naming the per-file reports (footer_lines). With categories
+    (summary["categories"]), personal media comes first and other media follows in its
+    own section; summary["category"] may limit the report to one of them.
     """
     out: list[str] = ["dpf duplicate report", ""]
     out.append(f"Mode:        {summary.get('mode', '?')}; matched on {summary.get('basis', '?')}")
@@ -378,18 +398,76 @@ def format_text(
         f"Scanned:     {plural(summary.get('files', 0), 'file')}, "
         f"{human_bytes(summary.get('bytes', 0))}"
     )
+    tallies = summary.get("categories")
+    if tallies:
+        out.append(f"{'Categories:':<13}{category_tally(tallies)}")
+    only = summary.get("category", ALL)
+    if only != ALL:
+        out.append(f"{'Showing:':<13}{TITLES[only].lower()} only (--category {only})")
     out.append(
         f"Duplicates:  {plural(result.groups, 'group')}; could free "
         f"~{human_bytes(result.redundant_bytes)} by keeping one copy of each"
     )
+    if result.hour_shift_groups:
+        out.append(f"{'':<13}{hour_shift_note(result.hour_shift_groups)}")
     if result.capped_groups:
         out.append(
             f"             {plural(result.capped_groups, 'group')} spread over very many "
             "folders were paired only with their first folder"
         )
+    for warning in summary.get("warnings", ()):
+        out.append(f"{'Warning:':<13}{warning}")
     out.append(f"Elapsed:     {duration(summary.get('elapsed', 0.0))}")
     out.append("")
 
+    opts = {"top": top, "min_files": min_files, "max_runs": max_runs, "tree_top": tree_top}
+    if not tallies:
+        out.extend(_body(result, **opts))
+    else:
+        for cat in CATEGORIES:
+            if only not in (ALL, cat):
+                continue
+            part = result.only(cat)
+            out.append(_section_title(cat, part))
+            out.append("")
+            if cat == OTHER and not (part.pairs or part.same_folder):
+                out.extend(["No duplicates among other media.", ""])
+                continue
+            out.extend(_body(part, **opts))
+
+    if footer:
+        out.extend(footer_lines(summary))
+    return "\n".join(out) + "\n"
+
+
+def category_tally(tallies: dict) -> str:
+    """E.g. "personal 1,234 files, 5.6 TB; other media 99 files, 1.2 TB"."""
+    return "; ".join(
+        f"{'personal' if c == PERSONAL else 'other media'} "
+        f"{plural(tallies[c]['files'], 'file')}, {human_bytes(tallies[c]['bytes'])}"
+        for c in CATEGORIES
+        if c in tallies
+    )
+
+
+def hour_shift_note(n: int, what: str = "group") -> str:
+    """E.g. "12 groups rely on a whole-hour time shift (time zone or DST copies)"."""
+    verb = "relies" if n == 1 else "rely"
+    return f"{plural(n, what)} {verb} on a whole-hour time shift (time zone or DST copies)"
+
+
+def _section_title(cat: str, part: GroupingResult) -> str:
+    title = f"--- {TITLES[cat]}"
+    if cat == OTHER:
+        title += " (folders listed under [categories] other)"
+    return f"{title}: {plural(len(part.pairs), 'folder pair')} ---"
+
+
+def _body(
+    result: GroupingResult, *, top: int | None, min_files: int, max_runs: int, tree_top: int
+) -> list[str]:
+    """Tree overview, folder pairs and same-folder duplicates."""
+    out: list[str] = []
     overview, tags = _tree_overview(result.trees, tree_top, result.near)
     out.extend(overview)
 
@@ -438,10 +516,7 @@ def format_text(
         if len(ranked) > _SAME_FOLDER_TOP:
             out.append(f"  … and {plural(len(ranked) - _SAME_FOLDER_TOP, 'more folder')}")
         out.append("")
-
-    if footer:
-        out.extend(footer_lines(summary))
-    return "\n".join(out) + "\n"
+    return out
 
 
 def footer_lines(summary: dict) -> list[str]:
@@ -458,7 +533,8 @@ def footer_lines(summary: dict) -> list[str]:
 
 def _group_files(g: DuplicateGroup) -> list[dict]:
     return [
-        {"path": f.path, "size": f.size, "mtime": f.mtime, "kind": f.kind} for f in g.files
+        {"path": f.path, "size": f.size, "mtime": f.mtime, "kind": f.kind, "hour_shift": h}
+        for f, h in zip(g.files, g.hours or (0,) * len(g.files))
     ]
 
 
@@ -469,6 +545,7 @@ def report_data(result: GroupingResult, summary: dict) -> dict:
         "groups": result.groups,
         "redundant_bytes": result.redundant_bytes,
         "capped_groups": result.capped_groups,
+        "hour_shift_groups": result.hour_shift_groups,
         "near": result.near,
         "trees": [dataclasses.asdict(t) for t in result.trees],
         "pairs": [dataclasses.asdict(p) for p in result.pairs],
@@ -478,6 +555,7 @@ def report_data(result: GroupingResult, summary: dict) -> dict:
                 "same_names": g.same_names,
                 "size": g.size,
                 "redundant_bytes": g.redundant_bytes,
+                "category": result.category_of(g),
                 "files": _group_files(g),
             }
             for g in result.same_folder
@@ -525,18 +603,28 @@ def _iso(mtime: float) -> str:
     return datetime.fromtimestamp(mtime).astimezone().isoformat(timespec="seconds")
 
 
-def write_csv(groups: Iterable[DuplicateGroup], path: str) -> int:
-    """One row per file of every group; returns the number of groups written."""
+def write_csv(
+    groups: Iterable[DuplicateGroup], path: str, category: Category | None = None
+) -> int:
+    """One row per file of every group; returns the number of groups written.
+
+    `hour_shift` is the file's whole-hour offset from the group's earliest file (0 for
+    most), `category` the group's (categories.of_dirs).
+    """
     n = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(CSV_FIELDS)
         for n, g in enumerate(groups, 1):
-            w.writerows(_group_rows(n, g))
+            w.writerows(_group_rows(n, g, category))
     return n
 
 
-def write_pool_csv(pools: Sequence[tuple[str, Iterable[DuplicateGroup]]], path: str) -> int:
+def write_pool_csv(
+    pools: Sequence[tuple[str, Iterable[DuplicateGroup]]],
+    path: str,
+    category: Category | None = None,
+) -> int:
     """write_csv for several pools, with a leading "pool" column; group ids restart per pool."""
     total = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -544,15 +632,19 @@ def write_pool_csv(pools: Sequence[tuple[str, Iterable[DuplicateGroup]]], path: 
         w.writerow(("pool", *CSV_FIELDS))
         for name, groups in pools:
             for n, g in enumerate(groups, 1):
-                w.writerows((name, *row) for row in _group_rows(n, g))
+                w.writerows((name, *row) for row in _group_rows(n, g, category))
                 total += 1
     return total
 
 
-def _group_rows(n: int, g: DuplicateGroup) -> Iterator[tuple]:
+def _group_rows(n: int, g: DuplicateGroup, category: Category | None = None) -> Iterator[tuple]:
     same = "yes" if g.same_names else "no"
-    for f in g.files:
-        yield (n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind, same)
+    cat = of_dirs(category, {f.dir for f in g.files})
+    for i, f in enumerate(g.files):
+        yield (
+            n, g.basis, f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind, same,
+            g.hour_of(i), cat,
+        )  # fmt: skip
 
 
 # -- backup coverage ---------------------------------------------------------------
@@ -560,6 +652,7 @@ def _group_rows(n: int, g: DuplicateGroup) -> Iterator[tuple]:
 COVERAGE_TOP = 50
 MISSING_CSV_FIELDS = (
     "pool", "missing_from", "path", "dir", "name", "size", "mtime", "kind", "similar_name_there",
+    "category",
 )  # fmt: skip
 
 
@@ -615,8 +708,43 @@ def similar_note(cov: Coverage) -> str:
     )
 
 
+def unindexed_note(cov: Coverage) -> str:
+    """The pool-level line about other (non-media) files, which coverage never compares."""
+    return (
+        f"{plural(cov.unindexed, 'other file')} (non-media) in "
+        f"{plural(cov.unindexed_dirs, 'folder')} {'is' if cov.unindexed == 1 else 'are'} not "
+        "compared by this check — sidecars/edits/catalogs may exist only on this side"
+    )
+
+
+def shifted_note(cov: Coverage) -> str:
+    n = cov.shifted
+    return (
+        f"{plural(n, 'file')} {'counts' if n == 1 else 'count'} as copied only through a "
+        "whole-hour time shift (time zone or DST copies)"
+    )
+
+
+def coverage_category_lines(cov: Coverage) -> list[str]:
+    """E.g. "personal: 1,200 files, 4.1 TB missing of 300,000 compared (0%)", per category."""
+    lines = []
+    for c in CATEGORIES:
+        if cov.category not in (ALL, c) or c not in cov.by_category:
+            continue
+        e = cov.by_category[c]
+        lines.append(
+            f"{'personal' if c == PERSONAL else 'other media'}: "
+            f"{plural(e['missing'], 'file')}, {human_bytes(e['missing_bytes'])} missing of "
+            f"{e['files']:,} compared ({_percent(e['missing'], e['files'])})"
+        )
+    return lines
+
+
 def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: int = 8) -> str:
-    """One coverage section: header, totals, then folders largest first (never every file)."""
+    """One coverage section: header, totals, then folders largest first (never every file).
+
+    With categories, personal folders come first and other media follows in its own part.
+    """
     out = [cov.title, "=" * len(cov.title)]
     out.append(f"{'Compared:':<16}{coverage_relation(cov)}; {cov.basis or '?'}")
     lines = root_lines({"root_status": cov.other_status, "roots": cov.other_roots})
@@ -630,7 +758,11 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
             f"{cov.other} never scanned, so files only there are not counted as copies:"
         )
         out.extend(f"{'':<18}{p}" for p in cov.never_scanned)
+    for warning in cov.warnings:
+        out.append(f"{'Warning:':<16}{warning}")
     out.append(f"{'':<16}{caveat(cov.basis_words)}")
+    if cov.category != ALL:
+        out.append(f"{'Showing:':<16}{TITLES[cov.category].lower()} only")
     head = {NOT_BACKED_UP: "Not backed up", ONLY_IN_BACKUP: "Only in backup"}.get(
         cov.direction, f"Not in {cov.other}"
     )
@@ -638,18 +770,47 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
     mine = f"pool {cov.pool}" if cov.pool else "these folders"
     out.append(
         f"{'':<16}{_percent(len(cov.missing), cov.files)} of the "
-        f"{plural(cov.files, 'file')} compared in {mine}"
+        f"{plural(cov.files, 'media file')} compared in {mine}"
     )
+    out.extend(f"{'':<16}{line}" for line in coverage_category_lines(cov))
+    if cov.shifted:
+        out.append(f"{'':<16}{shifted_note(cov)}")
     if cov.similar:
         out.append(f"{'':<16}{similar_note(cov)}")
+    if cov.unindexed:
+        out.append(f"{'':<16}{unindexed_note(cov)}")
     out.append("")
     if not cov.folders:
         out.append(
-            f"Every compared file has a copy in pool {cov.other}." if cov.files
+            f"Every compared media file has a copy in pool {cov.other}." if cov.files
             else "No files to compare."
         )  # fmt: skip
         return "\n".join(out) + "\n"
-    shown = cov.folders if top is None else cov.folders[: max(top, 0)]
+    if not cov.by_category:
+        out.extend(_missing_lines(cov, cov.folders, top, max_runs))
+        return "\n".join(out) + "\n"
+    for c in CATEGORIES:
+        if cov.category not in (ALL, c):
+            continue
+        part = [m for m in cov.folders if m.category == c]
+        title = f"--- {TITLES[c]}"
+        if c == OTHER:
+            title += " (folders listed under [categories] other)"
+        out.append(f"{title}: {plural(len(part), 'folder')} ---")
+        out.append("")
+        if not part:
+            out.extend(["Nothing missing.", ""])
+            continue
+        out.extend(_missing_lines(cov, part, top, max_runs))
+        out.append("")
+    return "\n".join(out).rstrip("\n") + "\n"
+
+
+def _missing_lines(
+    cov: Coverage, folders: list[MissingFolder], top: int | None, max_runs: int
+) -> list[str]:
+    out = []
+    shown = folders if top is None else folders[: max(top, 0)]
     num_w = len(f"[{len(shown)}]")
     for n, m in enumerate(shown, 1):
         num = f"[{n}]".ljust(num_w)
@@ -657,14 +818,14 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
         if m.runs and m.missing < m.total:
             label = f"with a copy in {cov.other}"
             out.extend(run_lines(m.runs, max_runs, skipped_label=label))
-    rest = cov.folders[len(shown):]
+    rest = folders[len(shown):]
     if rest:
         files = sum(m.missing for m in rest)
         out.append(
             f"… {plural(len(rest), 'more folder')} ({plural(files, 'file')}, "
             f"{human_bytes(sum(m.bytes for m in rest))}) not shown (coverage top {top})"
         )
-    return "\n".join(out) + "\n"
+    return out
 
 
 def coverage_data(cov: Coverage) -> dict:
@@ -680,19 +841,27 @@ def coverage_data(cov: Coverage) -> dict:
         "roots": cov.roots,
         "other_roots": cov.other_status or cov.other_roots,
         "never_scanned": cov.never_scanned,
+        "warnings": cov.warnings,
+        "category": cov.category,
         "files_compared": cov.files,
         "bytes": cov.bytes,
         "missing_files": len(cov.missing),
         "missing_bytes": cov.missing_bytes,
         "missing_folders": cov.missing_dirs,
         "similar_name_files": len(cov.similar),
+        "hour_shift_files": cov.shifted,
         "empty_files": cov.empty,
+        "other_files_not_compared": cov.unindexed,
+        "other_files_folders": cov.unindexed_dirs,
+        "by_category": cov.by_category,
         "elapsed": cov.elapsed,
         "folders": [dataclasses.asdict(m) for m in cov.folders],
     }
 
 
-def write_missing_csv(coverages: Iterable[Coverage], path: str) -> int:
+def write_missing_csv(
+    coverages: Iterable[Coverage], path: str, category: Category | None = None
+) -> int:
     """One row per missing file of every coverage section; returns the rows written."""
     n = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
@@ -703,7 +872,8 @@ def write_missing_csv(coverages: Iterable[Coverage], path: str) -> int:
                 path = f.path
                 w.writerow(
                     (cov.pool or "", cov.other, path, f.dir, f.name, f.size, _iso(f.mtime),
-                     f.kind, "yes" if path in cov.similar else "no")
+                     f.kind, "yes" if path in cov.similar else "no",
+                     category(f.dir) if category else PERSONAL)
                 )  # fmt: skip
                 n += 1
     return n
