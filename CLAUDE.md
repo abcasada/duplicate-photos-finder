@@ -279,8 +279,7 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.
 
-- **Mode 1b, EXIF shot matching (2026-10-31, built and reviewed; not yet run on real
-  data):** `dpf exif [PATH… | --pool NAME]` caches EXIF of photos (not videos) in the
+- **Mode 1b, EXIF shot matching (2026-10-31, built, reviewed, run on 1A/1B):** `dpf exif [PATH… | --pool NAME]` caches EXIF of photos (not videos) in the
   `exif` table (schema v6 CREATE TABLE; v7 recreates a table without `shutter_mode`,
   i.e. one written by the first, pre-review build); `find --mode 1b` matches by shot
   first, else mode 1 (README "Mode 1b"). Rules: same shot = same make, model, body serial
@@ -329,6 +328,15 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
    that ImageWidth is the same for an original and its Lightroom re-saved DNG, and that
    Sony `Shutter` is present on the A7R IV files. Not done: video identity (videos are
    not read).
+   - **Done 2026-10-31 for 1A and 1B:** the user ran `dpf exif` on both (every photo
+     cached; index backed up first as `index.v5-backup-20261031.db`, then
+     `index.v7-backup-20261031.db` before v8). `find --mode 1b --no-scan --pool A --pool B`
+     (82 s): only copy 4.8 TB → 1.8 TB, name match 3.1 TB → 560 GB, unique across all
+     drives 18.5 → 17.4 TB; A not in B 239,478 files / 2.4 TB (43,936 copied only as the
+     same shot, 1.3 TB of them re-saved at another size); 418 files in pool A dropped by
+     the burst guard. 4A/4B had been rescanned by the user the same day (4A only copy now
+     104 GB). Old SMART report imported (12 readings). Still to do: `dpf exif` on the
+     other drives (2A/2B/3A/3B/4B, and 4A only if the user asks), a real `dpf smart` run.
    - **First `dpf smart` run** (after the running `dpf exif` finishes: any dpf command
      migrates the index to v8 on open). Back up `index.db`, then
      `dpf smart --import ~/apps/smart-summary/smart_report.json` and `dpf smart` with the
