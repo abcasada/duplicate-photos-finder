@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -123,7 +125,7 @@ class SmartReadCliTest(CliFixture):
         self.fake.as_root = os.geteuid() == 0
         self.fake.smart[("-a", "/dev/sda")] = ata("/dev/sda", "WD-1A", pending=1)
         self.fake.smart[("-a", "-d", "sat", "/dev/sdb")] = ata("/dev/sdb", "WD-CA13ZBDK")
-        self.media = os.path.join(self.tmp, "media")
+        self.media = os.path.join(os.path.realpath(self.tmp), "media")
         self.mounts = [
             ("/dev/sda1", os.path.join(self.media, "Storage 1A 4TB")),
             ("/dev/loop24p2", os.path.join(self.media, "Storage 4A 8TB")),
@@ -211,19 +213,42 @@ class SmartReadCliTest(CliFixture):
             return real_index(*args, **kwargs)
 
         self.fake.as_root = True
-        env = {"SUDO_UID": str(os.getuid()), "HOME": "/root"}
+        env = {"SUDO_UID": str(os.getuid()), "HOME": "/root", "XDG_CACHE_HOME": "/root/.cache"}
+        pools = os.path.join(self.tmp, "pools.toml")  # given explicitly: honoured
         with mock.patch.dict(os.environ, env), \
                 mock.patch("os.geteuid", return_value=0), \
                 mock.patch("os.initgroups", lambda *a: events.append("initgroups")), \
                 mock.patch("os.setgid", lambda *a: events.append("setgid")), \
                 mock.patch("os.setuid", lambda *a: events.append("setuid")), \
                 mock.patch("dpf.cli.Index", index):  # fmt: skip
-            code, _, err = self.run_cli("smart")
-            home = os.environ["HOME"]
+            code, _, err = self.run_cli("--pools-file", pools, "smart")
+            after = dict(os.environ)
         self.assertEqual(code, 0, err)
         self.assertEqual(events, ["initgroups", "setgid", "setuid", "index"])
-        self.assertNotEqual(home, "/root")
+        self.assertNotEqual(after["HOME"], "/root")
+        self.assertNotIn("XDG_CACHE_HOME", after)
+        self.assertNotIn("XDG_CONFIG_HOME", after)
         self.assertFalse(any(c[0] == "sudo" for c in self.fake.calls))
+
+
+class LauncherTest(unittest.TestCase):
+    def test_no_bytecode_written_as_root(self):
+        """bin/dpf run as root (sudo dpf smart) must not leave root-owned __pycache__."""
+        launcher = os.path.join(os.path.dirname(__file__), "..", "bin", "dpf")
+        code = (
+            "import os, runpy, sys\n"
+            "os.geteuid = lambda: {euid}\n"
+            "sys.argv = ['dpf', '--version']\n"
+            "try:\n    runpy.run_path(sys.argv0, run_name='__main__')\n"
+            "except SystemExit:\n    pass\n"
+            "print(sys.dont_write_bytecode)\n"
+        )  # fmt: skip
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+        for euid, expected in ((0, "True"), (1000, "False")):
+            script = code.format(euid=euid).replace("sys.argv0", repr(launcher))
+            proc = subprocess.run([sys.executable, "-c", script], capture_output=True,
+                                  text=True, env=env)  # fmt: skip
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], expected, proc.stderr)
 
 
 if __name__ == "__main__":
