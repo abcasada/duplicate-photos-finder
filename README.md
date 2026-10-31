@@ -373,6 +373,33 @@ coverage sheets; `report.json` is `{"summary", "pools": {"A": …, "B": …}, "c
 `files.csv` and `missing.csv` have a `pool` column. Each pool is still searched on its
 own: no duplicate pair ever spans two pools.
 
+### Drive summary and personal totals
+
+Every report (unless `--category` limits it) has a **Drives** section: at the top of a
+combined `--pool A --pool B` report, after the duplicates in a single-pool one, and as a
+**Drives** sheet in report.xlsx. One row per drive, then pool and overall totals:
+
+```
+Drive               Pool  Capacity    Used      Free   Photos  Videos   Media  Personal   Other  Not media  Only copy  Name match  Scanned
+Storage 4A 8TB      A       8.0 TB  5.1 TB*   2.9 TB  112,186   8,285  4.0 TB    3.0 TB  1.0 TB     1.1 TB   673.0 GB    159.7 GB  2026-10-27
+```
+
+- **Capacity / Used / Free** come from `dpf space` or the last scan (`*` entered by hand,
+  `—` not recorded, `+` on a total that leaves such drives out).
+- **Media** = indexed photos and videos, split into **Personal** and **Other** with
+  `[categories]`. **Not media** = used space minus media (other files and overhead).
+- **Only copy** = personal media with no copy on any other drive, in its pool or the
+  backup pool: what you would lose with that drive. It needs the coverage check, so it
+  appears when the pool has a `[backups]` partner. **Name match** is the part of it that
+  has a file of the same name in the other pool with another size or date, usually the
+  same photo re-saved with new metadata, so probably a copy after all (mode 1b/2 will
+  tell).
+
+Under the table: personal media per pool, in total and **unique** (each set of
+duplicates counted once), unique across all drives (a file in both A and B counts once),
+and the only-copy total. Matching is by name, size and date, so these lean high: a
+re-saved copy counts as another file, never the other way round.
+
 ### Reading the report
 
 The report starts with a **tree overview**, then lists every folder pair. Both are

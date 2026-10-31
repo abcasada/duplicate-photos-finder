@@ -31,6 +31,7 @@ from dpf.coverage import (
     same_drive_warnings,
     stale_warnings,
 )
+from dpf.overview import Overview, PoolInput, build_overview, format_overview
 from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
     BACKUP,
@@ -527,6 +528,15 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         cov.elapsed = time.monotonic() - began
         coverages.append(cov)
 
+    overview = None
+    if args.category == ALL:  # personal totals need every group
+        pool_inputs = [PoolInput(r.target.name or "", r.target.roots, r.groups) for r in runs]
+        # Loosened matching would count different files as copies: no only-copy figures.
+        loose = args.ignore_mtime or args.ignore_size
+        overview = build_overview(
+            idx, pool_inputs, [] if loose else coverages, cats, basis=_basis(args)
+        )
+
     os.makedirs(out, exist_ok=True)
     paths = {
         "csv_path": os.path.join(out, "files.csv"),
@@ -552,14 +562,18 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         run = runs[0]
         write_csv(run.groups, paths["csv_path"], category)
         summary = {**run.summary, **paths}
+        if overview is not None:
+            summary["overview"] = overview.to_json()
         if not args.no_xlsx and _write_xlsx(
-            xlsx_path, run.result, run.groups, summary, coverages=coverages
+            xlsx_path, run.result, run.groups, summary, coverages=coverages, overview=overview
         ):
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)  # a stale workbook from an earlier run into the same --out
         write_json(run.result, summary, paths["json_path"], coverage=coverages)
         parts = [format_text(run.result, summary, **text_opts)]
+        if overview is not None:
+            parts.append(_banner("Drives") + "\n" + format_overview(overview))
     else:
         write_pool_csv(
             [(r.target.name or "", r.groups) for r in runs], paths["csv_path"], category
@@ -570,10 +584,11 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             "pools": [r.target.name for r in runs],
             "elapsed": elapsed,
             **({"category": args.category} if args.category != ALL else {}),
+            **({"overview": overview.to_json()} if overview is not None else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
-                                            coverages=coverages):  # fmt: skip
+                                            coverages=coverages, overview=overview):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)
@@ -585,6 +600,8 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             f"dpf duplicate report: {', '.join(f'pool {r.target.name}' for r in runs)}\n"
             "Duplicates are searched within each pool, never between pools.\n"
         ]
+        if overview is not None:
+            parts.append(_banner("Drives") + "\n" + format_overview(overview))
         for r in runs:
             parts.append(_banner(f"Pool {r.target.name}"))
             parts.append(format_text(r.result, r.summary, **text_opts))
@@ -1177,16 +1194,17 @@ def _write_xlsx(
     *,
     runs: list[_PoolRun] | None = None,
     coverages: list[Coverage] | None = None,
+    overview: Overview | None = None,
 ) -> bool:
     """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
     from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
 
     try:
         if runs is None:
-            write_xlsx(result, groups or [], summary or {}, path, coverages or [])
+            write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview)
         else:
             sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
-            write_combined_xlsx(sheets, coverages or [], summary or {}, path)
+            write_combined_xlsx(sheets, coverages or [], summary or {}, path, overview)
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":
             raise

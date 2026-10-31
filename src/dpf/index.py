@@ -417,12 +417,25 @@ class Index:
         return count, total
 
     def dir_totals(self, roots: Sequence[str]) -> Iterator[tuple[str, int, int]]:
-        """(dir, file count, total bytes) for every folder holding indexed files under `roots`."""
+        """(dir, file count, total bytes) of the photos/videos of every folder under `roots`.
+
+        Files indexed with --all-files (kind 'other') are left out.
+        """
         where, params = _prefix_clause(roots)
         yield from self.conn.execute(
-            f"SELECT dir, count(*), coalesce(sum(size), 0) FROM files WHERE {where} GROUP BY dir",
+            f"SELECT dir, count(*), coalesce(sum(size), 0) FROM files "
+            f"WHERE {where} AND kind != 'other' GROUP BY dir",
             params,
         )
+
+    def kind_totals(self, roots: Sequence[str]) -> dict[str, tuple[int, int]]:
+        """kind -> (file count, total bytes) indexed under `roots`."""
+        where, params = _prefix_clause(roots)
+        rows = self.conn.execute(
+            f"SELECT kind, count(*), coalesce(sum(size), 0) FROM files WHERE {where} GROUP BY kind",
+            params,
+        )
+        return {kind: (n, b) for kind, n, b in rows}
 
     def name_buckets(
         self, roots: Sequence[str], *, by_size: bool = True, exact_names: bool = False

@@ -652,6 +652,17 @@ class CoverageCliTest(PoolsFixture):
         with open(os.path.join(self.out, name), newline="") as fh:
             return fh.read()
 
+    def test_drives_section_and_loose_matching(self):
+        self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
+        code, out, _ = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
+        self.assertEqual(code, 0)
+        self.assertIn("===== Drives =====", out)
+        self.assertIn("Only copy", out)
+        code, out, _ = self.run_cli("find", "-q", "--pool", "A", "--ignore-mtime", "-o", self.out)
+        self.assertEqual(code, 0)
+        self.assertIn("===== Drives =====", out)
+        self.assertNotIn("Only copy", out)  # different files could count as copies
+
     def test_pool_a_reports_not_backed_up(self):
         self.assertEqual(self.run_cli("scan", "-q", "--pool", "B")[0], 0)
         code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
@@ -679,7 +690,7 @@ class CoverageCliTest(PoolsFixture):
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertEqual(wb.names[-1], "A not in B")
-            self.assertEqual(wb.names[1], "Trees")
+            self.assertEqual(wb.names[1:3], ["Drives", "Trees"])
 
     def test_pool_b_from_index_reports_only_in_backup(self):
         self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
@@ -826,7 +837,7 @@ class CoverageCliTest(PoolsFixture):
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertEqual(wb.names, [
-                "Summary",
+                "Summary", "Drives",
                 "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
                 "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
                 "A not in B", "B not in A",
@@ -838,7 +849,8 @@ class CoverageCliTest(PoolsFixture):
         self.write_pools(f'A = ["{self.media}/Storage [0-9]A *"]', f'B = ["{self.b1}"]')
         code, out, err = self.run_cli("find", "-q", "--pool", "A", "-o", self.out)
         self.assertEqual((code, err), (0, ""))
-        self.assertNotIn("=====", out)
+        self.assertNotIn("===== Pool", out)
+        self.assertNotIn("Only copy", out)  # no coverage check, so no only-copy figures
         self.assertNotIn("Not backed up", out)
         self.assertEqual(self.read("files.csv").splitlines()[0], ",".join(CSV_FIELDS))
 

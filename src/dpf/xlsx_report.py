@@ -33,6 +33,7 @@ from dpf.grouping import (
     TreePair,
 )
 from dpf.models import DuplicateGroup
+from dpf.overview import Overview, personal_lines
 from dpf.report import (
     OFFLINE_NOTE,
     PAIR_LABELS,
@@ -97,6 +98,7 @@ def write_xlsx(
     summary: dict,
     path: str,
     coverage: Sequence[Coverage] = (),
+    overview: Overview | None = None,
 ) -> None:
     """Write report.xlsx. Raises ModuleNotFoundError if XlsxWriter is not installed.
 
@@ -109,12 +111,14 @@ def write_xlsx(
         fmt = _Formats(wb)
         summary_ws = wb.add_worksheet(SHEETS[0])
         used = {SHEETS[0].casefold()}
-        tables = _pool_tables(wb, fmt, result, groups, "", used)
+        drives = _drives_tables(wb, fmt, overview, used)
+        tables = drives + _pool_tables(wb, fmt, result, groups, "", used)
         tables += _coverage_tables(wb, fmt, coverage, used)
         for t in tables:
             t.finish()
         w = _SummaryWriter(summary_ws, fmt)
         w.title("dpf duplicate report")
+        _personal_block(w, overview)
         _pool_block(w, result, summary, elapsed=True)
         _coverage_block(w, coverage, tables)
         _sheet_list(w, tables)
@@ -123,7 +127,11 @@ def write_xlsx(
 
 
 def write_combined_xlsx(
-    pools: Sequence[PoolSheets], coverage: Sequence[Coverage], summary: dict, path: str
+    pools: Sequence[PoolSheets],
+    coverage: Sequence[Coverage],
+    summary: dict,
+    path: str,
+    overview: Overview | None = None,
 ) -> None:
     """One workbook for several pools: each pool's sheets prefixed with its name.
 
@@ -137,9 +145,10 @@ def write_combined_xlsx(
         fmt = _Formats(wb)
         summary_ws = wb.add_worksheet(SHEETS[0])
         used = {SHEETS[0].casefold()}
+        drives = _drives_tables(wb, fmt, overview, used)
         per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
         cov_tables = _coverage_tables(wb, fmt, coverage, used)
-        tables = [t for ts in per_pool for t in ts] + cov_tables
+        tables = drives + [t for ts in per_pool for t in ts] + cov_tables
         for t in tables:
             t.finish()
         w = _SummaryWriter(summary_ws, fmt)
@@ -149,6 +158,9 @@ def write_combined_xlsx(
         w.line("Elapsed", duration(summary.get("elapsed", 0.0)))
         w.line("", "Duplicates are searched within each pool, never between pools.")
         w.skip()
+        _personal_block(w, overview)
+        if drives:
+            _sheet_list(w, drives, title="Drive sheet")
         for p, ts in zip(pools, per_pool):
             w.heading(f"Pool {p.name}")
             _pool_block(w, p.result, p.summary, elapsed=False, basis=False)
@@ -174,6 +186,66 @@ def sheet_name(text: str, used: set[str]) -> str:
         name = base[: 31 - len(suffix)].rstrip() + suffix
     used.add(name.casefold())
     return name
+
+
+def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> list[_Table]:
+    """The Drives sheet (none without an overview): one row per drive, sizes in bytes."""
+    if ov is None:
+        return []
+    sole = any(d.sole_files is not None for d in ov.drives)
+    columns = [("Drive", None), ("Pool", 6), ("Capacity", 11), ("Used", 11), ("Free", 11),
+               ("Photos", 10), ("Videos", 9), ("Media size", 11)]  # fmt: skip
+    if ov.categories:
+        columns += [("Personal", 11), ("Other media", 11)]
+    columns += [("Not media", 11)]
+    if sole:
+        columns += [("Only copy files", 10), ("Only copy size", 11), ("Name match", 11)]
+    columns += [("Space", 10), ("Last scanned", 18)]
+    t = _Table(wb, fmt, sheet_name("Drives", used), columns, 1, kind="Drives")
+    for d in ov.drives:
+        if not t.next_row():
+            break
+        values: list[int | None] = [d.capacity, d.used, d.free]
+        c = 0
+        t.folder(c, d.root)
+        t.text(c + 1, d.pool)
+        for c, v in enumerate(values, 2):
+            if v is not None:
+                t.num(c, v, fmt.size)
+        t.num(5, d.photos)
+        t.num(6, d.videos)
+        t.num(7, d.media_bytes, fmt.size)
+        c = 8
+        if ov.categories:
+            t.num(c, d.personal_bytes or 0, fmt.size)
+            t.num(c + 1, d.other_bytes or 0, fmt.size)
+            c += 2
+        if d.not_media is not None:
+            t.num(c, d.not_media, fmt.size)
+        c += 1
+        if sole:
+            if d.sole_files is not None:
+                t.num(c, d.sole_files)
+                t.num(c + 1, d.sole_bytes or 0, fmt.size)
+                t.num(c + 2, d.sole_similar or 0, fmt.size)
+            c += 3
+        space = "by hand" if d.manual else "measured"
+        if d.capacity is None:
+            space = "folder" if d.folder else "not recorded"
+        t.text(c, space)
+        if d.scanned_at is not None:
+            t.ws.write_datetime(t.row, c + 1, datetime.fromtimestamp(d.scanned_at), fmt.date)
+    return [t]
+
+
+def _personal_block(w: _SummaryWriter, ov: Overview | None) -> None:
+    if ov is None or not ov.pools:
+        return
+    lines = personal_lines(ov)
+    w.heading(lines[0].split("  (")[0].rstrip(":"))
+    for line in lines[1:]:
+        w.line("", line.strip())
+    w.skip()
 
 
 def _pool_tables(
@@ -590,6 +662,7 @@ def _datetime(mtime: float) -> datetime | None:
 
 
 _SHEET_NOTES = {
+    "Drives": "each drive: space, photos/videos, personal media, only copies",
     "Trees": "tree overview: folder pairs grouped by the trees they sit in",
     "Folder pairs": "every pair of folders sharing duplicates, largest first",
     "Sequences": "one row per run of consecutive matched files",
