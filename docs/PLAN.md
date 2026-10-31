@@ -213,3 +213,16 @@ only verify the mode 1 candidates (fast), or do a full content scan?
   another without one: stricter than "equal when both have it", never seen on the
   target cameras); non-RAW keys include the pixel size so resized exports never match;
   a mode-1 group holding two shots is split, and its files without EXIF match neither.
+- **2026-10-31: review fixes for 1b.** Silent/electronic-shutter bursts share serial,
+  shutter count and second (Sony counts mechanical actuations; Pentax leaves out live
+  view), so: no identity when Sony `Shutter` is 0 0 0 or Pentax `ShutterType` electronic
+  / `LiveView` on, and an index-wide guard drops any shot key whose files carry
+  different camera numbers or two names in one folder. RAW keys now carry the pixel
+  size too (exiftool reports the full-resolution IFD for DNG/TIFF raws). Sony
+  `InternalSerialNumber` with -n is decimal bytes: kept as hex per byte. Videos are not
+  read. exiftool never opens an original: a 16 MB copy, then the whole file up to 256 MB,
+  all read with O_NOATIME (EPERM: skipped and counted, `--allow-atime` overrides); 60 s
+  watchdog per exiftool command (the batch is then retried file by file; failures are
+  not cached), I/O errors not cached, stale `/dev/shm/dpf-exif-*` removed. Same-shot
+  matches between files of different sizes are flagged on pairs/runs/trees and, in
+  coverage, listed per folder (text, "… re-saved" sheet, missing.csv `status`).

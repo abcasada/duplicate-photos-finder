@@ -433,38 +433,67 @@ up". Mode 1b proves such copies from the camera's own EXIF instead:
 #    first time, then only new or changed files). Ctrl-C keeps progress; rerun to resume.
 dpf exif --pool A
 dpf exif --pool B
-dpf exif "/run/media/adam/Storage 1A 4TB/Photography"   # or just a folder
+dpf exif "/run/media/adam/Storage 1A 4TB/Photography/2023"   # or a folder: a sample
 
 # 2. Report with mode 1b; works from the index, so drives may be unplugged
 dpf find --mode 1b --no-scan --pool A --pool B
 ```
 
+A PATH may be a folder inside a scanned drive, so a few hundred files can be tried
+first; `--db` (before `exif`) points dpf at another index, e.g. a copy.
+
 **What counts as the same shot.** Two files with the same camera make and model, the
 same body serial (Sony `InternalSerialNumber`; Pentax and other makes `SerialNumber`),
 the same shutter count and the same `DateTimeOriginal`, in the same format family
-(ARW, DNG, JPG, …; for non-RAW formats also the same pixel size). They match whatever
-their names, sizes and dates.
+(ARW, DNG, JPG, …) and the same pixel size (where exiftool reports one; JPG and other
+non-RAW files need one). They match whatever their names, sizes and dates.
+
+**When the shutter count cannot be trusted, there is no identity.** The Sony counter
+does not advance in silent (electronic) shooting and the Pentax counter not in live
+view, so the frames of such a burst share serial, count and second:
+- `dpf exif` gives no identity to a frame whose camera records a silent/electronic
+  shutter (Sony `Shutter` = 0 0 0, Pentax `ShutterType` = electronic or `LiveView` on);
+- and a guard drops any shot identity found on files with different camera numbers
+  (`DSC01000` and `DSC01001`) or under two names in one folder, wherever they are
+  indexed. A copy renamed without a camera number (`Hawaii-001.ARW`) does not trip it.
+  The report counts such files ("share a shot identity with differently numbered or
+  named files"); they fall back to mode 1.
 
 - **Proves:** the two files come from the same press of the shutter on the same camera
   body, in the same format. A re-saved DNG/ARW matches its original.
 - **Does not prove:** identical contents. The report says "same shot", never
-  "identical", and counts how many matches differ in size ("re-saved / metadata
-  differs"). A full-size edited JPG export that keeps the camera's EXIF is the same shot
-  as the camera JPG. Mode 2 will compare contents.
+  "identical". Pairs, runs and trees holding a same-shot match between files of
+  different sizes say `same shot, sizes differ` (and the Sizes differ column in the
+  workbook): those copies were re-saved, so their contents differ. A full-size edited
+  JPG export that keeps the camera's EXIF is the same shot as the camera JPG. Mode 2
+  will compare contents.
+- **Backed up as another version.** In backup coverage, files counted as copied only
+  through a same-shot file of another size are listed per folder ("Copied only as the
+  same shot, sizes differ"), in a "… re-saved" sheet and in `missing.csv` with status
+  `same shot, size differs`: the backup holds the shot, not this file.
 - **RAW+JPG** of one shot share the identity but are different formats: never
   duplicates, only counted ("N shots exist in two or more formats").
 - **Different shots veto a mode 1 match.** Same name, size and date but another body or
   shutter count (Sony numbers wrap every 10,000 shots, and there are two A7R IV bodies)
   is not a match.
-- **Files without an identity** (phones, GoPro, video, most edits, or no EXIF read yet)
-  match by mode 1 rules. The report says how many files have no EXIF cached yet.
+- **Files without an identity** (phones, GoPro, most edits, silent-shutter frames, or no
+  EXIF read yet) match by mode 1 rules, and so do **videos**: `dpf exif` does not read
+  them at all. The report says how many photos have no EXIF cached yet.
 
 Backup coverage, the Drives summary (only copy, name match) and the dumps check all use
-the same rule in mode 1b. `dpf exif` only reads: files are opened read-only (without
-updating access times where the kernel allows it), the first 512 kB of each file is
-copied to `/dev/shm` for exiftool and deleted after, and exiftool reads the original
-file itself only when a tag is missing from that head (an MP4 whose index sits at the
-end, for example). exiftool must be installed (`apt install libimage-exiftool-perl`).
+the same rule in mode 1b.
+
+**`dpf exif` only reads, and leaves even access times alone.** It opens every file
+read-only with `O_NOATIME`; a file the kernel will not open that way (not owned by
+you) is skipped and counted, unless `--allow-atime`. It copies the first 512 kB to
+`/dev/shm` and exiftool parses only that copy, never the original. When a tag is
+missing from the head, it copies the first 16 MB, then (for missing camera tags, not
+just a missing pixel size) the whole file up to 256 MB; a larger file is cached
+without identity ("too large"). Read errors from a failing or unplugged drive (I/O
+error, device gone) and exiftool runs that hang (60 s watchdog) or crash are counted
+and not cached, so a rerun tries those files again. Leftover temp folders of a run that
+died are removed at the next start. exiftool must be installed (`apt install
+libimage-exiftool-perl`).
 
 ### Reading the report
 
