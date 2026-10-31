@@ -418,18 +418,33 @@ dpf smart --import ~/apps/smart-summary/smart_report.json   # readings of the ol
 ```
 
 It prints one line per drive (name, model, serial, health, number of warnings, trend),
-then any device it could not read. A PATH is traced from `/proc/mounts` to its physical
-disk, through partitions and loop devices (`lsblk`, `losetup`): a drive mounted as
-`/dev/loop24p2` backed by `/dev/sdb` reads `/dev/sdb`. Importing a report twice adds
-nothing (a reading is keyed by serial number and time).
+then any device it could not read. A PATH (symlinks resolved) is traced from
+`/proc/mounts` to its physical disk, through partitions and loop devices (`lsblk`,
+`losetup`): a drive mounted as `/dev/loop24p2` backed by `/dev/sdb` reads `/dev/sdb`. A
+PATH on the system disk (the root filesystem or the one holding your home), such as the
+empty mount folder of an unplugged drive, is refused with "not on a separate drive"
+unless it is that mount point itself. Importing a report twice adds nothing (a reading
+is keyed by serial number and time).
+
+`dpf smart` replaces the separate smart-summary tool, and with it the earlier
+`find --smart-report JSON` option, which is gone: import that report once with
+`--import` and every report shows the readings from the index.
+
+A drive is its serial number with one model and capacity, so a USB bridge that reports
+its own serial for different disks does not mix their histories. A drive read as plain
+SCSI (a bridge without SAT passthrough) gets the warning "the serial number may be the
+bridge's".
 
 **sudo.** smartctl needs root, but dpf itself runs as you and never writes a file as
 root. It runs `sudo -n smartctl …`; if sudo wants a password, it asks once (`sudo -v` on
 the terminal) and goes on. The kernel log is read with plain `dmesg` first and through
-`sudo -n` only if that is refused. `--no-sudo` runs smartctl directly (then it usually
-gets "Permission denied"). Started as root (`sudo dpf smart`) no sudo is used, and dpf
-switches back to the invoking user (`SUDO_UID`) before it opens the index, so
-`~/.cache/dpf/index.db` stays yours.
+`sudo -n` only if that is refused, before any drive is read (so the drives' own
+messages during reading don't count). `--no-sudo` runs smartctl directly (then it usually
+gets "Permission denied"). Started as root (`sudo dpf smart`) no sudo is used: dpf takes
+the invoking user's home (`SUDO_UID`; `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` are dropped) for
+the default index and pools file, and switches back to that user before it opens the
+index, so `~/.cache/dpf/index.db` stays yours. `--db` and `--pools-file` are honoured
+as given. The launcher writes no bytecode when run as root.
 
 **Reports.** Every `find` shows the newest reading of each drive on the **Drives** section
 and sheet (no option needed): Health, Model, Serial, Power-on (years), Temp, Pending,
@@ -453,9 +468,11 @@ column, plus a line for such other drives.
 - A newest reading older than 30 days is called out (amber in the sheet): connect the
   drive and run `dpf smart` again.
 
-A drive is linked to an indexed drive by its mount point when read, else by its
-filesystem label (the mount folder's name). For a drive whose label cannot be read, link
-it by serial number in the pools file:
+A drive is linked to an indexed drive by `[smart] links` (below), else by its mount point
+when read, else by its filesystem label (the mount folder's name); within each step the
+newest reading wins, so a replaced drive with the same label never takes its successor's
+place. For a drive whose label cannot be read, link it by serial number in the pools
+file:
 
 ```toml
 [smart]
