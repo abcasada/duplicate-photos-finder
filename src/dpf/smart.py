@@ -78,6 +78,11 @@ class DriveHealth:
         return f"(no label) {self.model or self.device}"
 
     @property
+    def identity(self) -> tuple[str, str | None, int | None]:
+        """(serial, model, capacity): one physical drive, even behind a bridge's serial."""
+        return self.serial, self.model, self.capacity
+
+    @property
     def years(self) -> float | None:
         return None if self.power_on_hours is None else self.power_on_hours / 8766
 
@@ -181,11 +186,15 @@ def trend(history: Sequence[DriveHealth]) -> tuple[str, ...]:
 
 
 def load_health(idx) -> list[DriveHealth]:
-    """The newest reading of every drive in the index (an `Index`), with its trend."""
-    history: dict[str, list[DriveHealth]] = {}
+    """The newest reading of every drive in the index (an `Index`), with its trend.
+
+    A drive is a serial number with one model and capacity: a USB bridge that reports
+    its own serial for different disks gives each disk its own history.
+    """
+    history: dict[tuple, list[DriveHealth]] = {}
     for rec in idx.smart_history():
         h = from_record(rec)
-        history.setdefault(h.serial, []).append(h)
+        history.setdefault(h.identity, []).append(h)
     return [replace(hs[-1], trend=trend(hs)) for hs in history.values()]
 
 
@@ -216,31 +225,41 @@ def display_name(h: DriveHealth, links: Mapping[str, str] = {}) -> str:
 def match_drives(
     health: Sequence[DriveHealth], roots: Sequence[str], links: Mapping[str, str] = {}
 ) -> tuple[dict[str, DriveHealth], list[DriveHealth]]:
-    """({root: health} for drives linked to a root, the rest).
+    """({root: health} for drives linked to a root, the rest, in the given order).
 
-    A drive belongs to the root whose folder name its `[smart] links` entry names, else
-    to a root equal to one of its mount points, else to a root whose folder name is one
-    of its filesystem labels. The first root listed wins a tie.
+    Three passes over every drive, each giving a root to the newest reading that claims
+    it: `[smart] links` (a linked drive is matched by its link only), then a mount point
+    equal to the root, then a filesystem label equal to the root's folder name. So a
+    replaced drive with the same label never takes its successor's root. The first root
+    listed wins a tie between roots.
     """
     by_label: dict[str, str] = {}
     for r in roots:
         by_label.setdefault(os.path.basename(r.rstrip("/")), r)
     by_path = {r.rstrip("/") or "/": r for r in roots}
+    newest_first = sorted(health, key=lambda h: h.timestamp or 0.0, reverse=True)
     matched: dict[str, DriveHealth] = {}
-    rest = []
-    for h in health:
+    taken: set[int] = set()
+
+    def claims(h: DriveHealth, step: int) -> list[str | None]:
         link = links.get(h.serial.casefold())
+        if step == 0:
+            return [by_label.get(link)] if link is not None else []
         if link is not None:
-            candidates = [by_label.get(link)]
-        else:
-            candidates = [by_path.get(m.rstrip("/") or "/") for m in h.mounts]
-            candidates += [by_label.get(label) for label in h.labels]
-        root = next((c for c in candidates if c is not None and c not in matched), None)
-        if root is not None:
-            matched[root] = h
-        else:
-            rest.append(h)
-    return matched, rest
+            return []
+        if step == 1:
+            return [by_path.get(m.rstrip("/") or "/") for m in h.mounts]
+        return [by_label.get(label) for label in h.labels]
+
+    for step in range(3):
+        for h in newest_first:
+            if id(h) in taken:
+                continue
+            root = next((c for c in claims(h, step) if c is not None and c not in matched), None)
+            if root is not None:
+                matched[root] = h
+                taken.add(id(h))
+    return matched, [h for h in health if id(h) not in taken]
 
 
 def _num(v: int | None) -> str:

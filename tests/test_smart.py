@@ -83,6 +83,34 @@ class SmartTest(unittest.TestCase):
         self.assertEqual(unlabelled.name, "Storage 4A 8TB")
         self.assertEqual(from_record(record("S6")).name, "(no label) WD")
 
+    def test_newest_reading_wins_a_shared_label(self):
+        root = "/mnt/fake/Storage 4A 8TB"
+        old = from_record(record("A-OLD", "Storage 4A 8TB", passed=False,
+                                 when="2026-10-01T12:00:00+00:00"))  # fmt: skip
+        new = from_record(record("Z-NEW", "Storage 4A 8TB", when="2026-10-31T12:00:00+00:00"))
+        for health in ([old, new], [new, old]):
+            matched, rest = match_drives(health, [root])
+            self.assertEqual(matched[root].serial, "Z-NEW")
+            self.assertEqual([h.serial for h in rest], ["A-OLD"])
+        # an exact mount point beats a newer reading that only shares the label
+        mounted = from_record(record("M", "Storage 4A 8TB", when="2026-09-01T12:00:00+00:00",
+                                     mounts=[root]))  # fmt: skip
+        matched, _ = match_drives([new, mounted], [root])
+        self.assertEqual(matched[root].serial, "M")
+
+    def test_link_beats_a_newer_drive_with_the_same_label(self):
+        root = "/mnt/fake/Storage 4A 8TB"
+        linked = from_record(record("WD-L", when="2026-10-01T12:00:00+00:00"))
+        other = from_record(record("X", "Storage 4A 8TB", when="2026-10-31T12:00:00+00:00",
+                                   mounts=[root]))  # fmt: skip
+        matched, rest = match_drives([other, linked], [root], {"wd-l": "Storage 4A 8TB"})
+        self.assertEqual(matched[root].serial, "WD-L")
+        self.assertEqual([h.serial for h in rest], ["X"])
+        # a link to a label no root has: the linked drive is not matched otherwise
+        stray = from_record(record("WD-S", "Storage 4A 8TB"))
+        matched, rest = match_drives([stray], [root], {"wd-s": "Gone"})
+        self.assertEqual((matched, [h.serial for h in rest]), ({}, ["WD-S"]))
+
     def test_trend_and_stale(self):
         history = [
             from_record(record("S1", "D", when="2026-09-01T12:00:00+00:00", pending=1)),
@@ -118,6 +146,22 @@ class SmartTest(unittest.TestCase):
         self.assertEqual(health["S1"].trend, ("Pending 1 → 4 since 2026-10-01",))
         self.assertEqual(health["S1"].labels, ("D",))
         self.assertEqual(health["S2"].trend, ())
+
+    def test_bridge_serial_keeps_drives_apart(self):
+        """One serial, two models or capacities: two drives, each with its own history."""
+        first = record("BRIDGE", "D", when="2026-10-01T12:00:00+00:00", pending=0)
+        second = record("BRIDGE", "E", when="2026-10-20T12:00:00+00:00", pending=7)
+        second["summary"]["model"] = "Seagate"
+        third = record("BRIDGE", "D", when="2026-10-30T12:00:00+00:00", pending=1)
+        bigger = record("BRIDGE", "F", when="2026-10-31T12:00:00+00:00")
+        bigger["summary"]["capacity_bytes"] = 4_000_000_000_000
+        with Index(os.path.join(self.tmp, "i.db")) as idx:
+            idx.put_smart([first, second, third, bigger], "smartctl")
+            health = {h.labels[0]: h for h in load_health(idx)}
+        self.assertEqual(sorted(health), ["D", "E", "F"])
+        self.assertEqual(health["D"].trend, ("Pending 0 → 1 since 2026-10-01",))
+        self.assertEqual(health["E"].trend, ())
+        self.assertEqual(health["F"].trend, ())
 
     def test_links_from_pools_file(self):
         path = self.write("pools.toml", '[smart]\nlinks = { "WD-X" = "Storage 4A" }\n')

@@ -1308,8 +1308,10 @@ def _smart(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     if args.roots and args.pool:
         parser.error("smart: give either PATHs or --pool, not both")
     user = _sudo_user()
-    if user is not None:  # root through sudo: the index and pools file are the user's
+    if user is not None:  # root through sudo: the default index and pools file are the user's
         os.environ["HOME"] = user.pw_dir
+        for name in ("XDG_CONFIG_HOME", "XDG_CACHE_HOME"):  # root's, if sudo kept them
+            os.environ.pop(name, None)
     failed: list[tuple[str, str]] = []
     kernel_log = True
     if args.import_path:
@@ -1334,13 +1336,13 @@ def _smart(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
 
     with Index(args.db) as idx:
         added = idx.put_smart(records, source)
-        newest = {h.serial: h for h in load_health(idx)}
+        newest = {h.identity: h for h in load_health(idx)}
         path = idx.path
     links = _smart_links(args.pools_file)
-    serials = list(dict.fromkeys(from_record(r).serial for r in records))
+    drives = list(dict.fromkeys(from_record(r).identity for r in records))
     rows = [("Drive", "Model", "Serial", "Health", "Flags", "Trend")]
-    for serial in serials:
-        h = newest.get(serial)
+    for drive in drives:
+        h = newest.get(drive)
         if h is not None:
             flags = plural(len(h.flags), "flag") if h.flags else ""
             rows.append((display_name(h, links), h.model or "?", h.serial, h.status, flags,

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from dpf.smartctl import (
+    SCSI_FLAG,
     BlockMap,
     Commands,
     SmartError,
@@ -88,6 +89,8 @@ class SatRetryTest(unittest.TestCase):
         fake.smart[("-a", "/dev/sdb")] = bridge("/dev/sdb", "SCSI-ONLY")
         data, _ = read_drive(commands(fake), "smartctl", "/dev/sdb")
         self.assertEqual(data["serial_number"], "SCSI-ONLY")
+        self.assertIn(SCSI_FLAG, detect_flags(data, []))  # the serial may be the bridge's
+        self.assertNotIn(SCSI_FLAG, detect_flags(ata("/dev/sda", "S1"), []))
 
     def test_sat_retry_only_on_no_data(self):
         fake = FakeSystem()
@@ -113,11 +116,21 @@ class SudoTest(unittest.TestCase):
         self.assertEqual(self.fake.calls.count(["sudo", "-v"]), 1)
         smartctl = [c for c in self.fake.calls if "smartctl" in c]
         self.assertTrue(all(c[:2] == ["sudo", "-n"] for c in smartctl), smartctl)
-        # plain dmesg is tried first, then sudo -n without a prompt
-        dmesg = [c for c in self.fake.calls if "dmesg" in c]
-        self.assertEqual([c[0] for c in dmesg], ["dmesg", "sudo"])
+        # plain dmesg, then sudo -n without a prompt; again after the scan asked for the
+        # password; all before any drive is read (the SAT retry logs messages of its own)
+        calls = self.fake.calls
+        dmesg = [i for i, c in enumerate(calls) if "dmesg" in c]
+        self.assertEqual([calls[i][0] for i in dmesg], ["dmesg", "sudo", "dmesg", "sudo"])
+        scan = calls.index(["sudo", "-v"])
+        first_read = next(i for i, c in enumerate(calls) if "-a" in c)
+        self.assertTrue(dmesg[1] < scan < dmesg[2] < dmesg[3] < first_read)
         self.assertTrue(result.kernel_log)
         self.assertEqual(result.records[0]["kernel_log_issues"], [self.fake.log[0]])
+
+    def test_kernel_log_read_once_when_sudo_is_cached(self):
+        self.read(commands(self.fake))
+        dmesg = [c[0] for c in self.fake.calls if "dmesg" in c]
+        self.assertEqual(dmesg, ["dmesg", "sudo"])
 
     def test_cached_sudo_needs_no_prompt(self):
         result = self.read(commands(self.fake))
@@ -224,7 +237,7 @@ class MountTest(unittest.TestCase):
 
     def test_loop_partition_resolves_to_backing_disk(self):
         paths = ["/mnt/fake/Storage 4A 8TB/Photography", "/mnt/fake/Storage 1A 4TB"]
-        disks = resolve_disks(paths, self.mounts, self.bmap)
+        disks = resolve_disks(paths, self.mounts, self.bmap, home="/home/u")
         self.assertEqual(list(disks.values()), ["/dev/sdb", "/dev/sda"])
         self.assertEqual(disk_mounts(self.mounts, self.bmap), {
             "sda": ["/mnt/fake/Storage 1A 4TB"], "sdb": ["/mnt/fake/Storage 4A 8TB"],
@@ -233,9 +246,31 @@ class MountTest(unittest.TestCase):
 
     def test_unresolvable_paths(self):
         with self.assertRaisesRegex(SmartError, "not on a connected drive"):
-            resolve_disks(["/mnt/fake/Storage 2B 8TB"], self.mounts, self.bmap)
-        with self.assertRaisesRegex(SmartError, "cannot trace"):
-            resolve_disks(["/"], self.mounts, self.bmap)  # nvme0n1p2 is not in lsblk here
+            resolve_disks(["/mnt/fake/Storage 2B 8TB"], self.mounts, self.bmap, home="/home/u")
+        with self.assertRaisesRegex(SmartError, "cannot trace"):  # nvme0n1p2 is not in lsblk
+            resolve_disks(["/"], self.mounts, self.bmap, home="/home/u")
+
+    def test_path_on_the_system_disk_is_refused(self):
+        mounts = [*self.mounts, ("/dev/sdc2", "/home")]
+        for path in ("/home/u/link", "/opt/unplugged-mount"):
+            with self.assertRaisesRegex(SmartError, "not on a separate drive"):
+                resolve_disks([path], mounts, self.bmap, home="/home/u")
+
+    def test_symlinks_are_resolved(self):
+        link = os.path.join(self.tmp, "photos")
+        os.symlink("/mnt/fake/Storage 1A 4TB/DCIM", link)
+        mounts = [*self.mounts, ("/dev/sdc2", os.path.realpath(self.tmp))]  # tmp: a home drive
+        disks = resolve_disks([link], mounts, self.bmap, home=self.tmp)
+        self.assertEqual(disks, {link: "/dev/sda"})
+
+    def test_loop_devices_count_in_the_kernel_log(self):
+        self.assertEqual(self.bmap.loops_on("sdb"), ["loop24", "loop24p2"])
+        self.assertEqual(self.bmap.loops_on("sda"), [])
+        self.fake.log = ["I/O error, dev loop24, sector 8", "I/O error, dev loop2, sector 8"]
+        self.fake.smart[("-a", "/dev/sdb")] = ata("/dev/sdb", "WD-CA13ZBDK")
+        (rec,) = read_smart(commands(self.fake), "smartctl", disks=["/dev/sdb"],
+                            mounts=self.mounts, bmap=self.bmap, sys_root=self.tmp).records
+        self.assertEqual(rec["kernel_log_issues"], ["I/O error, dev loop24, sector 8"])
 
     def test_file_backed_loop_and_partition_chain(self):
         bmap = BlockMap(

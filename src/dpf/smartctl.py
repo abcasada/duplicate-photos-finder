@@ -44,7 +44,10 @@ ATA_NONZERO_IS_BAD = (5, 187, 197, 198)
 # Routine warning-level kernel messages that don't indicate a problem.
 BENIGN_KERNEL_MSGS = ("using unchecked data buffer", "No UUID available providing old NGUID")
 
-LSBLK_PARTITIONS = "NAME,TYPE,SIZE,PTTYPE,PARTLABEL,FSTYPE,LABEL,UUID,MOUNTPOINTS,FSUSE%"
+SCSI_FLAG = ("read as SCSI (a USB bridge without SAT passthrough): the serial number may be "
+             "the bridge's, and drive attributes are missing")  # fmt: skip
+
+LSBLK_PARTITIONS ="NAME,TYPE,SIZE,PTTYPE,PARTLABEL,FSTYPE,LABEL,UUID,MOUNTPOINTS,FSUSE%"
 DMESG = ["dmesg", "--level=emerg,alert,crit,err,warn", "--time-format=iso"]
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess]
@@ -197,6 +200,8 @@ def detect_flags(data: Mapping, kernel_lines: Sequence[str] | None) -> list[str]
         flags.append(f"{len(serious)} kernel log warning/error line(s) mention this drive")
     if data.get("smart_status", {}).get("passed") is False:
         flags.append("SMART overall health assessment FAILED")
+    if data.get("device", {}).get("protocol") == "SCSI":
+        flags.append(SCSI_FLAG)
 
     for attr in data.get("ata_smart_attributes", {}).get("table", []):
         if attr.get("when_failed"):
@@ -337,7 +342,7 @@ def read_kernel_log(cmds: Commands) -> list[str] | None:
     """Warning-or-worse kernel messages, or None if the log isn't readable.
 
     Plain dmesg first; through `sudo -n` only if that fails, never asking for a password
-    (smartctl has asked for it by then, if needed).
+    (read_smart reads it again once smartctl has asked for one).
     """
     proc = cmds.run(DMESG)
     if proc.returncode != 0 and cmds.sudo:
@@ -346,13 +351,18 @@ def read_kernel_log(cmds: Commands) -> list[str] | None:
 
 
 def kernel_issues(
-    dev: str, log_lines: Sequence[str] | None, limit: int = 100, sys_root: str = SYS
+    dev: str,
+    log_lines: Sequence[str] | None,
+    limit: int = 100,
+    sys_root: str = SYS,
+    also: Sequence[str] = (),
 ) -> list[str] | None:
-    """Log lines mentioning the drive, its SATA port or its USB port."""
+    """Log lines mentioning the drive, its SATA port, its USB port, or the devices in
+    `also` (loop devices backed by it, e.g. loop24 for a drive mounted as loop24p2)."""
     if log_lines is None:
         return None
     names = block_names(dev, sys_root)
-    patterns = [re.escape(n) + r"(?:p?\d+)?" for n in names]  # sda, sda1, nvme0n1p2
+    patterns = [re.escape(n) + r"(?:p?\d+)?" for n in [*names, *also]]  # sda1, nvme0n1p2
     if names:
         for part in os.path.realpath(os.path.join(sys_root, "block", names[0])).split("/"):
             if re.fullmatch(r"ata\d+|\d+-[\d.]+", part):  # ata3, usb port 2-1
@@ -427,6 +437,15 @@ class BlockMap:
                 return None
         return None
 
+    def loops_on(self, disk: str) -> list[str]:
+        """Names of the loop devices (and their partitions) backed by `disk` (e.g. sdb)."""
+        names = {os.path.basename(key) for key in self.devices}
+        return sorted(
+            n for n in names
+            if re.fullmatch(r"loop\d+(?:p\d+)?", n)
+            and os.path.basename(self.disk_of("/dev/" + n) or "") == disk
+        )  # fmt: skip
+
 
 def block_map(cmds: Commands) -> BlockMap:
     """Every block device (lsblk) and loop device backing (losetup); no root needed."""
@@ -477,15 +496,31 @@ class SmartRead:
 
 
 def resolve_disks(
-    paths: Sequence[str], mounts: Sequence[tuple[str, str]], bmap: BlockMap
+    paths: Sequence[str],
+    mounts: Sequence[tuple[str, str]],
+    bmap: BlockMap,
+    home: str | None = None,
 ) -> dict[str, str]:
-    """{path: disk device} for mounted paths; SmartError naming any that can't be traced."""
+    """{path: disk device} for mounted paths; SmartError naming any that can't be traced.
+
+    Symlinks in a path are resolved. A path on the root filesystem or the one holding
+    `home` (default: ~) is refused unless it is that mount point itself: an unplugged
+    drive's empty mount folder, or a link, would otherwise name the system disk.
+    """
+    home = os.path.realpath(os.path.expanduser("~") if home is None else home)
+    system = {hit for p in ("/", home) if (hit := mount_of(p, mounts)) is not None}
     found: dict[str, str] = {}
     for path in paths:
-        hit = mount_of(path, mounts)
+        real = os.path.realpath(path)
+        hit = mount_of(real, mounts)
         if hit is None or not hit[0].startswith("/dev/"):
             what = f"mounted from {hit[0]} at {hit[1]}" if hit else "not mounted"
             raise SmartError(f"{path}: not on a connected drive ({what})")
+        if hit in system and real != (hit[1].rstrip("/") or "/"):
+            raise SmartError(
+                f"{path}: not on a separate drive (it lies on {hit[0]}, mounted at {hit[1]}); "
+                "name that mount point itself to read the system disk"
+            )
         disk = bmap.disk_of(hit[0])
         if disk is None:
             raise SmartError(f"{path}: cannot trace {hit[0]} (mounted at {hit[1]}) to a disk")
@@ -508,7 +543,13 @@ def read_smart(
     mounts = read_mounts() if mounts is None else mounts
     bmap = block_map(cmds) if bmap is None else bmap
     on_disk = disk_mounts(mounts, bmap)
+    # The kernel log is read before any drive, so the SAT retries' own messages don't
+    # count. When it needs sudo and sudo needs a password, it is read again right after
+    # the scan, whose smartctl call asks for the password; the scan reads no drive.
+    log = read_kernel_log(cmds)
     devices = scan_devices(cmds, smartctl)
+    if log is None and cmds.prompted:
+        log = read_kernel_log(cmds)
     if disks is not None:
         wanted = {os.path.basename(d): d for d in disks}
         devices = [d for d in devices if wanted.keys() & set(block_names(d, sys_root))]
@@ -533,12 +574,13 @@ def read_smart(
         else:
             serials[serial] = dev
             readings.append((dev, data))
-    log = read_kernel_log(cmds) if readings else []
     result.kernel_log = log is not None
     for dev, data in readings:
-        points = [p for n in block_names(dev, sys_root) for p in on_disk.get(n, ())]
+        names = block_names(dev, sys_root)
+        points = [p for n in names for p in on_disk.get(n, ())]
+        loops = [m for n in names for m in bmap.loops_on(n)]
         result.records.append(build_record(
             dev, data, get_partitions(cmds, dev, sys_root),
-            kernel_issues(dev, log, sys_root=sys_root), points,
+            kernel_issues(dev, log, sys_root=sys_root, also=loops), points,
         ))  # fmt: skip
     return result
