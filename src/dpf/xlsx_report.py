@@ -37,6 +37,7 @@ from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
 from dpf.months import PoolMonths
 from dpf.overview import Overview, personal_lines
+from dpf.smart import ATTRS, FAILED, WARNING, DriveHealth
 from dpf.report import (
     OFFLINE_NOTE,
     PAIR_LABELS,
@@ -214,10 +215,18 @@ def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> li
     if sole:
         columns += [("Only copy files", 10), ("Only copy size", 11), ("Name match", 11)]
     columns += [("Space", 10), ("Last scanned", 18)]
+    health = bool(ov.health or ov.health_others)
+    first_health = len(columns)
+    if health:
+        columns += [("Health", 9), ("Model", 24), ("Serial", 18), ("Power-on years", 9),
+                    ("Temp °C", 8), *((title, 10) for _, title in ATTRS),
+                    ("SMART checked", 12), ("SMART warnings", 60)]  # fmt: skip
     t = _Table(wb, fmt, sheet_name("Drives", used), columns, 1, kind="Drives")
     for d in ov.drives:
         if not t.next_row():
             break
+        if health:
+            _health_cells(t, first_health, ov.health.get(d.root))
         values: list[int | None] = [d.capacity, d.used, d.free]
         c = 0
         t.folder(c, d.root)
@@ -248,7 +257,37 @@ def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> li
         t.text(c, space)
         if d.scanned_at is not None:
             t.ws.write_datetime(t.row, c + 1, datetime.fromtimestamp(d.scanned_at), fmt.date)
+    for h in ov.health_others:
+        if not t.next_row():
+            break
+        t.text(0, h.name)
+        t.text(1, "—")
+        if h.capacity:
+            t.num(2, h.capacity, fmt.size)
+        t.text(first_health - 2, "not scanned by dpf")
+        _health_cells(t, first_health, h)
     return [t]
+
+
+def _health_cells(t: _Table, c: int, h: DriveHealth | None) -> None:
+    if h is None:
+        t.text(c, "not checked")
+        return
+    fill = {FAILED: t.fmt.warning_text, WARNING: t.fmt.warning_text}.get(h.status)
+    t.text(c, h.status, fill)
+    t.text(c + 1, h.model or "")
+    t.text(c + 2, h.serial)
+    if h.years is not None:
+        t.num(c + 3, round(h.years, 1), t.fmt.one_decimal)
+    if h.temperature is not None:
+        t.num(c + 4, h.temperature)
+    for i, (key, _) in enumerate(ATTRS, c + 5):
+        if key in h.attrs:
+            bad = key != "udma_crc_errors" and h.attrs[key] > 0
+            t.num(i, h.attrs[key], t.fmt.amber if bad else None)
+    c += 5 + len(ATTRS)
+    t.text(c, h.checked[:10])
+    t.text(c + 1, "; ".join(h.flags))
 
 
 def _months_tables(
@@ -353,6 +392,7 @@ class _Formats:
         self.bold = add(bold=True)
         self.left_int = add(num_format="#,##0", align="left")
         self.left_size = add(num_format=SIZE_FORMAT, align="left")
+        self.one_decimal = add(num_format="0.0")
 
 
 class _Table:

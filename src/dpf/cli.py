@@ -242,6 +242,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-xlsx", action="store_true", help="don't write report.xlsx (needs XlsxWriter)"
     )
     f.add_argument(
+        "--smart-report", default=None, metavar="JSON",
+        help="add drive health from a smart-summary JSON report to the Drives section",
+    )
+    f.add_argument(
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
     )  # fmt: skip
@@ -586,6 +590,8 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         overview = build_overview(
             idx, pool_inputs, [] if loose else coverages, cats, basis=_basis(args)
         )
+        if not _add_health(overview, args):
+            return 1
         months = [month_totals(idx, r.target.name or "", r.target.roots, r.groups, cats)
                   for r in runs]  # fmt: skip
 
@@ -770,6 +776,24 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     if run.errors:
         print("  errors are cached too; `dpf exif --retry-errors` reads them again")
     return 0
+
+
+def _add_health(overview: Overview, args: argparse.Namespace) -> bool:
+    """SMART health of --smart-report on the overview's drives; False on a bad file."""
+    if not args.smart_report:
+        return True
+    from dpf.smart import load_links, load_smart_report, match_drives
+
+    try:
+        health = load_smart_report(args.smart_report)
+        links = load_links(args.pools_file)
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return False
+    overview.health, overview.health_others = match_drives(
+        health, [d.root for d in overview.drives], links
+    )
+    return True
 
 
 def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -> DumpCheck | None:

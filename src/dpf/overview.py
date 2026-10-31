@@ -26,6 +26,7 @@ from dpf.coverage import Coverage, same_drive_warnings
 from dpf.index import Index
 from dpf.models import SPACE_MANUAL, DuplicateGroup
 from dpf.report import human_bytes, plural
+from dpf.smart import DriveHealth, format_health
 
 Key = tuple[str, str]  # (dir, name)
 
@@ -78,6 +79,8 @@ class Overview:
     all_unique: tuple[int, int] | None = None  # (files, bytes) across exactly two pools
     sole: tuple[int, int] | None = None  # (files, bytes) with no copy on any other drive
     sole_similar: int = 0  # bytes of those with a same-name, near-size file in the other pool
+    health: dict[str, DriveHealth] = field(default_factory=dict)  # root -> SMART reading
+    health_others: list[DriveHealth] = field(default_factory=list)  # drives dpf doesn't scan
 
     def to_json(self) -> dict:
         return {
@@ -88,7 +91,13 @@ class Overview:
             "all_unique": _pair(self.all_unique),
             "only_copy": _pair(self.sole),
             "only_copy_similar_name_bytes": self.sole_similar,
+            "health": {root: _health_json(h) for root, h in self.health.items()},
+            "health_other_drives": [_health_json(h) for h in self.health_others],
         }
+
+
+def _health_json(h: DriveHealth) -> dict:
+    return {**asdict(h), "attrs": dict(h.attrs), "status": h.status}
 
 
 def _pair(value: tuple[int, int] | None) -> dict | None:
@@ -358,6 +367,10 @@ def format_overview(ov: Overview) -> str:
                          "); files deleted since then still count, so rescan a drive after "
                          "deleting from it.")  # fmt: skip
     out += [""] + notes + [""] + personal_lines(ov)
+    if ov.health or ov.health_others:
+        out += ["", "Drive health (SMART):"]
+        out.append(format_health(names, [ov.health.get(d.root) for d in ov.drives],
+                                 ov.health_others).rstrip("\n"))  # fmt: skip
     return "\n".join(out) + "\n"
 
 
