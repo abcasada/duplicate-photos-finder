@@ -1,4 +1,5 @@
-"""Command-line interface: `dpf scan`, `exif`, `find`, `drives`, `space`, `folders`, `pools`."""
+"""Command-line interface: `dpf scan`, `exif`, `find`, `drives`, `space`, `smart`, `folders`,
+`pools`."""
 
 from __future__ import annotations
 
@@ -242,10 +243,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-xlsx", action="store_true", help="don't write report.xlsx (needs XlsxWriter)"
     )
     f.add_argument(
-        "--smart-report", default=None, metavar="JSON",
-        help="add drive health from a smart-summary JSON report to the Drives section",
-    )
-    f.add_argument(
         "-o", "--out", default=None, metavar="DIR",
         help="report directory (default: ~/.cache/dpf/reports/<timestamp>-<mode>)",
     )  # fmt: skip
@@ -284,6 +281,33 @@ def _build_parser() -> argparse.ArgumentParser:
     fo.add_argument(
         "-o", "--out", default=None, metavar="FILE",
         help="CSV file (default: ~/.cache/dpf/reports/<timestamp>-folders/folders.csv)",
+    )  # fmt: skip
+
+    sm = sub.add_parser(
+        "smart", help="read the drives' SMART health into the index (smartctl via sudo)",
+        description="Read the SMART data of every drive smartctl finds (or only the drives "
+        "holding PATHs or the connected drives of --pool) and keep each reading in the "
+        "index, so reports show every drive's health and how it changed. Only SMART data is "
+        "read, never a filesystem. dpf runs as you: smartctl runs as `sudo -n smartctl`, and "
+        "sudo asks for your password once if it needs it.",
+    )  # fmt: skip
+    sm.add_argument(
+        "roots", nargs="*", metavar="PATH",
+        help="only the drives these mounted folders are on (default: every drive)",
+    )  # fmt: skip
+    sm.add_argument(
+        "--pool", metavar="NAME", action="append",
+        help="only the connected drives of this pool (repeatable)",
+    )  # fmt: skip
+    sm.add_argument(
+        "--import", dest="import_path", metavar="JSON",
+        help="store the readings of a smart-summary report instead of reading the drives "
+        "(importing a file again adds nothing)",
+    )  # fmt: skip
+    sm.add_argument(
+        "--sudo", action=argparse.BooleanOptionalAction, default=True,
+        help="run smartctl (and dmesg, if the kernel log is restricted) through sudo when "
+        "dpf is not root (default: on)",
     )  # fmt: skip
 
     sub.add_parser(
@@ -590,8 +614,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         overview = build_overview(
             idx, pool_inputs, [] if loose else coverages, cats, basis=_basis(args)
         )
-        if not _add_health(overview, args):
-            return 1
+        _add_health(overview, idx, args)
         months = [month_totals(idx, r.target.name or "", r.target.roots, r.groups, cats)
                   for r in runs]  # fmt: skip
 
@@ -778,22 +801,35 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     return 0
 
 
-def _add_health(overview: Overview, args: argparse.Namespace) -> bool:
-    """SMART health of --smart-report on the overview's drives; False on a bad file."""
-    if not args.smart_report:
-        return True
-    from dpf.smart import load_links, load_smart_report, match_drives
+def _add_health(overview: Overview, idx: Index, args: argparse.Namespace) -> None:
+    """The newest SMART reading of each drive in the index (dpf smart), on the overview.
+
+    Drives of indexed roots outside this run are left out; drives dpf never scanned are
+    listed apart.
+    """
+    from dpf.smart import load_health, match_drives
+
+    health = load_health(idx)
+    if not health:
+        return
+    links = _smart_links(args.pools_file)
+    roots = [d.root for d in overview.drives]
+    every = list(dict.fromkeys(roots + [r.root for r in idx.roots()]))
+    matched, rest = match_drives(health, every, links)
+    overview.health = {r: matched[r] for r in roots if r in matched}
+    overview.health_others = rest
+    overview.health_links = links
+
+
+def _smart_links(path: str | None) -> dict[str, str]:
+    """[smart] links of the pools file; none (with a warning) when unreadable."""
+    from dpf.smart import load_links
 
     try:
-        health = load_smart_report(args.smart_report)
-        links = load_links(args.pools_file)
+        return load_links(path)
     except PoolError as e:
-        print(f"dpf: {e}", file=sys.stderr)
-        return False
-    overview.health, overview.health_others = match_drives(
-        health, [d.root for d in overview.drives], links
-    )
-    return True
+        print(f"dpf: warning: {e}", file=sys.stderr)
+        return {}
 
 
 def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -> DumpCheck | None:
@@ -980,7 +1016,9 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
     header = ["Drive / folder", "Files", "Media size"]
     header += ["Personal", "Other media"] if cats else []
     header += ["Used on drive", "Capacity"] + (["Space as of"] if space_column else [])
-    header += ["Last scanned", "Connected"] + (["Pool"] if pools else [])
+    health, others, links = _drive_health(idx, known, args.pools_file)
+    header += ["Last scanned", "Connected"] + (["Health"] if health is not None else [])
+    header += ["Pool"] if pools else []
     rows = [tuple(header)]
     connected = 0
     for r, sp in zip(known, spaces):
@@ -994,9 +1032,11 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
         row += _space_cells(sp, by_hand)
         row += [_space_date(r)] if space_column else []
         row += [scan_date(r.scanned_at), "yes" if online else "no"]
+        if health is not None:
+            row.append(health[r.root].status if r.root in health else "—")
         row += [", ".join(pools_of(pools, r.root)) or "—"] if pools else []
         rows.append(tuple(row))
-    texts = ("Drive / folder", "Space as of", "Last scanned", "Connected", "Pool")
+    texts = ("Drive / folder", "Space as of", "Last scanned", "Connected", "Health", "Pool")
     _print_table(rows, left={i for i, h in enumerate(header) if h in texts})
 
     files, nbytes = idx.totals(drop_nested(r.root for r in known))
@@ -1029,7 +1069,35 @@ def _drives(idx: Index, args: argparse.Namespace) -> int:
             f"(scanned before it was recorded); plug {'it' if missing == 1 else 'them'} in "
             "and run 'dpf space --missing'."
         )
+    if health is not None:
+        _health_footer(health, others, links)
     return 0
+
+
+def _drive_health(idx: Index, known: list[RootStats], pools_file: str | None):
+    """({root: newest SMART reading}, readings of drives not in the index, [smart] links),
+    or (None, [], {}) when `dpf smart` has stored nothing."""
+    from dpf.smart import load_health, match_drives
+
+    health = load_health(idx)
+    if not health:
+        return None, [], {}
+    links = _smart_links(pools_file)
+    return *match_drives(health, [r.root for r in known], links), links
+
+
+def _health_footer(health: dict, others: list, links: dict[str, str]) -> None:
+    from dpf.smart import STALE_DAYS, OK, display_name
+
+    print("Health: the newest `dpf smart` reading (— = none for this drive)")
+    old = [os.path.basename(root) for root, h in health.items() if h.stale()]
+    old += [display_name(h, links) for h in others if h.stale()]
+    if old:
+        print(f"SMART readings older than {STALE_DAYS} days: {', '.join(old)}")
+    bad = [f"{display_name(h, links)} {h.status}" for h in others if h.status != OK]
+    if others:
+        line = f"{plural(len(others), 'other drive')} with SMART readings, not in the index"
+        print(line + (f": {', '.join(bad)}" if bad else ", all OK"))
 
 
 def _space_cells(space: DriveSpace | None, mark: bool) -> tuple[str, str]:
@@ -1226,6 +1294,143 @@ def _print_table(rows: list[tuple[str, ...]], left: Collection[int], indent: str
             for c, (cell, w) in enumerate(zip(row, widths))
         ]
         print((indent + "  ".join(cells)).rstrip())
+
+
+def _smart(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    """`dpf smart`: read SMART data with smartctl (or import a smart-summary report) and
+    keep every reading in the index."""
+    from dpf.smart import SmartError as ReportError
+    from dpf.smart import display_name, from_record, load_health, load_report
+    from dpf.smartctl import SmartError
+
+    if args.import_path and (args.roots or args.pool):
+        parser.error("smart: --import takes no PATHs or --pool")
+    if args.roots and args.pool:
+        parser.error("smart: give either PATHs or --pool, not both")
+    user = _sudo_user()
+    if user is not None:  # root through sudo: the index and pools file are the user's
+        os.environ["HOME"] = user.pw_dir
+    failed: list[tuple[str, str]] = []
+    kernel_log = True
+    if args.import_path:
+        try:
+            records = load_report(args.import_path)
+        except ReportError as e:
+            print(f"dpf: {e}", file=sys.stderr)
+            return 1
+        source = "import"
+    else:
+        try:
+            read = _read_smart(args)
+        except (SmartError, PoolError) as e:
+            print(f"dpf: {e}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("dpf: interrupted; nothing stored", file=sys.stderr)
+            return 130
+        records, failed, kernel_log = read.records, read.failed, read.kernel_log
+        source = "smartctl"
+    _drop_root(user)  # nothing is written as root
+
+    with Index(args.db) as idx:
+        added = idx.put_smart(records, source)
+        newest = {h.serial: h for h in load_health(idx)}
+        path = idx.path
+    links = _smart_links(args.pools_file)
+    serials = list(dict.fromkeys(from_record(r).serial for r in records))
+    rows = [("Drive", "Model", "Serial", "Health", "Flags", "Trend")]
+    for serial in serials:
+        h = newest.get(serial)
+        if h is not None:
+            flags = plural(len(h.flags), "flag") if h.flags else ""
+            rows.append((display_name(h, links), h.model or "?", h.serial, h.status, flags,
+                         "; ".join(h.trend)))  # fmt: skip
+    if len(rows) > 1:
+        _print_table(rows, left=range(len(rows[0])), indent="  ")
+    for dev, reason in failed:
+        print(f"  ! {dev}: could not read ({reason})")
+    if args.import_path:
+        print(
+            f"imported {plural(added, 'reading')} of {plural(len(rows) - 1, 'drive')} from "
+            f"{args.import_path} ({len(records) - added:,} already in the index or without a "
+            f"serial number) into {path}"
+        )
+    else:
+        print(f"stored {plural(added, 'reading')} in {path}; {len(failed):,} unreadable")
+        if records and not kernel_log:
+            print("note: the kernel log was unreadable, so kernel log lines are not checked")
+        if any("Permission denied" in reason for _, reason in failed):
+            print("Permission denied: smartctl needs root; leave --sudo on, or run as root.")
+    return 1 if failed or (not args.import_path and not records) else 0
+
+
+def _read_smart(args: argparse.Namespace):
+    """Read SMART of every drive, or of the drives behind PATHs / the --pool mounts."""
+    from dpf.smartctl import (
+        Commands,
+        SmartError,
+        block_map,
+        find_smartctl,
+        read_mounts,
+        read_smart,
+        resolve_disks,
+    )
+
+    cmds = Commands(sudo=args.sudo, notice=lambda m: print(f"dpf: {m}", file=sys.stderr))
+    smartctl = find_smartctl()
+
+    def progress(dev: str) -> None:
+        print(f"reading SMART of {dev}", file=sys.stderr)
+
+    if not args.roots and not args.pool:
+        return read_smart(cmds, smartctl, progress=progress)
+    mounts = read_mounts()
+    bmap = block_map(cmds)
+    if args.pool:
+        pools = load_pools(args.pools_file)
+        paths: list[str] = []
+        for name in args.pool:
+            pool = get_pool(pools, name)
+            found = [p for _, p in mounts if any(matches(p, pat) for pat in pool.patterns)]
+            if not found:
+                raise SmartError(f"no drive of pool {pool.name} is connected")
+            paths += [p for p in found if p not in paths]
+    else:
+        paths = [os.path.abspath(p) for p in args.roots]
+    disks = resolve_disks(paths, mounts, bmap)
+    for p, disk in disks.items():
+        print(f"{p}: {disk}", file=sys.stderr)
+    return read_smart(
+        cmds, smartctl, disks=list(dict.fromkeys(disks.values())), mounts=mounts, bmap=bmap,
+        progress=progress,
+    )  # fmt: skip
+
+
+def _sudo_user():
+    """The user who started dpf through sudo (root with SUDO_UID set), else None."""
+    import pwd
+
+    if os.geteuid() != 0:
+        return None
+    try:
+        uid = int(os.environ.get("SUDO_UID", ""))
+    except ValueError:
+        return None
+    if uid == 0:
+        return None
+    try:
+        return pwd.getpwuid(uid)
+    except KeyError:
+        return None
+
+
+def _drop_root(user) -> None:
+    """Become `user` (from _sudo_user) again before writing, so the index stays theirs."""
+    if user is None:
+        return
+    os.initgroups(user.pw_name, user.pw_gid)
+    os.setgid(user.pw_gid)
+    os.setuid(user.pw_uid)
 
 
 def _pools(args: argparse.Namespace) -> int:
@@ -1453,6 +1658,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "pools":
         return _pools(args)
+    if args.command == "smart":
+        return _smart(args, parser)
     if args.command == "space":
         return _space(args, parser)
     if args.command == "folders":

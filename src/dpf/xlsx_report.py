@@ -37,7 +37,7 @@ from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
 from dpf.months import PoolMonths
 from dpf.overview import Overview, personal_lines
-from dpf.smart import ATTRS, FAILED, WARNING, DriveHealth
+from dpf.smart import ATTRS, FAILED, WARNING, DriveHealth, display_name
 from dpf.report import (
     OFFLINE_NOTE,
     PAIR_LABELS,
@@ -220,7 +220,8 @@ def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> li
     if health:
         columns += [("Health", 9), ("Model", 24), ("Serial", 18), ("Power-on years", 9),
                     ("Temp °C", 8), *((title, 10) for _, title in ATTRS),
-                    ("SMART checked", 12), ("SMART warnings", 60)]  # fmt: skip
+                    ("SMART checked", 12), ("SMART trend", 30),
+                    ("SMART warnings", 60)]  # fmt: skip
     t = _Table(wb, fmt, sheet_name("Drives", used), columns, 1, kind="Drives")
     for d in ov.drives:
         if not t.next_row():
@@ -260,7 +261,7 @@ def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> li
     for h in ov.health_others:
         if not t.next_row():
             break
-        t.text(0, h.name)
+        t.text(0, display_name(h, ov.health_links))
         t.text(1, "—")
         if h.capacity:
             t.num(2, h.capacity, fmt.size)
@@ -286,8 +287,9 @@ def _health_cells(t: _Table, c: int, h: DriveHealth | None) -> None:
             bad = key != "udma_crc_errors" and h.attrs[key] > 0
             t.num(i, h.attrs[key], t.fmt.amber if bad else None)
     c += 5 + len(ATTRS)
-    t.text(c, h.checked[:10])
-    t.text(c + 1, "; ".join(h.flags))
+    t.text(c, h.date, t.fmt.warning_text if h.stale() else None)
+    t.text(c + 1, "; ".join(h.trend))
+    t.text(c + 2, "; ".join(h.flags))
 
 
 def _months_tables(

@@ -81,6 +81,7 @@ class Overview:
     sole_similar: int = 0  # bytes of those with a same-name, near-size file in the other pool
     health: dict[str, DriveHealth] = field(default_factory=dict)  # root -> SMART reading
     health_others: list[DriveHealth] = field(default_factory=list)  # drives dpf doesn't scan
+    health_links: dict[str, str] = field(default_factory=dict)  # [smart] links: serial -> label
 
     def to_json(self) -> dict:
         return {
@@ -97,7 +98,7 @@ class Overview:
 
 
 def _health_json(h: DriveHealth) -> dict:
-    return {**asdict(h), "attrs": dict(h.attrs), "status": h.status}
+    return {**asdict(h), "attrs": dict(h.attrs), "status": h.status, "stale": h.stale()}
 
 
 def _pair(value: tuple[int, int] | None) -> dict | None:
@@ -370,7 +371,7 @@ def format_overview(ov: Overview) -> str:
     if ov.health or ov.health_others:
         out += ["", "Drive health (SMART):"]
         out.append(format_health(names, [ov.health.get(d.root) for d in ov.drives],
-                                 ov.health_others).rstrip("\n"))  # fmt: skip
+                                 ov.health_others, ov.health_links).rstrip("\n"))  # fmt: skip
     return "\n".join(out) + "\n"
 
 
