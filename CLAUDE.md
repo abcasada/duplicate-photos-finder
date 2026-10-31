@@ -77,16 +77,19 @@ tool has.
 ## Running and testing
 
 ```sh
-python3 -m unittest discover -s tests -t .     # full suite, about 1 s, all must pass
+python3 -m unittest discover -s tests -t .     # full suite, about 4 s, all must pass
 ./bin/dpf --help                               # run from the checkout (no install)
 ./bin/dpf drives                               # what's indexed, what's connected, pools
 ./bin/dpf pools                                # pool membership
 ./bin/dpf find --mode 1 --pool A               # scan connected A drives + report
 ./bin/dpf find --mode 1 --no-scan --pool B -o /some/dir   # index only, custom out dir
+./bin/dpf exif --pool A                        # cache camera EXIF of connected A drives
+./bin/dpf find --mode 1b --no-scan --pool A --pool B      # same shot first, else mode 1
 ```
 
 `tests/__init__.py` puts `src/` on `sys.path`. CLI tests point `XDG_CONFIG_HOME` at a
-temp dir and pass `--allow-same-drive`, because `/tmp` is its own tmpfs.
+temp dir and pass `--allow-same-drive`, because `/tmp` is its own tmpfs. The EXIF tests
+run the real exiftool on tiny generated JPEGs and skip when it is missing.
 
 ## Architecture
 
@@ -94,9 +97,9 @@ Data flows **scan → index → match → group → report**.
 
 | Module | Role |
 |---|---|
-| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `find`, `drives` (`--forget`), `space` (`--missing`, `--set`), `folders`, `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
+| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `exif`, `find` (`--mode 1` or `1b`), `drives` (`--forget`), `space` (`--missing`, `--set`), `folders`, `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
 | `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing), `drop_nested`, and `drive_space` (one `os.statvfs` + `ismount`, taken once per root after its walk). |
-| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root`, `set_space` (updates an existing roots row only). |
+| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries), `exif` (schema v6: the `dpf exif` cache keyed by (dir, name) with the read_size/read_mtime it was read at, valid only while they equal the files row's; kept apart from `files` so rescans keep it; `shot`/`ident` keys, index `exif_shot`). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root` (also drops exif rows), `set_space` (updates an existing roots row only); EXIF: `exif_todo`, `put_exif`, `exif_row`, `exif_status`, `multi_format_shots`, `shot_groups`, `shot_name_buckets`, `shot_coverage_buckets` (adds each file's shot and whether the other side holds it, via an `EXISTS` on `exif_shot`). |
 | `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped; around a camera-number token only *neutral* text (dates, separators) is dropped, other text is kept; extension kept). `copy_numbers(name)` feeds the matcher's copy-number rules. `match_key` is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
 | `src/dpf/match_name.py` | Mode 1 matcher; `bucket_groups` holds the per-bucket rules and is shared with coverage. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance; then (unless `--strict-time`) whole clusters are merged across **whole-hour shifts** (`_hour_merge`: all residues mod 3600 within the tolerance, span ≤ 14 h + tol), so every pair in a group satisfies `times_match` and nothing chains; strict clusters are never split. A cluster with several copy numbers is then split by number. `DuplicateGroup.hours` holds each file's offset in hours. |
 | `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). Pairs, runs and trees carry `hour_shift` (offsets B after A that some match needed) and `category` (OTHER only when both folders are other media); roll-up never crosses a category boundary; `GroupingResult.only(cat)` filters. |
@@ -107,7 +110,9 @@ Data flows **scan → index → match → group → report**.
 | `src/dpf/folders.py` | `dpf folders`: CSV overview (`write_folders_csv`), one row per folder two levels below each indexed root, with subtree totals (`summarize`, via `Index.file_rows` and `extras_under`) and blank Personal?/Notes columns for the owner to classify folders by hand. Index only; pools are matched against indexed roots, never by globbing mounts, so no drive is touched. |
 | `src/dpf/overview.py` | The Drives section/sheet (`build_overview`, `format_overview`, `personal_lines`): per drive space, photos/videos, personal/other bytes, not-media (used − media), **only copy** (personal media with no copy on another drive: in the coverage `missing` list and not in a within-pool group spanning another drive; counts lean high) and **name match** (`Coverage.near`: a same-name file within `coverage.NEAR_SIZE` = 64 kB in size; likely re-saved, unproven). Per pool personal total and unique (groups counted once); across exactly two pools, unique = A's + B's groups/singles entirely missing from A. Built only for `--category all`, since it needs every group. |
 | `src/dpf/dumps.py` | Optional `[dumps]` table (`dump`, `sorted`, `min_photos`): dump folders (path contains the dump word) under the run's roots holding ≥ min_photos photos with no mode-1 match in a sorted folder (path contains the sorted word, not the dump word) on any indexed drive. `find_missing` with `index.Words` path filters (SQL `instr(lower(dir))`), so both sides may share roots. Section/sheet "Dumps not in Photography", JSON `dumps`. |
-| `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
+| `src/dpf/exif.py` | Mode 1b EXIF reading. `parse_entry` (exiftool `-json -n` → `ExifData`; serial tag per make: Sony `InternalSerialNumber`, others `SerialNumber`), `ExifData.ident` (make\|model\|serial\|shutter\|DateTimeOriginal, normalised) and `.shot` (+ format family + pixel size for non-RAW), `needs_full_read`, `ExifTool` (one `-stay_open` process), `read_exif` (file list from `Index.exif_todo`; per `st_dev` 4 reader threads copy the first 512 kB (O_NOATIME) to `/dev/shm`; min(6, CPUs) exiftool processes parse batches of 16; fallback on the original path; one writer commits every 500 rows/1 s, so Ctrl-C keeps progress; empty-looking roots skipped; vanished files not stored). |
+| `src/dpf/match_shot.py` | Mode 1b matcher. `split_by_shot` (the veto: a mode-1 group with two shot keys splits by key, keyless files apart), `find_shot_duplicates` (shot groups from `Index.shot_groups` unioned with the vetoed mode-1 groups of the same key; disjoint, no chaining; shot groups get basis `SHOT_BASIS` and no hours), `ShotStats` (summary["shots"]), `basis`. |
+| `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` / `missing_files` (`shots=True`: mode 1b via `_missing_by_shot`, counting `by_shot` and `vetoed` per dir) (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
 | `src/dpf/media.py` | Extension sets (images incl. RAW/HEIC, videos), `SKIP_DIRS` (`$RECYCLE.BIN`, `System Volume Information`, …), `is_junk` (`._*`, Thumbs.db, desktop.ini, .DS_Store). |
 | `src/dpf/models.py` | `FileRecord`, `DuplicateGroup`, `RootStats` (frozen dataclasses). |
 | `bin/dpf` | Launcher that adds `src/` to the path. It works through a symlink (e.g. `~/.local/bin/dpf`). |
@@ -256,23 +261,29 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   be listed, while the index holds files for it keeps its index, is reported "from index", and warns
   (`scanner.scan_roots(kept=…)`); `--allow-empty` accepts the empty scan.
 
+- **Mode 1b, EXIF shot matching (2026-10-31, built; not yet run on real data):**
+  `dpf exif [PATH… | --pool NAME]` caches EXIF in the new `exif` table (schema v6,
+  CREATE TABLE only); `find --mode 1b` matches by shot first, else mode 1 (README "Mode
+  1b"). Rules: same shot = same make, model, body serial (Sony `InternalSerialNumber`,
+  others `SerialNumber`; normalised: case, spaces, leading zeros), shutter count (> 0) and
+  DateTimeOriginal (both as cached; a missing DTO only equals a missing DTO), same format
+  family (jpeg=jpg, tiff=tif, heif=heic), and for non-RAW formats the same pixel size.
+  Two shot keys in one mode-1 group veto it (split by key; keyless files kept apart).
+  Files without a key fall back to mode 1. Coverage, the Drives overview and the dumps
+  check use the same rule. Report: "Shots:" header lines (identity count, files without
+  EXIF cached, shot groups and how many differ in size, vetoed groups, RAW+JPG shots);
+  coverage lines for files copied only as the same shot, vetoed missing files and files
+  without EXIF on each side. Synthetic 540k-file index: coverage 6.0 s vs 4.0 s mode 1,
+  duplicates +1.2 s. **Back up `index.db` before the first run** (v6 migrates on open).
+
 ## Next steps (agreed with the user)
 
-1. **Mode 1b: EXIF matching** (slow, so it's a separate mode).
-   - Read the body serial (`InternalSerialNumber` for Sony, `SerialNumber` for Pentax),
-     `ShutterCount`, `DateTimeOriginal` (+ `OffsetTimeOriginal`), Make/Model and
-     dimensions; for video use QuickTime `CreateDate` + `Duration`.
-   - **Shot identity = (Model, serial, ShutterCount)**. The cameras record no sub-second
-     time, and bursts make capture time ambiguous. RAW+JPG of one shot share that
-     identity and should be reported as "same shot, different format", not duplicates.
-   - Use the fast pipeline from `docs/PLAN.md` ("EXIF research"): read the first 512 KB of
-     each file in folder order with ~4 reader threads per HDD, and parse with a pool of
-     `exiftool -stay_open -fast` processes (CPU-bound, ~22 ms per ARW per process). Fall
-     back to the full file when a tag is missing.
-   - Cache results in the index keyed by (path, size, mtime) so reruns only read
-     changed files.
-   - Expected: ~70 files/s per HDD, so ~50 min for 1A on the first pass.
-   - Proposed CLI: `dpf scan --exif`, `dpf find --mode 1b`.
+1. **Mode 1b on real data.** Back up `index.db`, run `dpf exif` per pool (1A ≈ 50 min
+   estimated), then `find --mode 1b --no-scan --pool A --pool B`; compare "A not in B"
+   and only-copy figures with mode 1, and spot-check shot matches whose sizes differ.
+   Measure real files/s (the 512 kB head and the fallback rules are untested on real
+   ARW/DNG/MP4). Not done yet: video identity (QuickTime CreateDate + Duration are cached
+   but not matched), and Sony video has no serial.
 2. **Phase 2: mode 2 (content):** `--compare exact|visual|both`.
    - Exact: rmlint (`-T df`, `-o json`, paths via stdin `-0`, **no `--xattr`**).
    - Same pixels, different metadata: exiftool `ImageDataHash`.

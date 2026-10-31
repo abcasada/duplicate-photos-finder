@@ -201,3 +201,15 @@ only verify the mode 1 candidates (fast), or do a full content scan?
 - **2026-10-25: smarter names landed.** The mode 1 key is `names.match_key` plus size plus
   mtime. The index is at schema v3 (migrated in place). The RAW+JPG run-splitting
   limitation is fixed.
+- **2026-10-31: mode 1b built.** `dpf exif` follows the pipeline above (4 readers per
+  device, 512 kB heads in `/dev/shm`, min(6, CPUs) `exiftool -stay_open` processes with
+  `-json -n -fast`, batches of 16, fallback to the original path). Re-read triggers:
+  videos without CreateDate or Duration; non-JPEG/PNG/GIF/BMP images without Make, or
+  from Sony/Pentax/Ricoh/Nikon without an identity; non-RAW images with an identity but
+  no pixel size. The cache is the `exif` table (schema v6), kept apart from `files` so
+  rescans keep it, and valid while size and mtime are unchanged. Matching rules are in
+  `src/dpf/match_shot.py` and CLAUDE.md "Current status". Design choices: the shot key
+  includes DateTimeOriginal as cached (a file with an identity but no DTO only matches
+  another without one: stricter than "equal when both have it", never seen on the
+  target cameras); non-RAW keys include the pixel size so resized exports never match;
+  a mode-1 group holding two shots is split, and its files without EXIF match neither.

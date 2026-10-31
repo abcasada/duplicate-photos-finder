@@ -37,7 +37,7 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Several pools in one run and one workbook (`--pool A --pool B`) | ✅ Done |
 | Copies whose dates moved by whole hours (time zones, DST) match (`--strict-time` turns it off) | ✅ Done |
 | Personal vs other media (`[categories]`, `--category`) | ✅ Done |
-| Mode 1b: EXIF (camera serial + shutter count) | 📋 Next: researched and benchmarked, not built |
+| Mode 1b: EXIF (camera serial + shutter count): `dpf exif`, `find --mode 1b` | ✅ Built (2026-10-31); first real-data run pending |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
 
@@ -49,7 +49,7 @@ Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md
 | Mode | What counts as a duplicate | Speed | Status |
 |---|---|---|---|
 | `1` / `name` | Similar filename (case-insensitive; copy marks like ` (1)`, ` - Copy`, `-2` ignored; files renamed with a date before their camera number still match), same extension, same size, modification time within 2 s or whole hours apart (time zones, DST). `--exact-names` requires identical names, `--strict-time` no hour shifts | Seconds: reads only folder listings | ✅ available |
-| `1b` (planned) | Same camera body serial + shutter count (from EXIF), so renamed or re-downloaded copies are caught and RAW+JPG pairs are recognised as one shot | ~50 min per large drive the first time (reads each file's header), cached afterwards | 📋 next |
+| `1b` / `shot` | The same camera shot: make, model, body serial, shutter count and capture time (EXIF, cached by `dpf exif`) in the same format, so renamed or re-saved copies match; RAW+JPG of one shot are never duplicates. Files without that identity fall back to mode 1 | `dpf exif` reads each file's first 512 kB once (~50 min for a large drive, estimated), cached afterwards; `find` then takes about as long as mode 1 | ✅ available |
 | `2` / `content` | `--compare exact` (byte-identical, via rmlint), `visual` (perceptual, via czkawka), or `both` | Hours: reads every file | 📋 planned |
 | `3` / `both` | Mode 1 report first, then mode 2 automatically | | 📋 planned |
 
@@ -422,6 +422,50 @@ of the same name within 64 kB in size in a sorted folder). Camera numbers repeat
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 
+### Mode 1b: the same camera shot (EXIF)
+
+Mode 1 needs equal sizes, so a photo re-saved with new metadata (Lightroom writing
+keywords into a DNG or ARW makes it a few kB larger and newer) counts as "not backed
+up". Mode 1b proves such copies from the camera's own EXIF instead:
+
+```sh
+# 1. Read EXIF once per drive (connected drives only; files of the last scan; slow the
+#    first time, then only new or changed files). Ctrl-C keeps progress; rerun to resume.
+dpf exif --pool A
+dpf exif --pool B
+dpf exif "/run/media/adam/Storage 1A 4TB/Photography"   # or just a folder
+
+# 2. Report with mode 1b; works from the index, so drives may be unplugged
+dpf find --mode 1b --no-scan --pool A --pool B
+```
+
+**What counts as the same shot.** Two files with the same camera make and model, the
+same body serial (Sony `InternalSerialNumber`; Pentax and other makes `SerialNumber`),
+the same shutter count and the same `DateTimeOriginal`, in the same format family
+(ARW, DNG, JPG, …; for non-RAW formats also the same pixel size). They match whatever
+their names, sizes and dates.
+
+- **Proves:** the two files come from the same press of the shutter on the same camera
+  body, in the same format. A re-saved DNG/ARW matches its original.
+- **Does not prove:** identical contents. The report says "same shot", never
+  "identical", and counts how many matches differ in size ("re-saved / metadata
+  differs"). A full-size edited JPG export that keeps the camera's EXIF is the same shot
+  as the camera JPG. Mode 2 will compare contents.
+- **RAW+JPG** of one shot share the identity but are different formats: never
+  duplicates, only counted ("N shots exist in two or more formats").
+- **Different shots veto a mode 1 match.** Same name, size and date but another body or
+  shutter count (Sony numbers wrap every 10,000 shots, and there are two A7R IV bodies)
+  is not a match.
+- **Files without an identity** (phones, GoPro, video, most edits, or no EXIF read yet)
+  match by mode 1 rules. The report says how many files have no EXIF cached yet.
+
+Backup coverage, the Drives summary (only copy, name match) and the dumps check all use
+the same rule in mode 1b. `dpf exif` only reads: files are opened read-only (without
+updating access times where the kernel allows it), the first 512 kB of each file is
+copied to `/dev/shm` for exiftool and deleted after, and exiftool reads the original
+file itself only when a tag is missing from that head (an MP4 whose index sits at the
+end, for example). exiftool must be installed (`apt install libimage-exiftool-perl`).
+
 ### Reading the report
 
 The report starts with a **tree overview**, then lists every folder pair. Both are
@@ -568,10 +612,10 @@ on name and date without reading file contents.
 - **Done since**: smarter mode 1 names (copy suffixes such as `DSC00001-2.jpg` or
   `IMG_1 (1).JPG`, and dates before camera numbers; size and date must still match),
   and runs that stay whole across RAW+JPG siblings while naming the unmatched ones.
-- **Next, mode 1b (EXIF)**: shot identity from the camera body serial and shutter count.
-  The author's Sony A7R IV bodies and Pentax K-1 Mark II both record these, but not
-  sub-second times. Uses a fast exiftool pipeline that reads only the first 512 KB of
-  each file, with results cached in the index.
+- **Mode 1b (EXIF)** (built 2026-10-31): shot identity from the camera body serial and
+  shutter count (`dpf exif`, then `find --mode 1b`). The author's Sony A7R IV bodies and
+  Pentax K-1 Mark II both record these, but not sub-second times. A fast exiftool
+  pipeline reads only the first 512 KB of each file, with results cached in the index.
 - **Phase 2, mode 2 (content)**: rmlint for exact copies, exiftool `ImageDataHash` for
   same-pixels-different-metadata, czkawka for visually similar (`--compare`).
 - **Phase 3, mode 3**: mode 1, then mode 2 automatically.
