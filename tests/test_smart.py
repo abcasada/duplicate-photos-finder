@@ -74,12 +74,12 @@ class SmartTest(unittest.TestCase):
         self.assertNotIn("older than", text)
 
     def test_mount_point_matches_before_label(self):
-        h = from_record(record("S4", "Other", mounts=["/run/media/u/Storage 4A 8TB"]))
+        h = from_record(record("S4", "Other", mounts=["/mnt/fake/Storage 4A 8TB"]))
         self.assertEqual(h.name, "Other")
-        roots = ["/run/media/u/Other", "/run/media/u/Storage 4A 8TB"]
+        roots = ["/mnt/fake/Other", "/mnt/fake/Storage 4A 8TB"]
         matched, rest = match_drives([h], roots)
-        self.assertEqual(list(matched), ["/run/media/u/Storage 4A 8TB"])
-        unlabelled = from_record(record("S5", mounts=["/run/media/u/Storage 4A 8TB"]))
+        self.assertEqual(list(matched), ["/mnt/fake/Storage 4A 8TB"])
+        unlabelled = from_record(record("S5", mounts=["/mnt/fake/Storage 4A 8TB"]))
         self.assertEqual(unlabelled.name, "Storage 4A 8TB")
         self.assertEqual(from_record(record("S6")).name, "(no label) WD")
 

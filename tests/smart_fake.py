@@ -107,7 +107,8 @@ class FakeSystem:
             return subprocess.CompletedProcess(argv, 1, "", "dmesg: Operation not permitted\n")
         if name == "lsblk":
             if "-l" in argv:
-                return subprocess.CompletedProcess(argv, 0, json.dumps({"blockdevices": self.blocks}), "")
+                out = json.dumps({"blockdevices": self.blocks})
+                return subprocess.CompletedProcess(argv, 0, out, "")
             parts = [p for dev in argv if dev in self.partitions for p in self.partitions[dev]]
             return subprocess.CompletedProcess(argv, 0, json.dumps({"blockdevices": parts}), "")
         if name == "losetup":

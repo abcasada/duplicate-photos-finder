@@ -33,7 +33,8 @@ class SmartCliTest(CliFixture):
     def readings(self):
         conn = sqlite3.connect(self.db)
         try:
-            return conn.execute("SELECT serial, source FROM smart ORDER BY serial, read_at").fetchall()
+            sql = "SELECT serial, source FROM smart ORDER BY serial, read_at"
+            return conn.execute(sql).fetchall()
         finally:
             conn.close()
 
@@ -63,7 +64,8 @@ class SmartCliTest(CliFixture):
         self.assertIn("cannot read SMART report", err)
 
     def test_drives_and_find_show_health_from_the_index(self):
-        self.run_cli("scan", "-q", os.path.join(self.drives, "one"), os.path.join(self.drives, "two"))
+        one_root, two_root = (os.path.join(self.drives, d) for d in ("one", "two"))
+        self.run_cli("scan", "-q", one_root, two_root)
         path = self.write_report([
             report_entry("S1", "one", "2026-08-01T12:00:00+00:00", pending=1),
             report_entry("S9", "Backup 2TB", "2026-10-25T12:00:00+00:00", passed=False),
@@ -78,26 +80,26 @@ class SmartCliTest(CliFixture):
         header = out.splitlines()[0]
         self.assertIn("Health", header)
         self.assertTrue(all(len(line) <= 150 for line in out.splitlines()))
-        one = next(line for line in out.splitlines() if line.startswith(os.path.join(self.drives, "one")))
-        two = next(line for line in out.splitlines() if line.startswith(os.path.join(self.drives, "two")))
+        one = next(line for line in out.splitlines() if line.startswith(one_root))
+        two = next(line for line in out.splitlines() if line.startswith(two_root))
         self.assertIn(" warning", one)
         self.assertRegex(two, r"\s—$")
         self.assertIn("1 other drive with SMART readings, not in the index: Backup 2TB FAILED", out)
 
         with mock.patch("time.time", return_value=1_793_448_000.0):  # 2026-10-31
-            code, out, _ = self.run_cli("find", "-q", "--no-scan", "-o", self.out,
-                                        os.path.join(self.drives, "one"),
-                                        os.path.join(self.drives, "two"))  # fmt: skip
+            code, out, _ = self.run_cli("find", "-q", "--no-scan", "-o", self.out, one_root,
+                                        two_root)  # fmt: skip
         self.assertEqual(code, 0)
         self.assertIn("Drive health (SMART):", out)
-        self.assertIn("one (warning): Current_Pending_Sector raw value is 3; trend: Pending 1 → 3 "
-                      "since 2026-08-01", out)  # fmt: skip
+        self.assertIn("one (warning): Current_Pending_Sector raw value is 3; trend: Pending "
+                      "1 → 3 since 2026-08-01", out)  # fmt: skip
         self.assertIn("  (not scanned by dpf)", out)
         self.assertNotIn("older than 30 days", out)
         with open(os.path.join(self.out, "report.json")) as fh:
             health = json.load(fh)["summary"]["overview"]["health"]
         (entry,) = health.values()
-        self.assertEqual((entry["serial"], entry["status"], entry["stale"]), ("S1", "warning", False))
+        self.assertEqual((entry["serial"], entry["status"], entry["stale"]),
+                         ("S1", "warning", False))  # fmt: skip
         if HAVE_XLSXWRITER:
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)

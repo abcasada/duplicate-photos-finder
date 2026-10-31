@@ -177,7 +177,7 @@ class RecordTest(unittest.TestCase):
         fake = FakeSystem()
         fake.smart[("-a", "/dev/sda")] = ata("/dev/sda", "S1 ", pending=1)
         fake.devices = ["/dev/sda"]
-        mounts = [("/dev/sda1", "/run/media/u/Storage 1A 4TB")]
+        mounts = [("/dev/sda1", "/mnt/fake/Storage 1A 4TB")]
         (rec,) = read_smart(commands(fake), "smartctl", mounts=mounts, sys_root="/x").records
         self.assertEqual(rec["summary"]["serial_number"], "S1")
         self.assertEqual(rec["summary"]["type"], "HDD")
@@ -185,7 +185,7 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(rec["flags"], ["1 kernel log warning/error line(s) mention this drive",
                                         "Current_Pending_Sector raw value is 1"])
         self.assertEqual(rec["labels"], ["Storage 1A 4TB"])
-        self.assertEqual(rec["mounts"], ["/run/media/u/Storage 1A 4TB"])
+        self.assertEqual(rec["mounts"], ["/mnt/fake/Storage 1A 4TB"])
         self.assertEqual(rec["device_path"], "/dev/sda")
         self.assertNotIn("json_format_version", rec["smartctl"])
         self.assertNotIn("argv", rec["smartctl"]["smartctl"])
@@ -200,40 +200,40 @@ class MountTest(unittest.TestCase):
         self.bmap = block_map(commands(self.fake))
         self.mounts = [
             ("/dev/nvme0n1p2", "/"),
-            ("tmpfs", "/run"),
-            ("/dev/sda1", "/run/media/adam/Storage 1A 4TB"),
-            ("/dev/loop24p2", "/run/media/adam/Storage 4A 8TB"),
+            ("tmpfs", "/mnt"),
+            ("/dev/sda1", "/mnt/fake/Storage 1A 4TB"),
+            ("/dev/loop24p2", "/mnt/fake/Storage 4A 8TB"),
         ]
 
     def test_read_mounts_unescapes(self):
         path = os.path.join(self.tmp, "mounts")
         with open(path, "w") as fh:
-            fh.write("/dev/loop24p2 /run/media/adam/Storage\\0404A\\0408TB ntfs3 ro 0 0\n"
-                     "tmpfs /run tmpfs rw 0 0\n")  # fmt: skip
+            fh.write("/dev/loop24p2 /mnt/fake/Storage\\0404A\\0408TB ntfs3 ro 0 0\n"
+                     "tmpfs /mnt tmpfs rw 0 0\n")  # fmt: skip
         self.assertEqual(read_mounts(path), [
-            ("/dev/loop24p2", "/run/media/adam/Storage 4A 8TB"), ("tmpfs", "/run"),
+            ("/dev/loop24p2", "/mnt/fake/Storage 4A 8TB"), ("tmpfs", "/mnt"),
         ])  # fmt: skip
         self.assertEqual(read_mounts(os.path.join(self.tmp, "none")), [])
 
     def test_mount_of_takes_the_innermost(self):
-        self.assertEqual(mount_of("/run/media/adam/Storage 1A 4TB/DCIM/x", self.mounts)[0],
+        self.assertEqual(mount_of("/mnt/fake/Storage 1A 4TB/DCIM/x", self.mounts)[0],
                          "/dev/sda1")  # fmt: skip
-        self.assertEqual(mount_of("/run/media/adam/Storage 1A 4TB", self.mounts)[0], "/dev/sda1")
-        self.assertEqual(mount_of("/run/media/adam/Storage 1A 4TBx", self.mounts)[0], "tmpfs")
+        self.assertEqual(mount_of("/mnt/fake/Storage 1A 4TB", self.mounts)[0], "/dev/sda1")
+        self.assertEqual(mount_of("/mnt/fake/Storage 1A 4TBx", self.mounts)[0], "tmpfs")
         self.assertEqual(mount_of("/home/u", self.mounts)[0], "/dev/nvme0n1p2")
 
     def test_loop_partition_resolves_to_backing_disk(self):
-        disks = resolve_disks(["/run/media/adam/Storage 4A 8TB/Photography",
-                               "/run/media/adam/Storage 1A 4TB"], self.mounts, self.bmap)  # fmt: skip
+        paths = ["/mnt/fake/Storage 4A 8TB/Photography", "/mnt/fake/Storage 1A 4TB"]
+        disks = resolve_disks(paths, self.mounts, self.bmap)
         self.assertEqual(list(disks.values()), ["/dev/sdb", "/dev/sda"])
         self.assertEqual(disk_mounts(self.mounts, self.bmap), {
-            "sda": ["/run/media/adam/Storage 1A 4TB"], "sdb": ["/run/media/adam/Storage 4A 8TB"],
+            "sda": ["/mnt/fake/Storage 1A 4TB"], "sdb": ["/mnt/fake/Storage 4A 8TB"],
         })  # fmt: skip
         self.assertIn(["losetup", "-J", "-l", "-O", "NAME,BACK-FILE"], self.fake.calls)
 
     def test_unresolvable_paths(self):
         with self.assertRaisesRegex(SmartError, "not on a connected drive"):
-            resolve_disks(["/run/media/adam/Storage 2B 8TB"], self.mounts, self.bmap)
+            resolve_disks(["/mnt/fake/Storage 2B 8TB"], self.mounts, self.bmap)
         with self.assertRaisesRegex(SmartError, "cannot trace"):
             resolve_disks(["/"], self.mounts, self.bmap)  # nvme0n1p2 is not in lsblk here
 
@@ -254,7 +254,7 @@ class MountTest(unittest.TestCase):
                             mounts=self.mounts, bmap=self.bmap, sys_root=self.tmp)  # fmt: skip
         (rec,) = result.records
         self.assertEqual(rec["summary"]["serial_number"], "WD-CA13ZBDK")
-        self.assertEqual(rec["mounts"], ["/run/media/adam/Storage 4A 8TB"])
+        self.assertEqual(rec["mounts"], ["/mnt/fake/Storage 4A 8TB"])
         self.assertEqual(rec["labels"], [])
         self.assertEqual(self.fake.ran("-a", "/dev/sda"), [])
 

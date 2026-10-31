@@ -422,7 +422,7 @@ class IndexFileTest(unittest.TestCase):
             self.assertEqual([r["summary"]["serial_number"] for r in latest], ["S1", "S2"])
             self.assertEqual(latest[0]["collected_at"], "2026-10-31T08:00:00+00:00")
             self.assertEqual(latest[0]["source"], "smartctl")
-            self.assertEqual(latest[0]["mounts"], ["/run/media/u/D"])
+            self.assertEqual(latest[0]["mounts"], ["/mnt/fake/D"])
             self.assertEqual(latest[0]["labels"], ["D"])
             self.assertNotIn("smartctl", latest[0])
             history = idx.smart_history("S1", full=True)
@@ -432,8 +432,8 @@ class IndexFileTest(unittest.TestCase):
             self.assertEqual(history[0]["smartctl"], {"device": {"name": "/dev/sda"}})
             self.assertEqual(history[0]["kernel_log_issues"], ["line"])
             self.assertEqual(len(idx.smart_history()), 3)
-            idx.replace_root("/run/media/u/D", [rec("/run/media/u/D", "x.jpg")])
-            idx.forget_root("/run/media/u/D")
+            idx.replace_root("/mnt/fake/D", [rec("/mnt/fake/D", "x.jpg")])
+            idx.forget_root("/mnt/fake/D")
             self.assertEqual(len(idx.smart_history()), 3)  # per drive, not per path
 
     def test_older_inventory_dropped(self):
@@ -450,7 +450,7 @@ def smart_rec(serial, when="2026-10-31T12:00:00+00:00", pending=0):
     return {
         "collected_at": when, "host": "h", "device_path": "/dev/sda", "flags": [],
         "partitions": [], "kernel_log_issues": ["line"], "labels": ["D"],
-        "mounts": ["/run/media/u/D"], "smartctl": {"device": {"name": "/dev/sda"}},
+        "mounts": ["/mnt/fake/D"], "smartctl": {"device": {"name": "/dev/sda"}},
         "summary": {"serial_number": serial, "model": "WD",
                     "ata_attributes": {"pending_sectors": pending}},
     }  # fmt: skip
