@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import subprocess
@@ -96,8 +97,21 @@ class ShotCoverageCliTest(PoolsFixture):
         with open(os.path.join(self.out, "report.json")) as fh:
             cov = json.load(fh)["coverage"]["A not in B"]
         self.assertEqual((cov["missing_files"], cov["same_shot_files"]), (0, 1))
+        self.assertEqual(cov["resaved_folders"], [{"dir": self.raw_a, "files": 1, "bytes": 1000}])
+        self.assertIn(f"{self.raw_a}   (1 file: IMGQ0001.DNG)", out)
+        with open(os.path.join(self.out, "missing.csv"), newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual([(r["name"], r["status"]) for r in rows],
+                         [("IMGQ0001.DNG", "same shot, size differs")])  # fmt: skip
         if HAVE_XLSXWRITER:
-            self.assertTrue(os.path.exists(os.path.join(self.out, "report.xlsx")))
+            from tests.test_xlsx_report import Workbook
+
+            wb = Workbook(os.path.join(self.out, "report.xlsx"))
+            self.addCleanup(wb.close)
+            self.assertIn("A not in B re-saved", wb.names)
+            sheet = wb.cells("A not in B re-saved")
+            self.assertEqual((sheet["C2"], sheet["D2"], sheet["E2"]),
+                             (self.raw_a, 1.0, "IMGQ0001.DNG"))  # fmt: skip
 
 
 @unittest.skipUnless(HAVE_EXIFTOOL, "exiftool not installed")
@@ -113,12 +127,24 @@ class ExifCliTest(CliFixture):
         self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
         code, out, err = self.run_cli("exif", "-q", self.drives)
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("read EXIF of 21 files", out)
+        self.assertIn("read EXIF of 21 photos", out)
         self.assertIn("0 with a camera shot identity, 21 without", out)
         code, out, _ = self.run_cli("exif", "-q", self.drives)
         self.assertIn("nothing to read", out)
         with Index(self.db) as idx:
             self.assertEqual(idx.exif_row(os.path.dirname(photo), "cam.jpg")["make"], "SONY")
+
+    def test_exif_reads_only_a_folder_inside_a_scanned_drive(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
+        sample = os.path.join(self.drives, "one", "DCIM")
+        code, out, err = self.run_cli("exif", sample)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"reading EXIF under {sample}", err)
+        self.assertIn("read EXIF of 10 photos", out)
+        with Index(self.db) as idx:
+            self.assertEqual(idx.exif_status([sample])["missing"], 0)
+            other = os.path.join(self.drives, "two")
+            self.assertEqual(idx.exif_status([other])["missing"], 10)
 
     def test_exif_refuses_unconnected_path(self):
         code, _, err = self.run_cli("exif", os.path.join(self.tmp, "nowhere"))
@@ -143,7 +169,7 @@ class ExifPoolCliTest(PoolsFixture):
         self.assertIn(f"skipping {self.a2} (pool A, not connected)", err)
         self.assertIn(f"reading EXIF under {self.a1}", err)
         self.assertNotIn(self.b1, err)
-        self.assertIn("read EXIF of 10 files", out)
+        self.assertIn("read EXIF of 10 photos", out)
 
 
 if __name__ == "__main__":

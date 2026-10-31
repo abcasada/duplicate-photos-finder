@@ -34,6 +34,7 @@ from dpf.grouping import (
     Run,
     TreePair,
     is_near,
+    natural_key,
 )
 from dpf.models import DuplicateGroup
 
@@ -48,6 +49,7 @@ CSV_FIELDS = (
 )  # fmt: skip
 SKIPPED_SHOWN = 3
 SIMILAR_NAMES = "similar names"
+SIZES_DIFFER = "same shot, sizes differ"  # a mode 1b match between files of other sizes
 
 
 def human_bytes(n: int) -> str:
@@ -206,6 +208,8 @@ def _describe(p: FolderPair, near: float = DEFAULT_NEAR) -> str:
         text += f"; {SIMILAR_NAMES}"
     if p.hour_shift:
         text += f"; {shift_text(p.hour_shift)}"
+    if p.sizes_differ:
+        text += f"; {SIZES_DIFFER}"
     if p.unindexed:
         text += f"; {plural(p.unindexed, 'other file')} not compared"
     return text
@@ -229,6 +233,8 @@ def _describe_tree(t: TreePair) -> str:
     )
     if t.hour_shift:
         text += f"; {shift_text(t.hour_shift)}"
+    if t.sizes_differ:
+        text += f"; {SIZES_DIFFER}"
     if t.unindexed:
         text += f"; {plural(t.unindexed, 'other file')} not compared"
     return text
@@ -289,6 +295,8 @@ def run_lines(
             line += f"  → in B: {_span(r.b_first, r.b_last)}"
         if r.hour_shift:
             line = f"{line.rstrip()}  ({shift_text(r.hour_shift)})"
+        if r.sizes_differ:
+            line = f"{line.rstrip()}  ({SIZES_DIFFER})"
         lines.append(line.rstrip())
     rest = runs[max_runs:]
     if rest:
@@ -461,6 +469,15 @@ def shot_lines(shots: dict | None) -> list[str]:
         f"{shots['with_identity']:,} of {files:,} photos/videos have a camera shot "
         "identity (body serial + shutter count)"
     ]
+    if shots.get("unreliable"):
+        lines.append(
+            f"{plural(shots['unreliable'], 'file')} share a shot identity with differently "
+            "numbered or named files (e.g. a silent-shutter burst): matched by name, size "
+            "and date only"
+        )
+    if shots.get("videos"):
+        lines.append(f"{plural(shots['videos'], 'video')}: no shot identity, matched by name, "
+                     "size and date")  # fmt: skip
     if shots["no_exif"]:
         lines.append(
             f"{plural(shots['no_exif'], 'file')} {'has' if shots['no_exif'] == 1 else 'have'} "
@@ -497,6 +514,13 @@ def coverage_shot_lines(cov: Coverage) -> list[str]:
             f"{plural(cov.by_shot, 'file')} {'counts' if cov.by_shot == 1 else 'count'} as "
             f"copied only as the same camera shot in pool {cov.other} (another name, size or "
             "date: re-saved / metadata differs)"
+        )
+    if cov.resaved:
+        n = len(cov.resaved)
+        lines.append(
+            f"{plural(n, 'file')} of those, {human_bytes(sum(f.size for f in cov.resaved))}, "
+            f"{'has' if n == 1 else 'have'} no copy of the same size there: the backup is "
+            "the same shot re-saved, not the same file (listed below and in missing.csv)"
         )
     if cov.vetoed:
         lines.append(
@@ -715,8 +739,10 @@ def _group_rows(n: int, g: DuplicateGroup, category: Category | None = None) -> 
 COVERAGE_TOP = 50
 MISSING_CSV_FIELDS = (
     "pool", "missing_from", "path", "dir", "name", "size", "mtime", "kind", "similar_name_there",
-    "category",
+    "category", "status",
 )  # fmt: skip
+MISSING = "missing"
+RESAVED = "same shot, size differs"  # copied only as the same shot (mode 1b), re-saved
 
 
 def coverage_relation(cov: Coverage) -> str:
@@ -844,15 +870,16 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
     if cov.unindexed:
         out.append(f"{'':<16}{unindexed_note(cov)}")
     out.append("")
+    resaved = resaved_lines(cov, top)
     if not cov.folders:
         out.append(
             f"Every compared media file has a copy in pool {cov.other}." if cov.files
             else "No files to compare."
         )  # fmt: skip
-        return "\n".join(out) + "\n"
+        return "\n".join(out + resaved) + "\n"
     if not cov.by_category:
         out.extend(_missing_lines(cov, cov.folders, top, max_runs))
-        return "\n".join(out) + "\n"
+        return "\n".join(out + resaved) + "\n"
     for c in CATEGORIES:
         if cov.category not in (ALL, c):
             continue
@@ -867,7 +894,30 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
             continue
         out.extend(_missing_lines(cov, part, top, max_runs))
         out.append("")
-    return "\n".join(out).rstrip("\n") + "\n"
+    return "\n".join(out + resaved).rstrip("\n") + "\n"
+
+
+def resaved_lines(cov: Coverage, top: int | None) -> list[str]:
+    """The folders of files counted as copied only as the same shot of another size."""
+    folders = cov.resaved_folders
+    if not folders:
+        return []
+    title = f"--- Copied only as the same shot, sizes differ (re-saved in pool {cov.other}) ---"
+    out = ["", title, ""]
+    shown = folders if top is None else folders[: max(top, 0)]
+    num_w = len(f"[{len(shown)}]")
+    for n, (d, files) in enumerate(shown, 1):
+        names = sorted((f.name for f in files), key=natural_key)
+        out.append(
+            f"{f'[{n}]'.ljust(num_w)}  {human_bytes(sum(f.size for f in files)):>8}  {d}   "
+            f"({plural(len(files), 'file')}: {_span(names[0], names[-1])})"
+        )
+    rest = folders[len(shown):]
+    if rest:
+        files = sum(len(fs) for _, fs in rest)
+        out.append(f"… {plural(len(rest), 'more folder')} ({plural(files, 'file')}) not shown; "
+                   "every file is in missing.csv")  # fmt: skip
+    return out
 
 
 def _missing_lines(
@@ -915,7 +965,13 @@ def coverage_data(cov: Coverage) -> dict:
         "similar_name_files": len(cov.similar),
         "hour_shift_files": cov.shifted,
         **({"same_shot_files": cov.by_shot, "other_shot_files": cov.vetoed,
-            "no_exif_files": cov.no_exif, "other_no_exif_files": cov.other_no_exif}
+            "no_exif_files": cov.no_exif, "other_no_exif_files": cov.other_no_exif,
+            "resaved_files": len(cov.resaved),
+            "resaved_bytes": sum(f.size for f in cov.resaved),
+            "resaved_folders": [
+                {"dir": d, "files": len(fs), "bytes": sum(f.size for f in fs)}
+                for d, fs in cov.resaved_folders
+            ]}
            if cov.shots else {}),
         "empty_files": cov.empty,
         "other_files_not_compared": cov.unindexed,
@@ -929,18 +985,21 @@ def coverage_data(cov: Coverage) -> dict:
 def write_missing_csv(
     coverages: Iterable[Coverage], path: str, category: Category | None = None
 ) -> int:
-    """One row per missing file of every coverage section; returns the rows written."""
+    """One row per missing file of every coverage section (status MISSING), then one per
+    file copied only as the same shot with another size (status RESAVED, mode 1b);
+    returns the rows written."""
     n = 0
     with open(path, "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(MISSING_CSV_FIELDS)
         for cov in coverages:
-            for f in cov.missing:
+            rows = [(f, MISSING) for f in cov.missing] + [(f, RESAVED) for f in cov.resaved]
+            for f, status in rows:
                 path = f.path
                 w.writerow(
                     (cov.pool or "", cov.other, path, f.dir, f.name, f.size, _iso(f.mtime),
                      f.kind, "yes" if path in cov.similar else "no",
-                     category(f.dir) if category else PERSONAL)
+                     category(f.dir) if category else PERSONAL, status)
                 )  # fmt: skip
                 n += 1
     return n

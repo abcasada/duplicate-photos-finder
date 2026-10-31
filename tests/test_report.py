@@ -54,9 +54,9 @@ def build():
     groups += [DuplicateGroup((e, r), "sha256") for e, r in zip(edits, renamed)]
     phone = [rec(f"{one}/Phone", "PXL_1.jpg", 1_000), rec(f"{one}/Phone", "PXL_1 (1).jpg", 1_000)]
     groups.append(DuplicateGroup(tuple(phone), "sha256"))
-    idx = Index(":memory:")
-    idx.replace_root("/drives", records + edits + renamed + phone)
-    return group(groups, idx, ["/drives"]), groups
+    with Index(":memory:") as idx:
+        idx.replace_root("/drives", records + edits + renamed + phone)
+        return group(groups, idx, ["/drives"]), groups
 
 
 def group(groups, idx, roots=("/",), **kw):

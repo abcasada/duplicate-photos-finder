@@ -1,10 +1,15 @@
 """Mode 1b: duplicates by camera shot identity, else by name, size and date (mode 1).
 
 A file's shot key (exif.ExifData.shot, cached by `dpf exif`) is its camera's make, model
-and body serial, the shutter count and DateTimeOriginal, plus its format family and, for
-non-RAW formats, its pixel size. Two files with the same shot key are the same photo in
-the same format, whatever their names, sizes and dates: a DNG or ARW re-saved with new
-metadata still matches its original. This proves the same capture, not the same bytes.
+and body serial, the shutter count and DateTimeOriginal, plus its format family and its
+pixel size. A key is not used when the shutter count did not advance (silent/electronic
+shutter, live view: exif), nor when the guard (Index._shot_guard) finds it on files with
+different camera numbers or under two names in one folder, as in a silent burst.
+
+Two files with the same shot key are the same photo in the same format, whatever their
+names, sizes and dates: a DNG or ARW re-saved with new metadata still matches its
+original. This proves the same capture, not the same bytes; groups whose files differ
+in size are marked (DuplicateGroup.sizes_differ).
 
 Rules:
 - Same shot key: a match, even with different names, sizes and mtimes.
@@ -59,10 +64,12 @@ class ShotStats:
     """What mode 1b found beyond mode 1, for the report header."""
 
     files: int = 0  # compared photos/videos (non-empty)
-    with_identity: int = 0  # cached, with a shot identity
+    with_identity: int = 0  # cached, with a usable shot key
+    unreliable: int = 0  # cached with a key the guard dropped (bursts, Index._shot_guard)
     no_identity: int = 0  # cached, read without an identity
     errors: int = 0  # cached as unreadable
-    no_exif: int = 0  # no valid cached row: run `dpf exif`
+    no_exif: int = 0  # photos with no valid cached row: run `dpf exif`
+    videos: int = 0  # never read: mode 1 rules
     shot_groups: int = 0  # groups that rely on a shot match
     resaved_groups: int = 0  # of those, holding files of different sizes
     vetoed: int = 0  # name/size/date groups split because their shots differ
@@ -76,8 +83,9 @@ def exif_counts(index: Index, roots: Sequence[str]) -> ShotStats:
     """ShotStats with the EXIF cache state of the media under `roots` filled in."""
     counts = index.exif_status(roots)
     stats = ShotStats(
-        with_identity=counts["ok"], no_identity=counts["none"], errors=counts["error"],
-        no_exif=counts["missing"],
+        with_identity=counts["ok"], unreliable=counts["unreliable"],
+        no_identity=counts["none"], errors=counts["error"], no_exif=counts["missing"],
+        videos=counts["video"],
     )  # fmt: skip
     stats.files = sum(counts.values())
     stats.multi_format = index.multi_format_shots(roots)
@@ -133,7 +141,7 @@ def find_shot_duplicates(
         stats.shot_groups += 1
         stats.resaved_groups += len({f.size for f in members.values()}) > 1
         ordered = tuple(sorted(members.values(), key=lambda f: f.path))
-        groups.append(DuplicateGroup(ordered, SHOT_BASIS))
+        groups.append(DuplicateGroup(ordered, SHOT_BASIS, shot=True))
     # A key left here has one file with an identity: its single name group is the match.
     groups += [by_name(part) for parts in keyed.values() for part in parts]
     groups += [by_name(part) for part in plain]

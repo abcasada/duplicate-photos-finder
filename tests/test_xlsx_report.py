@@ -254,13 +254,15 @@ class CategoryXlsxTest(unittest.TestCase):
             wb = Workbook(path)
             self.addCleanup(wb.close)
             pairs = wb.cells("Folder pairs")
-            self.assertEqual((pairs["S1"], pairs["T1"]), ("Time shift", "Category"))
+            self.assertEqual((pairs["S1"], pairs["T1"], pairs["U1"]),
+                             ("Time shift", "Sizes differ", "Category"))  # fmt: skip
             rows = {pairs[f"F{r}"]: r for r in range(2, 5)}
             self.assertEqual(pairs[f"S{rows['/d/one/Trip']}"], "+1 h")
-            self.assertEqual(pairs[f"T{rows['/d/one/Plex']}"], "other")
-            self.assertEqual(pairs[f"T{rows['/d/one/Photos']}"], "personal")
+            self.assertEqual(pairs[f"U{rows['/d/one/Plex']}"], "other")
+            self.assertEqual(pairs[f"U{rows['/d/one/Photos']}"], "personal")
             seq = wb.cells("Sequences")
-            self.assertEqual((seq["L1"], seq["M1"]), ("Time shift", "Category"))
+            self.assertEqual((seq["L1"], seq["M1"], seq["N1"]),
+                             ("Time shift", "Sizes differ", "Category"))  # fmt: skip
             self.assertIn("+1 h", seq.values())
             files = wb.cells("Files")
             self.assertEqual((files["I1"], files["J1"]), ("Hours after first", "Category"))
@@ -279,7 +281,8 @@ class CategoryXlsxTest(unittest.TestCase):
             wb = Workbook(path)
             self.addCleanup(wb.close)
             pairs = wb.cells("Folder pairs")
-            self.assertEqual(pairs["T1"], "Category")
+            self.assertEqual(pairs["U1"], "Category")
+            self.assertNotIn("U2", pairs)
             self.assertNotIn("T2", pairs)
             self.assertNotIn("S2", pairs)
 

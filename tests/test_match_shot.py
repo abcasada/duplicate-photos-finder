@@ -1,12 +1,24 @@
+import csv
+import os
+import tempfile
 import unittest
 
 from dpf.coverage import check_coverage, missing_files
 from dpf.dumps import DumpConfig, check_dumps
 from dpf.exif import ExifData, row_values
+from dpf.grouping import group_duplicates
 from dpf.index import Index
 from dpf.match_name import find_name_duplicates
 from dpf.match_shot import SHOT_BASIS, find_shot_duplicates, split_by_shot
 from dpf.models import FileRecord
+from dpf.report import (
+    RESAVED,
+    SIZES_DIFFER,
+    format_coverage,
+    format_text,
+    run_lines,
+    write_missing_csv,
+)
 
 T = 1_600_000_000.0
 
@@ -16,7 +28,7 @@ def rec(dir, name, size=100, mtime=T):
 
 
 def shot(f: FileRecord, shutter=1, serial="AAA", model="ILCE-7RM4A", taken="2023:01:01 10:00:00",
-         make="SONY", width=None, height=None):  # fmt: skip
+         make="SONY", width=9504, height=6336):  # fmt: skip
     """An EXIF row for `f` (as read at its size and mtime) with the given identity."""
     data = ExifData(
         fmt=f.name.rsplit(".", 1)[-1].lower(), make=make, model=model, serial=serial,
@@ -127,6 +139,59 @@ class ShotDuplicatesTest(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertEqual(self.stats.no_exif, 1)
 
+    def test_silent_burst_is_not_one_shot(self):
+        """Regression (review): a silent-shutter burst shares serial, count and second."""
+        fs = [rec("/r/A", f"DSC0100{i}.ARW", 61_000_000 + i * 12345, T + 0.1 * i)
+              for i in range(3)]  # fmt: skip
+        found, _ = self.find(fs, [shot(f, shutter=5000) for f in fs])
+        self.assertEqual(found, [])
+        self.assertEqual((self.stats.unreliable, self.stats.with_identity), (3, 0))
+        b = rec("/b/X", "DSC01000.ARW", 61_000_000, T)
+        self.idx.replace_root("/b", [b])
+        self.idx.put_exif([shot(b, shutter=5000)])
+        cov = check_coverage(self.idx, ["/r"], ["/b"], pool="A", other="B", direction="x",
+                             shots=True)  # fmt: skip
+        self.assertEqual([f.name for f in cov.missing], ["DSC01001.ARW", "DSC01002.ARW"])
+        self.assertEqual(cov.by_shot, 0)  # DSC01000 is copied by name, size and date only
+
+    def test_guard_drops_a_key_held_under_two_names_in_one_folder(self):
+        fs = [rec("/r/A", "Hawaii-001.ARW", 100), rec("/r/A", "Hawaii-002.ARW", 200)]
+        copy = rec("/r/B", "Hawaii-001.ARW", 150, T + 9)
+        found, _ = self.find(fs + [copy], [shot(f) for f in fs + [copy]])
+        self.assertEqual(found, [])
+        self.assertEqual(self.stats.unreliable, 3)
+
+    def test_renamed_copy_without_camera_number_keeps_the_key(self):
+        a = rec("/r/A", "DSC01000.ARW", 100)
+        b = rec("/r/B", "Hawaii-001.ARW", 104, T + 9)
+        c = rec("/r/C", "DSC01000 (1).ARW", 108, T + 99)  # copy mark: same match key
+        found, _ = self.find([a, b, c], [shot(a), shot(b), shot(c)])
+        self.assertEqual(len(found), 1)
+        self.assertEqual(len(found[0]), 3)
+        self.assertEqual(self.stats.unreliable, 0)
+
+    def test_sizes_differ_marks_pairs_and_runs(self):
+        a = [rec("/r/A", f"DSC0000{i}.ARW", 100 + i) for i in range(3)]
+        b = [rec("/r/B", f"DSC0000{i}.ARW", 100 + i + (i == 1) * 4, T + 9 * (i == 1))
+             for i in range(3)]  # fmt: skip
+        self.idx.replace_root("/r", a + b)
+        self.idx.put_exif([shot(f, shutter=i) for i, f in enumerate(a, 1)])
+        self.idx.put_exif([shot(f, shutter=i) for i, f in enumerate(b, 1)])
+        groups, _ = find_shot_duplicates(self.idx, ["/r"])
+        self.assertEqual([g.sizes_differ for g in groups], [False, True, False])
+        result = group_duplicates(groups, self.idx.list_dir, self.idx.subdirs,
+                                  self.idx.dir_extras, roots=["/r"])  # fmt: skip
+        (pair,) = result.pairs
+        self.assertTrue(pair.sizes_differ)
+        self.assertEqual([r.sizes_differ for r in pair.runs], [True])
+        text = format_text(result, {"basis": "x"}, footer=False)
+        self.assertIn(f"(all photos/videos match, 3 files; {SIZES_DIFFER})", text)
+        self.assertIn(f"({SIZES_DIFFER})", run_lines(pair.runs, 8)[0])
+        plain = [g for g in groups if not g.sizes_differ]
+        result = group_duplicates(plain, self.idx.list_dir, self.idx.subdirs,
+                                  self.idx.dir_extras, roots=["/r"])  # fmt: skip
+        self.assertFalse(result.pairs[0].sizes_differ)
+
     def test_groups_are_disjoint(self):
         files = [rec(f"/r/{i}", "DSC00001.ARW", 100 + i % 2) for i in range(6)]
         rows = [shot(f, shutter=1 + i % 3) for i, f in enumerate(files)]
@@ -154,9 +219,40 @@ class ShotCoverageTest(unittest.TestCase):
         b = rec("/b/2023", "IMGQ0001.DNG", 30_004_096, T + 9_999_999)
         self.assertEqual(self.missing([a], [b], [shot(a), shot(b)]), [])
         self.assertEqual(sum(self.found.by_shot.values()), 1)
+        self.assertEqual(self.found.resaved, [a])  # copied, but as another version
         plain = missing_files(self.idx, ["/a"], ["/b"])  # mode 1 alone
         self.assertEqual([f.path for f in plain.missing], ["/a/2023/IMGQ0001.DNG"])
         self.assertEqual(plain.near, {"/a/2023/IMGQ0001.DNG"})
+
+    def test_renamed_copy_of_the_same_size_is_not_listed_as_resaved(self):
+        a = rec("/a/2023", "IMGQ0001.DNG", 30_000_000)
+        b = rec("/b/2023", "Trip-001.dng", 30_000_000, T + 86_400)
+        self.assertEqual(self.missing([a], [b], [shot(a), shot(b)]), [])
+        self.assertEqual(self.found.resaved, [])
+
+    def test_resaved_files_are_listed_in_report_and_csv(self):
+        a = [rec("/a/2023", f"IMGQ000{i}.DNG", 1_000 + i) for i in range(1, 4)]
+        b = [rec("/b/2023", f"IMGQ000{i}.DNG", 1_100 + i, T + 99) for i in range(1, 3)]
+        self.idx.replace_root("/a", a)
+        self.idx.replace_root("/b", b)
+        self.idx.put_exif([shot(f, shutter=i) for i, f in enumerate(a, 1)])
+        self.idx.put_exif([shot(f, shutter=i) for i, f in enumerate(b, 1)])
+        cov = check_coverage(self.idx, ["/a"], ["/b"], pool="A", other="B", direction="x",
+                             shots=True)  # fmt: skip
+        self.assertEqual([f.name for f in cov.missing], ["IMGQ0003.DNG"])
+        self.assertEqual([f.name for f in cov.resaved], ["IMGQ0001.DNG", "IMGQ0002.DNG"])
+        text = format_coverage(cov)
+        self.assertIn("2 files of those, 2.0 kB, have no copy of the same size there", text)
+        self.assertIn("Copied only as the same shot, sizes differ (re-saved in pool B)", text)
+        self.assertIn("/a/2023   (2 files: IMGQ0001.DNG … IMGQ0002.DNG)", text)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "missing.csv")
+            self.assertEqual(write_missing_csv([cov], path), 3)
+            with open(path, newline="") as fh:
+                rows = list(csv.DictReader(fh))
+        self.assertEqual([(r["name"], r["status"]) for r in rows], [
+            ("IMGQ0003.DNG", "missing"), ("IMGQ0001.DNG", RESAVED), ("IMGQ0002.DNG", RESAVED),
+        ])  # fmt: skip
 
     def test_other_shot_with_same_name_is_missing(self):
         a, b = rec("/a/d", "DSC00001.ARW"), rec("/b/d", "DSC00001.ARW")

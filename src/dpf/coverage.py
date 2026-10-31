@@ -95,6 +95,16 @@ class Coverage:
     vetoed: int = 0  # missing files whose name/size/date match was refused (shots differ)
     no_exif: int = 0  # compared files with no EXIF cached (mode 1b): name rules only
     other_no_exif: int = 0  # the same, in the other pool
+    resaved: list[FileRecord] = field(default_factory=list)  # copied only as the same shot,
+    # no copy there proven to be of the same size: sorted by folder, then natural name order
+
+    @property
+    def resaved_folders(self) -> list[tuple[str, list[FileRecord]]]:
+        """`resaved` per folder, largest total size first."""
+        by_dir: dict[str, list[FileRecord]] = {}
+        for f in self.resaved:
+            by_dir.setdefault(f.dir, []).append(f)
+        return sorted(by_dir.items(), key=lambda e: (-sum(f.size for f in e[1]), e[0]))
 
     @property
     def missing_dirs(self) -> int:
@@ -154,6 +164,8 @@ class Missing:
     near: set[str]
     by_shot: Counter[str] = field(default_factory=Counter)  # per dir: copied as a shot only
     vetoed: Counter[str] = field(default_factory=Counter)  # per dir: missing, name match refused
+    resaved: list[FileRecord] = field(default_factory=list)  # copied as a shot only, and no
+    # copy there is proven to have the same size: the backup may be another version
 
     def astuple(self) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str], set[str]]:
         return self.missing, self.totals, self.similar, self.shifted, self.near
@@ -287,6 +299,7 @@ def _missing_by_shot(
     pending: list[tuple[FileRecord, str, str, bool]] = []  # (file, bucket key, shot, vetoed)
     by_shot: Counter[str] = Counter()
     vetoed: Counter[str] = Counter()
+    resaved: list[FileRecord] = []
     buckets = index.shot_coverage_buckets(
         roots, other_roots, by_size=not ignore_size, exact_names=exact_names,
         words=words, other_words=other_words,
@@ -296,6 +309,7 @@ def _missing_by_shot(
         other = {id(f) for f, side, _, _ in bucket if side}
         shot_of = {id(f): s for f, _, s, _ in bucket}
         elsewhere = {id(f) for f, _, _, e in bucket if e}
+        same_size = {id(f) for f, _, _, e in bucket if e == 2}
         mine = [f for f, side, _, _ in bucket if not side]
         for f in mine:
             totals[f.dir] += 1
@@ -337,6 +351,8 @@ def _missing_by_shot(
                 vetoed[f.dir] += id(f) in refused
             elif id(f) in elsewhere or k in group_elsewhere or k in covered_keys:
                 by_shot[f.dir] += 1
+                if id(f) not in same_size:
+                    resaved.append(f)
             else:
                 pending.append((f, key, k, id(f) in refused))
         missing += left
@@ -344,12 +360,14 @@ def _missing_by_shot(
     for f, key, k, was_refused in pending:
         if k in covered_keys:
             by_shot[f.dir] += 1
+            resaved.append(f)
             continue
         missing.append(f)
         vetoed[f.dir] += was_refused
         note_similar(key, [f])
     missing.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
-    return Missing(missing, totals, similar, shifted, near, by_shot, vetoed)
+    resaved.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
+    return Missing(missing, totals, similar, shifted, near, by_shot, vetoed, resaved)
 
 
 def _count_shifted(
@@ -565,7 +583,7 @@ def check_coverage(
         ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift, shots=shots,
     )  # fmt: skip
     missing, totals, similar, shifted, near = found.astuple()
-    by_shot, vetoed = found.by_shot, found.vetoed
+    by_shot, vetoed, resaved = found.by_shot, found.vetoed, found.resaved
     extras = index.extras_under(roots)
 
     def cat(d: str) -> str:
@@ -586,6 +604,7 @@ def check_coverage(
         shifted = Counter({d: n for d, n in shifted.items() if cat(d) == only})
         by_shot = Counter({d: n for d, n in by_shot.items() if cat(d) == only})
         vetoed = Counter({d: n for d, n in vetoed.items() if cat(d) == only})
+        resaved = [f for f in resaved if cat(f.dir) == only]
         extras = {d: n for d, n in extras.items() if cat(d) == only}
         similar = {p for p in similar if cat(p.rsplit("/", 1)[0] or "/") == only}
         near &= similar
@@ -609,6 +628,7 @@ def check_coverage(
         cov.shots = True
         cov.by_shot = sum(by_shot.values())
         cov.vetoed = sum(vetoed.values())
+        cov.resaved = resaved
         cov.no_exif = index.exif_status(roots)["missing"]
         cov.other_no_exif = index.exif_status(other_roots)["missing"]
     cov.shifted = sum(shifted.values())

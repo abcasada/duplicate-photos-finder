@@ -31,6 +31,7 @@ from dpf.grouping import (
     FolderPair,
     GroupingResult,
     TreePair,
+    natural_key,
 )
 from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
@@ -405,13 +406,18 @@ def _shift(table: _Table, col: int, hours: Sequence[int]) -> None:
         table.text(col, shift_cell(hours), table.fmt.warning_text)
 
 
+def _resized(table: _Table, col: int, flag: bool) -> None:
+    if flag:
+        table.text(col, "same shot", table.fmt.warning_text)
+
+
 def _category(table: _Table, col: int, category: str | None) -> None:
     """The category cell (amber for other media); empty when no categories are set."""
     if category:
         table.text(col, category, table.fmt.warning_text if category == OTHER else None)
 
 
-_EXTRA_COLUMNS = [("Time shift", 11), ("Category", 10)]
+_EXTRA_COLUMNS = [("Time shift", 11), ("Sizes differ", 10), ("Category", 10)]
 
 
 def _relation(table: _Table, col: int, label: str, fill: str | None) -> None:
@@ -457,7 +463,8 @@ def _trees(
         t.num(11, tree.folders)
         _not_compared(t, 12, tree.unindexed)
         _shift(t, 13, tree.hour_shift)
-        _category(t, 14, categories and tree.category)
+        _resized(t, 14, tree.sizes_differ)
+        _category(t, 15, categories and tree.category)
     t.data_bar(1)
     return t
 
@@ -518,7 +525,8 @@ def _pairs(
         if text:
             t.text(17, text)
         _shift(t, 18, p.hour_shift)
-        _category(t, 19, categories and p.category)
+        _resized(t, 19, p.sizes_differ)
+        _category(t, 20, categories and p.category)
     t.data_bar(2)
     return t
 
@@ -552,7 +560,8 @@ def _sequences(
                 t.num(9, len(r.skipped), fmt.amber)
                 t.text(10, name_list(r.skipped, _SKIPPED_NAMES))
             _shift(t, 11, r.hour_shift)
-            _category(t, 12, categories and p.category)
+            _resized(t, 12, r.sizes_differ)
+            _category(t, 13, categories and p.category)
     return t
 
 
@@ -616,7 +625,37 @@ def _files(
 def _coverage_tables(
     wb, fmt: _Formats, coverage: Sequence[Coverage], used: set[str]
 ) -> list[_Table]:
-    return [_coverage_sheet(wb, fmt, cov, sheet_name(cov.label, used)) for cov in coverage]
+    tables = []
+    for cov in coverage:
+        tables.append(_coverage_sheet(wb, fmt, cov, sheet_name(cov.label, used)))
+        if cov.resaved:
+            tables.append(_resaved_sheet(wb, fmt, cov, sheet_name(f"{cov.label} re-saved", used)))
+    return tables
+
+
+def _resaved_sheet(wb, fmt: _Formats, cov: Coverage, name: str) -> _Table:
+    """One row per folder of files counted as copied only as the same shot (mode 1b)
+    while no copy in the other pool has their size."""
+    columns = [
+        ("#", 6), ("Size", 13), ("Folder", None), ("Files", 8), ("First", None),
+        ("Last", None),
+    ]  # fmt: skip
+    note = (f"copied to pool {cov.other} only as the same camera shot, with no copy of the "
+            "same size there (re-saved: the backup is another version); every file is in "
+            "missing.csv")  # fmt: skip
+    t = _Table(wb, fmt, name, columns, freeze_cols=1, note=note)
+    for n, (d, files) in enumerate(cov.resaved_folders, 1):
+        if not t.next_row():
+            continue
+        names = sorted((f.name for f in files), key=natural_key)
+        t.num(0, n)
+        t.num(1, sum(f.size for f in files), fmt.size)
+        t.folder(2, d)
+        t.num(3, len(files))
+        t.text(4, names[0])
+        t.text(5, names[-1])
+    t.data_bar(1)
+    return t
 
 
 def _dump_tables(wb, fmt: _Formats, check: DumpCheck | None, used: set[str]) -> list[_Table]:
@@ -988,6 +1027,8 @@ def _notes(near: float) -> list[str]:
         "Time shift (amber): some matches differ by whole hours (copies made across time "
         "zones or a DST change); +1 h = B's dates are one hour later than A's. "
         "--strict-time turns this off.",
+        'Sizes differ (amber, mode 1b): some matches are the same camera shot in files of '
+        "different sizes (re-saved with new metadata): not the same contents.",
         "Category: personal, or other (folders listed under [categories] other in the pools "
         "file); empty when no categories are set. A pair is other only when both folders are.",
         "Folder cells link to the folder on this computer (file:// links).",

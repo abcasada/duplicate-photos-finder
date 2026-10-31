@@ -21,7 +21,7 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 
 from dpf.models import DriveSpace, FileRecord, RootStats
-from dpf.names import match_key
+from dpf.names import camera_token, match_key
 
 _TABLES = """
 CREATE TABLE IF NOT EXISTS roots (
@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS dirs (
     other  INTEGER NOT NULL,
     errors INTEGER NOT NULL
 ) WITHOUT ROWID;
+"""
+
+_EXIF_TABLE = """
 CREATE TABLE IF NOT EXISTS exif (
     dir          TEXT NOT NULL,
     name         TEXT NOT NULL,
@@ -76,8 +79,7 @@ CREATE TABLE IF NOT EXISTS exif (
     taken_subsec TEXT,
     width        INTEGER,
     height       INTEGER,
-    created      TEXT,
-    duration     REAL,
+    shutter_mode TEXT,
     fmt          TEXT,
     ident        TEXT,
     shot         TEXT,
@@ -96,13 +98,15 @@ CREATE INDEX IF NOT EXISTS exif_shot ON exif (shot);
 
 EXIF_COLUMNS = (
     "dir", "name", "read_size", "read_mtime", "status", "make", "model", "serial", "shutter",
-    "taken", "taken_offset", "taken_subsec", "width", "height", "created", "duration", "fmt",
+    "taken", "taken_offset", "taken_subsec", "width", "height", "shutter_mode", "fmt",
     "ident", "shot", "note", "read_at",
 )  # fmt: skip
 
-# The cached shot of a files row joined as `e` (NULL when absent or out of date).
-_SHOT = "CASE WHEN e.read_size = files.size AND e.read_mtime = files.mtime THEN e.shot END"
 _VALID_EXIF = "e.read_size = files.size AND e.read_mtime = files.mtime"
+# A shot key the guard found unreliable (Index._shot_guard), for the exif row `e`.
+_BAD_SHOT = "EXISTS (SELECT 1 FROM temp.bad_shots b WHERE b.shot = e.shot)"
+# The usable shot of a files row joined as `e`: NULL when absent, out of date or unreliable.
+_SHOT = f"CASE WHEN {_VALID_EXIF} AND NOT {_BAD_SHOT} THEN e.shot END"
 
 _COLUMNS = "dir, name, name_key, size, mtime, kind, match_key"
 _ROOT_COLUMNS = (
@@ -125,11 +129,14 @@ _SPACE_COLUMNS = {
 #   5  roots.used_bytes, capacity_bytes, is_mount, space_source, space_at: the drive's
 #      space (statvfs at scan time, `dpf space`, or entered by hand); NULL until recorded
 #   6  exif table (dpf exif; mode 1b), created empty: no existing row changes
+#   7  exif table recreated when it lacks shutter_mode: rows of the first 1b build kept
+#      Sony serials in another form and no shutter mode, so their keys cannot be trusted
+#      (a cache of connected drives only; nothing else changes)
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 6
+_VERSION = 7
 
 _BATCH = 10_000
 
@@ -231,8 +238,9 @@ class Index:
         self.conn = sqlite3.connect(self.path)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self._guarded = False  # temp.bad_shots is up to date (_shot_guard)
         try:
-            self.conn.executescript(_TABLES)
+            self.conn.executescript(_TABLES + _EXIF_TABLE)
             self._migrate()
             self.conn.executescript(_INDEXES)
         except BaseException:
@@ -263,7 +271,12 @@ class Index:
                 for column, kind in _SPACE_COLUMNS.items():
                     if column not in columns:
                         self.conn.execute(f"ALTER TABLE roots ADD COLUMN {column} {kind}")
-            # 6: the exif table is created by _TABLES (IF NOT EXISTS); nothing to convert.
+            # 6: the exif table is created by _EXIF_TABLE (IF NOT EXISTS); nothing to convert.
+            if version < 7:
+                columns = {r[1] for r in self.conn.execute("PRAGMA table_info(exif)")}
+                if "shutter_mode" not in columns:
+                    self.conn.execute("DROP TABLE exif")
+                    self.conn.execute(_EXIF_TABLE)
             if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
             self.conn.commit()
@@ -297,6 +310,11 @@ class Index:
     def close(self) -> None:
         self.conn.close()
 
+    def __del__(self) -> None:
+        conn = getattr(self, "conn", None)  # absent if __init__ failed early
+        if conn is not None:
+            conn.close()
+
     def __enter__(self) -> Index:
         return self
 
@@ -321,6 +339,7 @@ class Index:
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
         files = total = 0
+        self._guarded = False
         with self.conn:
             self.conn.execute(f"DELETE FROM files WHERE {where}", params)
             self._replace_dirs(where, params, dir_stats)
@@ -373,6 +392,7 @@ class Index:
         """
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
+        self._guarded = False
         with self.conn:
             files, total = self.conn.execute(
                 f"SELECT count(*), coalesce(sum(size), 0) FROM staging WHERE {where}", params
@@ -422,6 +442,7 @@ class Index:
         """
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
+        self._guarded = False
         with self.conn:
             removed = self.conn.execute(f"DELETE FROM files WHERE {where}", params).rowcount
             for table in ("dirs", "staging", "exif"):
@@ -630,8 +651,10 @@ class Index:
     def exif_todo(
         self, roots: Sequence[str], *, retry_errors: bool = False
     ) -> list[tuple[str, str, int, float, str]]:
-        """(dir, name, size, mtime, kind) of the non-empty photos/videos under `roots` that
-        lack a valid EXIF row (or whose row is an error, with `retry_errors`), in folder order.
+        """(dir, name, size, mtime, kind) of the non-empty photos under `roots` that lack a
+        valid EXIF row (or whose row is an error, with `retry_errors`), in folder order.
+
+        Videos are never read: they have no shot identity and match by mode 1 rules.
         """
         where, params = _prefix_clause(roots)
         stale = "e.status IS NULL OR NOT (" + _VALID_EXIF + ")"
@@ -639,13 +662,14 @@ class Index:
             stale += " OR e.status = 'error'"
         return self.conn.execute(
             f"SELECT dir, name, size, mtime, kind FROM files LEFT JOIN exif e USING (dir, name) "
-            f"WHERE {where} AND size > 0 AND kind != 'other' AND ({stale}) ORDER BY dir, name",
+            f"WHERE {where} AND size > 0 AND kind = 'image' AND ({stale}) ORDER BY dir, name",
             params,
         ).fetchall()
 
     def put_exif(self, rows: Iterable[Sequence]) -> None:
         """Insert or replace EXIF rows (values in EXIF_COLUMNS order), in one transaction."""
         marks = ", ".join("?" * len(EXIF_COLUMNS))
+        self._guarded = False
         with self.conn:
             self.conn.executemany(
                 f"INSERT OR REPLACE INTO exif ({', '.join(EXIF_COLUMNS)}) VALUES ({marks})", rows
@@ -659,38 +683,46 @@ class Index:
         return dict(zip(EXIF_COLUMNS, row)) if row else None
 
     def exif_status(self, roots: Sequence[str]) -> dict[str, int]:
-        """Non-empty photos/videos under `roots` by EXIF state: "ok" (a shot identity),
-        "none" (read, no identity), "error", and "missing" (no valid row)."""
+        """Non-empty photos/videos under `roots` by EXIF state: "ok" (a usable shot key),
+        "unreliable" (a key the guard dropped), "none" (read, no key), "error", "missing"
+        (a photo with no valid row) and "video" (videos are never read)."""
+        self._shot_guard()
         where, params = _prefix_clause(roots)
         rows = self.conn.execute(
-            f"SELECT CASE WHEN e.status IS NULL OR NOT ({_VALID_EXIF}) THEN 'missing' "
+            f"SELECT CASE WHEN kind = 'video' THEN 'video' "
+            f"WHEN e.status IS NULL OR NOT ({_VALID_EXIF}) THEN 'missing' "
+            f"WHEN e.status = 'ok' AND {_BAD_SHOT} THEN 'unreliable' "
             f"ELSE e.status END, count(*) FROM files LEFT JOIN exif e USING (dir, name) "
             f"WHERE {where} AND size > 0 AND kind != 'other' GROUP BY 1",
             params,
         )
-        counts = {"ok": 0, "none": 0, "error": 0, "missing": 0}
+        counts = {"ok": 0, "unreliable": 0, "none": 0, "error": 0, "missing": 0, "video": 0}
         counts.update(dict(rows.fetchall()))
         return counts
 
     def multi_format_shots(self, roots: Sequence[str]) -> int:
         """Camera shots under `roots` cached in two or more formats (e.g. RAW+JPG)."""
+        self._shot_guard()
         where, params = _prefix_clause(roots)
         return self.conn.execute(
             f"SELECT count(*) FROM (SELECT e.ident FROM files JOIN exif e USING (dir, name) "
-            f"WHERE {where} AND size > 0 AND e.ident IS NOT NULL AND {_VALID_EXIF} "
+            f"WHERE {where} AND size > 0 AND e.shot IS NOT NULL AND {_VALID_EXIF} "
+            f"AND NOT {_BAD_SHOT} "
             f"GROUP BY e.ident HAVING count(DISTINCT e.fmt) > 1)",
             params,
         ).fetchone()[0]
 
     def shot_groups(self, roots: Sequence[str]) -> Iterator[tuple[str, list[FileRecord]]]:
         """Yield (shot, files) for every shot key held by two or more non-empty files under
-        `roots` with valid EXIF rows. Streams in shot order."""
+        `roots` with valid EXIF rows. Streams in shot order. Unreliable keys are left out."""
+        self._shot_guard()
         where, params = _prefix_clause(roots)
         sql = f"""
             WITH s AS (
                 SELECT dir, name, size, mtime, kind, e.shot AS shot
                 FROM files JOIN exif e USING (dir, name)
                 WHERE {where} AND size > 0 AND e.shot IS NOT NULL AND {_VALID_EXIF}
+                  AND NOT {_BAD_SHOT}
             ), d AS (SELECT shot FROM s GROUP BY shot HAVING count(*) > 1)
             SELECT dir, name, size, mtime, kind, shot FROM s JOIN d USING (shot)
             ORDER BY shot, dir, name
@@ -702,7 +734,8 @@ class Index:
     def shot_name_buckets(
         self, roots: Sequence[str], *, by_size: bool = True, exact_names: bool = False
     ) -> Iterator[list[tuple[FileRecord, str | None]]]:
-        """name_buckets, with each file's cached shot key (None without a valid one)."""
+        """name_buckets, with each file's usable shot key (None without one)."""
+        self._shot_guard()
         where, params = _prefix_clause(roots)
         column = "name_key" if exact_names else "match_key"
         keys = f"{column}, size" if by_size else column
@@ -728,13 +761,15 @@ class Index:
         exact_names: bool = False,
         words: Words = Words(),
         other_words: Words = Words(),
-    ) -> Iterator[tuple[str, list[tuple[FileRecord, bool, str | None, bool]]]]:
+    ) -> Iterator[tuple[str, list[tuple[FileRecord, bool, str | None, int]]]]:
         """coverage_buckets, each entry extended to (file, other side, shot, elsewhere).
 
-        `shot` is the file's cached shot key (None without a valid one); `elsewhere` is
-        True for a file under `roots` whose shot is also held by a non-empty file under
-        `other_roots` with a valid row, wherever it lies and whatever its name.
+        `shot` is the file's usable shot key (None without one). `elsewhere`, for a file
+        under `roots`, is 2 when a non-empty file of the same size under `other_roots`
+        holds its shot (valid row), wherever it lies and whatever its name; 1 when only
+        files of other sizes do; else 0.
         """
+        self._shot_guard()
         where, params = _prefix_clause(roots)
         other, other_params = _prefix_clause(other_roots)
         extra, extra_params = words.clause()
@@ -744,8 +779,9 @@ class Index:
         column = "name_key" if exact_names else "match_key"
         order = "6, 3, 1, 2" if by_size else "6, 1, 2"
         elsewhere = f"""
-            CASE WHEN e.shot IS NOT NULL AND {_VALID_EXIF} THEN EXISTS (
-                SELECT 1 FROM exif e2 JOIN files f2 USING (dir, name)
+            CASE WHEN e.shot IS NOT NULL AND {_VALID_EXIF} AND NOT {_BAD_SHOT} THEN (
+                SELECT max(CASE WHEN f2.size = files.size THEN 2 ELSE 1 END)
+                FROM exif e2 JOIN files f2 USING (dir, name)
                 WHERE e2.shot = e.shot AND f2.size = e2.read_size AND f2.mtime = e2.read_mtime
                   AND f2.size > 0 AND {other}
             ) ELSE 0 END
@@ -765,6 +801,42 @@ class Index:
         for _, group in itertools.groupby(rows, key=keyfn):
             bucket = list(group)
             if any(not r[6] for r in bucket):
-                yield bucket[0][5], [
-                    (_record(r), bool(r[6]), r[7], bool(r[8])) for r in bucket
-                ]
+                yield bucket[0][5], [(_record(r), bool(r[6]), r[7], r[8] or 0) for r in bucket]
+
+    def _shot_guard(self) -> None:
+        """Fill temp.bad_shots with the shot keys that cannot identify one photo.
+
+        A key is unreliable when, across the whole index, its files (same format, valid
+        rows) carry different camera numbers (names.camera_token of their match keys:
+        "DSC01000" and "DSC01001" of a silent-shutter burst share serial, shutter count
+        and second), or when one folder holds it under two names (match keys). A copy
+        renamed without any camera number never triggers it alone. Recomputed after any
+        change to files or exif rows.
+        """
+        if self._guarded:
+            return
+        self.conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS bad_shots (shot TEXT PRIMARY KEY) WITHOUT ROWID"
+        )
+        rows = self.conn.execute(f"""
+            SELECT e.shot, dir, match_key FROM files JOIN exif e USING (dir, name)
+            WHERE {_VALID_EXIF} AND e.shot IN (
+                SELECT shot FROM exif WHERE shot IS NOT NULL GROUP BY shot HAVING count(*) > 1
+            )
+            ORDER BY e.shot
+        """)
+        bad = []
+        for shot, group in itertools.groupby(rows, key=lambda r: r[0]):
+            numbers: set[str] = set()
+            keys: dict[str, set[str]] = {}
+            for _, d, key in group:
+                number = camera_token(os.path.splitext(key)[0])
+                if number:
+                    numbers.add(number)
+                keys.setdefault(d, set()).add(key)
+            if len(numbers) > 1 or any(len(k) > 1 for k in keys.values()):
+                bad.append((shot,))
+        with self.conn:
+            self.conn.execute("DELETE FROM temp.bad_shots")
+            self.conn.executemany("INSERT INTO temp.bad_shots VALUES (?)", bad)
+        self._guarded = True

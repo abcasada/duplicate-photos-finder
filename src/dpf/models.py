@@ -27,11 +27,18 @@ class DuplicateGroup:
 
     `hours` gives, per file (in `files` order), the whole hours its mtime lies after the
     earliest file's, when the copies differ by a whole-hour time shift; () when none do.
+    `shot` is True for a mode 1b group matched as the same camera shot.
     """
 
     files: tuple[FileRecord, ...]
     basis: str
     hours: tuple[int, ...] = ()
+    shot: bool = False
+
+    @property
+    def sizes_differ(self) -> bool:
+        """True for a same-shot group whose files are not all of one size (re-saved)."""
+        return self.shot and len({f.size for f in self.files}) > 1
 
     @property
     def hour_shift(self) -> bool:
