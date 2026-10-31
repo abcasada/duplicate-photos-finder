@@ -14,11 +14,13 @@ used and total space of the drive holding the root: measured at each scan or by
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from dpf.models import DriveSpace, FileRecord, RootStats
 from dpf.names import camera_token, match_key
@@ -89,6 +91,27 @@ CREATE TABLE IF NOT EXISTS exif (
 ) WITHOUT ROWID;
 """
 
+# One row per SMART reading of a physical drive (dpf smart, or imported); every reading is
+# kept, so reports can show a trend. JSON columns hold the smart-summary record parts.
+_SMART_TABLE = """
+CREATE TABLE IF NOT EXISTS smart (
+    serial     TEXT NOT NULL,
+    read_at    REAL NOT NULL,
+    source     TEXT NOT NULL,
+    host       TEXT,
+    device     TEXT,
+    model      TEXT,
+    labels     TEXT NOT NULL,
+    mounts     TEXT NOT NULL,
+    summary    TEXT NOT NULL,
+    flags      TEXT NOT NULL,
+    kernel     TEXT,
+    partitions TEXT,
+    smartctl   TEXT,
+    UNIQUE (serial, read_at)
+);
+"""
+
 # Created after _migrate, since they may name columns that older databases lack.
 _INDEXES = """
 CREATE INDEX IF NOT EXISTS files_name_size ON files (name_key, size);
@@ -132,11 +155,13 @@ _SPACE_COLUMNS = {
 #   7  exif table recreated when it lacks shutter_mode: rows of the first 1b build kept
 #      Sony serials in another form and no shutter mode, so their keys cannot be trusted
 #      (a cache of connected drives only; nothing else changes)
+#   8  smart table (dpf smart): every SMART reading per drive serial, created empty;
+#      nothing else changes. forget_root leaves it alone (readings are per physical drive)
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 7
+_VERSION = 8
 
 _BATCH = 10_000
 
@@ -240,7 +265,7 @@ class Index:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._guarded = False  # temp.bad_shots is up to date (_shot_guard)
         try:
-            self.conn.executescript(_TABLES + _EXIF_TABLE)
+            self.conn.executescript(_TABLES + _EXIF_TABLE + _SMART_TABLE)
             self._migrate()
             self.conn.executescript(_INDEXES)
         except BaseException:
@@ -277,6 +302,7 @@ class Index:
                 if "shutter_mode" not in columns:
                     self.conn.execute("DROP TABLE exif")
                     self.conn.execute(_EXIF_TABLE)
+            # 8: the smart table is created by _SMART_TABLE (IF NOT EXISTS); nothing to convert.
             if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
             self.conn.commit()
@@ -438,7 +464,8 @@ class Index:
     def forget_root(self, root: str) -> int:
         """Remove everything indexed at or under `root` (files, dirs, staging, exif, roots).
 
-        Only the index is touched. Returns the number of files removed.
+        SMART readings stay: they belong to a physical drive, not a path. Only the index
+        is touched. Returns the number of files removed.
         """
         root = root.rstrip("/") or "/"
         where, params = _prefix_clause([root])
@@ -853,3 +880,100 @@ class Index:
             self.conn.execute("DELETE FROM temp.bad_shots")
             self.conn.executemany("INSERT INTO temp.bad_shots VALUES (?)", bad)
         self._guarded = True
+
+    # -- SMART readings (dpf smart) --------------------------------------------------
+
+    def put_smart(self, records: Iterable[Mapping], source: str) -> int:
+        """Store SMART readings (smart-summary drive entries plus `labels`/`mounts`).
+
+        A reading is keyed by serial number and time (`collected_at`), so storing one again
+        (e.g. importing a report twice) changes nothing. Entries without a serial number
+        or a valid time are skipped. Returns the number of readings added.
+        """
+        rows = [row for rec in records if (row := _smart_row(rec, source)) is not None]
+        with self.conn:
+            before = self.conn.total_changes
+            self.conn.executemany(
+                f"INSERT OR IGNORE INTO smart ({', '.join(_SMART_COLUMNS)}) "
+                f"VALUES ({', '.join('?' * len(_SMART_COLUMNS))})",
+                rows,
+            )
+            return self.conn.total_changes - before
+
+    def smart_latest(self, *, full: bool = False) -> list[dict]:
+        """The newest reading of each drive, by serial; `full` adds smartctl's output."""
+        rows = self.conn.execute(
+            f"SELECT {_smart_select(full)} FROM smart s WHERE read_at = "
+            "(SELECT max(read_at) FROM smart WHERE serial = s.serial) ORDER BY serial"
+        )
+        return [_smart_record(r, full) for r in rows]
+
+    def smart_history(self, serial: str | None = None, *, full: bool = False) -> list[dict]:
+        """Every reading of drive `serial` (of every drive if None), oldest first."""
+        where, params = ("WHERE serial = ?", (serial.strip(),)) if serial is not None else ("", ())
+        rows = self.conn.execute(
+            f"SELECT {_smart_select(full)} FROM smart {where} ORDER BY serial, read_at", params
+        )
+        return [_smart_record(r, full) for r in rows]
+
+
+_SMART_COLUMNS = (
+    "serial", "read_at", "source", "host", "device", "model", "labels", "mounts", "summary",
+    "flags", "kernel", "partitions", "smartctl",
+)  # fmt: skip
+
+
+def _smart_select(full: bool) -> str:
+    return ", ".join(_SMART_COLUMNS[:-1] + (("smartctl",) if full else ()))
+
+
+def _json(value: object) -> str | None:
+    return None if value is None else json.dumps(value, ensure_ascii=False)
+
+
+def _smart_row(rec: Mapping, source: str) -> tuple | None:
+    summary = rec.get("summary") or {}
+    serial = str(summary.get("serial_number") or "").strip()
+    try:
+        when = datetime.fromisoformat(rec.get("collected_at") or "")
+    except (TypeError, ValueError):
+        return None
+    if not serial:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (
+        serial, when.timestamp(), source, rec.get("host"), rec.get("device_path"),
+        summary.get("model"), _json(list(rec.get("labels") or [])),
+        _json(list(rec.get("mounts") or [])), _json({**summary, "serial_number": serial}),
+        _json(list(rec.get("flags") or [])),
+        _json(rec.get("kernel_log_issues")), _json(rec.get("partitions")),
+        _json(rec.get("smartctl")),
+    )  # fmt: skip
+
+
+def _smart_record(row: Sequence, full: bool) -> dict:
+    """A stored reading in the smart-summary record format (plus labels, mounts, source)."""
+    values = dict(zip(_SMART_COLUMNS, row))
+
+    def load(key: str):
+        text = values.get(key)
+        return None if text is None else json.loads(text)
+
+    rec = {
+        "collected_at": datetime.fromtimestamp(values["read_at"], timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+        "host": values["host"],
+        "device_path": values["device"],
+        "summary": load("summary"),
+        "flags": load("flags"),
+        "partitions": load("partitions"),
+        "kernel_log_issues": load("kernel"),
+        "labels": load("labels"),
+        "mounts": load("mounts"),
+        "source": values["source"],
+    }
+    if full:
+        rec["smartctl"] = load("smartctl")
+    return rec

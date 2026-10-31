@@ -389,6 +389,53 @@ class IndexFileTest(unittest.TestCase):
         with Index(path) as idx:
             self.assertEqual(idx.totals(["/a"])[0], 1)
 
+    def test_migrates_version_7_in_place(self):
+        """v8 adds the smart table; files, roots and exif rows are kept."""
+        path = os.path.join(self.tmp.name, "index.db")
+        with Index(path) as idx:
+            idx.replace_root("/m/A", [rec("/m/A", "x.jpg")])
+            idx.put_exif([("/m/A", "x.jpg", 1, 0.0, "none") + (None,) * 14 + (5.0,)])
+            idx.conn.execute("DROP TABLE smart")
+            idx.conn.execute("PRAGMA user_version = 7")
+            idx.conn.commit()
+        with Index(path) as idx:
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], _VERSION)
+            self.assertEqual(_VERSION, 8)
+            self.assertEqual(idx.totals(["/m"])[0], 1)
+            self.assertEqual(idx.exif_row("/m/A", "x.jpg")["status"], "none")
+            self.assertEqual(idx.smart_latest(), [])
+            self.assertEqual(idx.put_smart([smart_rec("S1")], "smartctl"), 1)
+        with Index(path) as idx:  # reopening is a no-op
+            self.assertEqual(len(idx.smart_history()), 1)
+
+    def test_smart_readings_keep_history(self):
+        with Index(os.path.join(self.tmp.name, "index.db")) as idx:
+            first = [smart_rec("S1", "2026-10-25T19:43:34+00:00", pending=1),
+                     smart_rec("S2", "2026-10-25T19:43:34+00:00"),
+                     smart_rec("", "2026-10-25T19:43:34+00:00"),  # no serial: skipped
+                     smart_rec("S3", "not a time")]  # fmt: skip
+            self.assertEqual(idx.put_smart(first, "import"), 2)
+            self.assertEqual(idx.put_smart(first, "import"), 0)  # importing again adds nothing
+            later = smart_rec("S1 ", "2026-10-31T08:00:00+00:00", pending=3)
+            self.assertEqual(idx.put_smart([later], "smartctl"), 1)
+            latest = idx.smart_latest()
+            self.assertEqual([r["summary"]["serial_number"] for r in latest], ["S1", "S2"])
+            self.assertEqual(latest[0]["collected_at"], "2026-10-31T08:00:00+00:00")
+            self.assertEqual(latest[0]["source"], "smartctl")
+            self.assertEqual(latest[0]["mounts"], ["/run/media/u/D"])
+            self.assertEqual(latest[0]["labels"], ["D"])
+            self.assertNotIn("smartctl", latest[0])
+            history = idx.smart_history("S1", full=True)
+            self.assertEqual([r["summary"]["ata_attributes"]["pending_sectors"] for r in history],
+                             [1, 3])  # fmt: skip
+            self.assertEqual(history[0]["collected_at"], "2026-10-25T19:43:34+00:00")
+            self.assertEqual(history[0]["smartctl"], {"device": {"name": "/dev/sda"}})
+            self.assertEqual(history[0]["kernel_log_issues"], ["line"])
+            self.assertEqual(len(idx.smart_history()), 3)
+            idx.replace_root("/run/media/u/D", [rec("/run/media/u/D", "x.jpg")])
+            idx.forget_root("/run/media/u/D")
+            self.assertEqual(len(idx.smart_history()), 3)  # per drive, not per path
+
     def test_older_inventory_dropped(self):
         path = os.path.join(self.tmp.name, "index.db")
         with Index(path) as idx:
@@ -397,6 +444,16 @@ class IndexFileTest(unittest.TestCase):
         with Index(path) as idx:
             self.assertEqual(idx.totals(["/a"])[0], 0)
             self.assertIsNone(idx.root_stats("/a"))
+
+
+def smart_rec(serial, when="2026-10-31T12:00:00+00:00", pending=0):
+    return {
+        "collected_at": when, "host": "h", "device_path": "/dev/sda", "flags": [],
+        "partitions": [], "kernel_log_issues": ["line"], "labels": ["D"],
+        "mounts": ["/run/media/u/D"], "smartctl": {"device": {"name": "/dev/sda"}},
+        "summary": {"serial_number": serial, "model": "WD",
+                    "ata_attributes": {"pending_sectors": pending}},
+    }  # fmt: skip
 
 
 # The schema of user_version 2, before the match_key column.
