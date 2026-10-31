@@ -61,13 +61,48 @@ CREATE TABLE IF NOT EXISTS dirs (
     other  INTEGER NOT NULL,
     errors INTEGER NOT NULL
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS exif (
+    dir          TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    read_size    INTEGER NOT NULL,
+    read_mtime   REAL NOT NULL,
+    status       TEXT NOT NULL,
+    make         TEXT,
+    model        TEXT,
+    serial       TEXT,
+    shutter      INTEGER,
+    taken        TEXT,
+    taken_offset TEXT,
+    taken_subsec TEXT,
+    width        INTEGER,
+    height       INTEGER,
+    created      TEXT,
+    duration     REAL,
+    fmt          TEXT,
+    ident        TEXT,
+    shot         TEXT,
+    note         TEXT,
+    read_at      REAL NOT NULL,
+    PRIMARY KEY (dir, name)
+) WITHOUT ROWID;
 """
 
 # Created after _migrate, since they may name columns that older databases lack.
 _INDEXES = """
 CREATE INDEX IF NOT EXISTS files_name_size ON files (name_key, size);
 CREATE INDEX IF NOT EXISTS files_match_size ON files (match_key, size);
+CREATE INDEX IF NOT EXISTS exif_shot ON exif (shot);
 """
+
+EXIF_COLUMNS = (
+    "dir", "name", "read_size", "read_mtime", "status", "make", "model", "serial", "shutter",
+    "taken", "taken_offset", "taken_subsec", "width", "height", "created", "duration", "fmt",
+    "ident", "shot", "note", "read_at",
+)  # fmt: skip
+
+# The cached shot of a files row joined as `e` (NULL when absent or out of date).
+_SHOT = "CASE WHEN e.read_size = files.size AND e.read_mtime = files.mtime THEN e.shot END"
+_VALID_EXIF = "e.read_size = files.size AND e.read_mtime = files.mtime"
 
 _COLUMNS = "dir, name, name_key, size, mtime, kind, match_key"
 _ROOT_COLUMNS = (
@@ -89,11 +124,12 @@ _SPACE_COLUMNS = {
 #   4  match_key recomputed: text around a camera number is only dropped when neutral
 #   5  roots.used_bytes, capacity_bytes, is_mount, space_source, space_at: the drive's
 #      space (statvfs at scan time, `dpf space`, or entered by hand); NULL until recorded
+#   6  exif table (dpf exif; mode 1b), created empty: no existing row changes
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 5
+_VERSION = 6
 
 _BATCH = 10_000
 
@@ -227,6 +263,7 @@ class Index:
                 for column, kind in _SPACE_COLUMNS.items():
                     if column not in columns:
                         self.conn.execute(f"ALTER TABLE roots ADD COLUMN {column} {kind}")
+            # 6: the exif table is created by _TABLES (IF NOT EXISTS); nothing to convert.
             if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
             self.conn.commit()
@@ -379,7 +416,7 @@ class Index:
         return self.root_stats(root) if updated else None
 
     def forget_root(self, root: str) -> int:
-        """Remove everything indexed at or under `root` (files, dirs, staging, roots rows).
+        """Remove everything indexed at or under `root` (files, dirs, staging, exif, roots).
 
         Only the index is touched. Returns the number of files removed.
         """
@@ -387,7 +424,7 @@ class Index:
         where, params = _prefix_clause([root])
         with self.conn:
             removed = self.conn.execute(f"DELETE FROM files WHERE {where}", params).rowcount
-            for table in ("dirs", "staging"):
+            for table in ("dirs", "staging", "exif"):
                 self.conn.execute(f"DELETE FROM {table} WHERE {where}", params)
             self.conn.execute(
                 "DELETE FROM roots WHERE path = ? OR (path >= ? AND path < ?)",
@@ -587,3 +624,147 @@ class Index:
             rest = d[len(lo):]
             children.add(lo + rest.split("/", 1)[0])
         return sorted(children)
+
+    # -- EXIF cache (dpf exif, mode 1b) ----------------------------------------------
+
+    def exif_todo(
+        self, roots: Sequence[str], *, retry_errors: bool = False
+    ) -> list[tuple[str, str, int, float, str]]:
+        """(dir, name, size, mtime, kind) of the non-empty photos/videos under `roots` that
+        lack a valid EXIF row (or whose row is an error, with `retry_errors`), in folder order.
+        """
+        where, params = _prefix_clause(roots)
+        stale = "e.status IS NULL OR NOT (" + _VALID_EXIF + ")"
+        if retry_errors:
+            stale += " OR e.status = 'error'"
+        return self.conn.execute(
+            f"SELECT dir, name, size, mtime, kind FROM files LEFT JOIN exif e USING (dir, name) "
+            f"WHERE {where} AND size > 0 AND kind != 'other' AND ({stale}) ORDER BY dir, name",
+            params,
+        ).fetchall()
+
+    def put_exif(self, rows: Iterable[Sequence]) -> None:
+        """Insert or replace EXIF rows (values in EXIF_COLUMNS order), in one transaction."""
+        marks = ", ".join("?" * len(EXIF_COLUMNS))
+        with self.conn:
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO exif ({', '.join(EXIF_COLUMNS)}) VALUES ({marks})", rows
+            )
+
+    def exif_row(self, dir: str, name: str) -> dict | None:
+        """The cached EXIF row of one file (valid or not), as a dict; None if absent."""
+        row = self.conn.execute(
+            f"SELECT {', '.join(EXIF_COLUMNS)} FROM exif WHERE dir = ? AND name = ?", (dir, name)
+        ).fetchone()
+        return dict(zip(EXIF_COLUMNS, row)) if row else None
+
+    def exif_status(self, roots: Sequence[str]) -> dict[str, int]:
+        """Non-empty photos/videos under `roots` by EXIF state: "ok" (a shot identity),
+        "none" (read, no identity), "error", and "missing" (no valid row)."""
+        where, params = _prefix_clause(roots)
+        rows = self.conn.execute(
+            f"SELECT CASE WHEN e.status IS NULL OR NOT ({_VALID_EXIF}) THEN 'missing' "
+            f"ELSE e.status END, count(*) FROM files LEFT JOIN exif e USING (dir, name) "
+            f"WHERE {where} AND size > 0 AND kind != 'other' GROUP BY 1",
+            params,
+        )
+        counts = {"ok": 0, "none": 0, "error": 0, "missing": 0}
+        counts.update(dict(rows.fetchall()))
+        return counts
+
+    def multi_format_shots(self, roots: Sequence[str]) -> int:
+        """Camera shots under `roots` cached in two or more formats (e.g. RAW+JPG)."""
+        where, params = _prefix_clause(roots)
+        return self.conn.execute(
+            f"SELECT count(*) FROM (SELECT e.ident FROM files JOIN exif e USING (dir, name) "
+            f"WHERE {where} AND size > 0 AND e.ident IS NOT NULL AND {_VALID_EXIF} "
+            f"GROUP BY e.ident HAVING count(DISTINCT e.fmt) > 1)",
+            params,
+        ).fetchone()[0]
+
+    def shot_groups(self, roots: Sequence[str]) -> Iterator[tuple[str, list[FileRecord]]]:
+        """Yield (shot, files) for every shot key held by two or more non-empty files under
+        `roots` with valid EXIF rows. Streams in shot order."""
+        where, params = _prefix_clause(roots)
+        sql = f"""
+            WITH s AS (
+                SELECT dir, name, size, mtime, kind, e.shot AS shot
+                FROM files JOIN exif e USING (dir, name)
+                WHERE {where} AND size > 0 AND e.shot IS NOT NULL AND {_VALID_EXIF}
+            ), d AS (SELECT shot FROM s GROUP BY shot HAVING count(*) > 1)
+            SELECT dir, name, size, mtime, kind, shot FROM s JOIN d USING (shot)
+            ORDER BY shot, dir, name
+        """
+        rows = self.conn.execute(sql, params)
+        for shot, group in itertools.groupby(rows, key=lambda r: r[5]):
+            yield shot, [_record(r) for r in group]
+
+    def shot_name_buckets(
+        self, roots: Sequence[str], *, by_size: bool = True, exact_names: bool = False
+    ) -> Iterator[list[tuple[FileRecord, str | None]]]:
+        """name_buckets, with each file's cached shot key (None without a valid one)."""
+        where, params = _prefix_clause(roots)
+        column = "name_key" if exact_names else "match_key"
+        keys = f"{column}, size" if by_size else column
+        sql = f"""
+            WITH files_in AS (SELECT * FROM files WHERE {where} AND size > 0),
+                 dup AS (SELECT {keys} FROM files_in GROUP BY {keys} HAVING count(*) > 1),
+                 picked AS (SELECT files_in.* FROM files_in JOIN dup USING ({keys}))
+            SELECT dir, name, files.size, files.mtime, kind, {column}, {_SHOT}
+            FROM picked AS files LEFT JOIN exif e USING (dir, name)
+            ORDER BY {column}, {"files.size, " if by_size else ""}dir, name
+        """
+        rows = self.conn.execute(sql, params)
+        keyfn = (lambda r: (r[5], r[2])) if by_size else (lambda r: r[5])
+        for _, group in itertools.groupby(rows, key=keyfn):
+            yield [(_record(r), r[6]) for r in group]
+
+    def shot_coverage_buckets(
+        self,
+        roots: Sequence[str],
+        other_roots: Sequence[str],
+        *,
+        by_size: bool = True,
+        exact_names: bool = False,
+        words: Words = Words(),
+        other_words: Words = Words(),
+    ) -> Iterator[tuple[str, list[tuple[FileRecord, bool, str | None, bool]]]]:
+        """coverage_buckets, each entry extended to (file, other side, shot, elsewhere).
+
+        `shot` is the file's cached shot key (None without a valid one); `elsewhere` is
+        True for a file under `roots` whose shot is also held by a non-empty file under
+        `other_roots` with a valid row, wherever it lies and whatever its name.
+        """
+        where, params = _prefix_clause(roots)
+        other, other_params = _prefix_clause(other_roots)
+        extra, extra_params = words.clause()
+        other_extra, other_extra_params = other_words.clause()
+        where, params = where + extra, params + extra_params
+        other, other_params = other + other_extra, other_params + other_extra_params
+        column = "name_key" if exact_names else "match_key"
+        order = "6, 3, 1, 2" if by_size else "6, 1, 2"
+        elsewhere = f"""
+            CASE WHEN e.shot IS NOT NULL AND {_VALID_EXIF} THEN EXISTS (
+                SELECT 1 FROM exif e2 JOIN files f2 USING (dir, name)
+                WHERE e2.shot = e.shot AND f2.size = e2.read_size AND f2.mtime = e2.read_mtime
+                  AND f2.size > 0 AND {other}
+            ) ELSE 0 END
+        """
+        sql = f"""
+            SELECT dir, name, size, mtime, kind, {column}, 0, {_SHOT}, {elsewhere}
+            FROM files LEFT JOIN exif e USING (dir, name)
+            WHERE {where} AND size > 0
+            UNION ALL
+            SELECT dir, name, size, mtime, kind, {column}, 1, {_SHOT}, 0
+            FROM files LEFT JOIN exif e USING (dir, name)
+            WHERE {other} AND size > 0
+            ORDER BY {order}
+        """
+        rows = self.conn.execute(sql, other_params + params + other_params)
+        keyfn = (lambda r: (r[5], r[2])) if by_size else (lambda r: r[5])
+        for _, group in itertools.groupby(rows, key=keyfn):
+            bucket = list(group)
+            if any(not r[6] for r in bucket):
+                yield bucket[0][5], [
+                    (_record(r), bool(r[6]), r[7], bool(r[8])) for r in bucket
+                ]

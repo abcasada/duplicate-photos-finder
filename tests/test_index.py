@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from dpf.index import Index
+from dpf.index import _VERSION, Index
 from dpf.models import DriveSpace, FileRecord
 
 
@@ -266,7 +266,7 @@ class IndexFileTest(unittest.TestCase):
         conn.close()
 
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], _VERSION)
             self.assertEqual(idx.totals(["/m"]), (3, 207))
             self.assertEqual(idx.root_stats("/m/A").scanned_at, 123.0)
             self.assertEqual(idx.dir_extras("/m/A/x"), (2, 1))
@@ -303,7 +303,7 @@ class IndexFileTest(unittest.TestCase):
             idx.conn.execute("PRAGMA user_version = 3")
             idx.conn.commit()
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], _VERSION)
             keys = dict(idx.conn.execute("SELECT name, match_key FROM files"))
             self.assertEqual(keys, {"BodyA_DSC01234.ARW": "bodya_dsc01234.arw", "x.jpg": "x.jpg"})
             staged = idx.conn.execute("SELECT match_key FROM staging").fetchall()
@@ -328,7 +328,7 @@ class IndexFileTest(unittest.TestCase):
         conn.close()
 
         with Index(path) as idx:
-            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], _VERSION)
             columns = [r[1] for r in idx.conn.execute("PRAGMA table_info(roots)")]
             self.assertEqual(columns, [
                 "path", "files", "bytes", "errors", "scanned_at",
