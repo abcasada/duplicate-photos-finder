@@ -49,3 +49,10 @@ other = [
 # dump = "dump"
 # sorted = "photography"
 # min_photos = 100
+
+# Optional: link a drive to its indexed folder by serial number, for `dpf smart` readings
+# whose filesystem label could not be read (drives are otherwise linked by the mount point
+# they had when read, or by their label = the mount folder's name). The serial is the one
+# `dpf smart` prints.
+# [smart]
+# links = { "WD-CA13ZBDK" = "Storage 4A 8TB" }

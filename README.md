@@ -38,6 +38,7 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Copies whose dates moved by whole hours (time zones, DST) match (`--strict-time` turns it off) | ✅ Done |
 | Personal vs other media (`[categories]`, `--category`) | ✅ Done |
 | Mode 1b: EXIF (camera serial + shutter count): `dpf exif`, `find --mode 1b` | ✅ Built (2026-10-31); first real-data run pending |
+| Drive health (SMART) with history: `dpf smart`, Drives section/sheet, `dpf drives` | ✅ Built (2026-10-31) |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
 
@@ -57,7 +58,8 @@ Developers and AI assistants resuming the work: start with [CLAUDE.md](CLAUDE.md
 
 Python 3.11+ with no third-party dependencies. The optional Excel report needs
 XlsxWriter (`sudo apt install python3-xlsxwriter`, or `pipx install '.[xlsx]'`); without
-it dpf skips `report.xlsx` and says so.
+it dpf skips `report.xlsx` and says so. `dpf smart` (drive health) needs smartmontools
+(`sudo apt install smartmontools`).
 
 ```sh
 git clone https://github.com/abcasada/duplicate-photos-finder.git
@@ -400,6 +402,65 @@ Under the table: personal media per pool, in total and **unique** (each set of
 duplicates counted once), unique across all drives (a file in both A and B counts once),
 and the only-copy total. Matching is by name, size and date, so these lean high: a
 re-saved copy counts as another file, never the other way round.
+
+### Drive health (SMART)
+
+`dpf smart` reads each drive's SMART data with `smartctl` (smartmontools) and keeps
+**every reading** in the index, so reports show how a drive is doing and how that
+changed. It reads SMART data and block-device metadata only: no filesystem on any drive is
+opened, so it is safe even for a drive that may be failing.
+
+```sh
+dpf smart                                   # every drive smartctl finds, also ones dpf never scans
+dpf smart "/run/media/adam/Storage 4A 8TB"  # only the drive(s) holding these mounted folders
+dpf smart --pool A                          # only the connected drives of pool A
+dpf smart --import ~/apps/smart-summary/smart_report.json   # readings of the old smart-summary tool
+```
+
+It prints one line per drive (name, model, serial, health, number of warnings, trend),
+then any device it could not read. A PATH is traced from `/proc/mounts` to its physical
+disk, through partitions and loop devices (`lsblk`, `losetup`): a drive mounted as
+`/dev/loop24p2` backed by `/dev/sdb` reads `/dev/sdb`. Importing a report twice adds
+nothing (a reading is keyed by serial number and time).
+
+**sudo.** smartctl needs root, but dpf itself runs as you and never writes a file as
+root. It runs `sudo -n smartctl …`; if sudo wants a password, it asks once (`sudo -v` on
+the terminal) and goes on. The kernel log is read with plain `dmesg` first and through
+`sudo -n` only if that is refused. `--no-sudo` runs smartctl directly (then it usually
+gets "Permission denied"). Started as root (`sudo dpf smart`) no sudo is used, and dpf
+switches back to the invoking user (`SUDO_UID`) before it opens the index, so
+`~/.cache/dpf/index.db` stays yours.
+
+**Reports.** Every `find` shows the newest reading of each drive on the **Drives** section
+and sheet (no option needed): Health, Model, Serial, Power-on (years), Temp, Pending,
+Reallocated, Uncorrectable, CRC errors, when it was checked, the trend and the warnings.
+Drives `dpf smart` read that dpf does not scan (a system SSD, an old backup disk) are
+listed under the table as "not scanned by dpf". `dpf drives` gets a short **Health**
+column, plus a line for such other drives.
+
+- **Health**: `OK`, `warning` (any warning sign below), or `FAILED` (the drive's own
+  SMART overall assessment failed: copy what you need off it). `—` / "not checked": no
+  reading for that drive.
+- **Pending / Reallocated / Uncorrectable**: sectors the drive could not read, has
+  remapped, or could not recover. Anything above 0 is a warning sign, and rising counts
+  mean the drive is going.
+- **CRC errors**: transfer errors on the cable or USB bridge, usually not the disk.
+- **Warnings**: smartctl warnings, failed attributes or self-tests, ATA error log
+  entries, NVMe wear/media errors, and kernel log lines (I/O errors, resets) that name the
+  drive or its port.
+- **Trend**: counters that changed since the drive's first reading, e.g. `Pending 1 → 3
+  since 2026-10-25`.
+- A newest reading older than 30 days is called out (amber in the sheet): connect the
+  drive and run `dpf smart` again.
+
+A drive is linked to an indexed drive by its mount point when read, else by its
+filesystem label (the mount folder's name). For a drive whose label cannot be read, link
+it by serial number in the pools file:
+
+```toml
+[smart]
+links = { "WD-CA13ZBDK" = "Storage 4A 8TB" }   # serial number = drive label
+```
 
 ### Dumps not yet sorted
 

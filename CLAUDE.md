@@ -57,7 +57,8 @@ tool has.
 ## Environment
 
 - Ubuntu 26.04, Python 3.14.4, SQLite 3.46, Ryzen 5 3600 (6 cores / 12 threads), 31 GB RAM.
-- Installed: rmlint 2.10.2, exiftool 13.50, ffmpeg, XlsxWriter 3.1.9, LibreOffice, gh.
+- Installed: rmlint 2.10.2, exiftool 13.50, ffmpeg, XlsxWriter 3.1.9, LibreOffice, gh,
+  smartmontools (smartctl, for `dpf smart`).
   Not installed: czkawka (planned for mode 2 visual), fclones, jdupes.
 - Drives mount at `/run/media/adam/<label>` (ntfs3, via udisks) **only while plugged in**.
   The mount folder disappears when unplugged.
@@ -69,7 +70,9 @@ tool has.
   - **B** = `Storage [0-9]B *` (1B 4TB, 2B 8TB, 3B 8TB, 4B 10TB). 1B is still labelled
     "Storage 1B 4TB (2)" by mistake.
   - **Storage 4A 8TB may be failing** (user, 2026-10-27): do not read it, list it, stat
-    it or run dpf against it unless the user asks.
+    it or run dpf against it unless the user asks. Exception (user, 2026-10-31): reading
+    its SMART data (`dpf smart`) is fine; that reads no filesystem. It is mounted via
+    `/dev/loop24p2` backed by the disk (serial WD-CA13ZBDK, linked in `[smart] links`).
 - Cameras that produce most duplicates: **two Sony A7R IV bodies** (`DSC#####`, ARW+JPG)
   and a **Pentax K-1 Mark II** (`IMGQ####`, DNG+JPG). There is also a Pentax K-50
   (`IMGP`), a Nikon D7500, GoPros (`GX`/`GH`), phones, and Sony video (`C####.MP4`).
@@ -85,11 +88,14 @@ python3 -m unittest discover -s tests -t .     # full suite, about 4 s, all must
 ./bin/dpf find --mode 1 --no-scan --pool B -o /some/dir   # index only, custom out dir
 ./bin/dpf exif --pool A                        # cache camera EXIF of connected A drives
 ./bin/dpf find --mode 1b --no-scan --pool A --pool B      # same shot first, else mode 1
+./bin/dpf smart                                # SMART of every drive into the index (sudo)
 ```
 
 `tests/__init__.py` puts `src/` on `sys.path`. CLI tests point `XDG_CONFIG_HOME` at a
 temp dir and pass `--allow-same-drive`, because `/tmp` is its own tmpfs. The EXIF tests
-run the real exiftool on tiny generated JPEGs and skip when it is missing.
+run the real exiftool on tiny generated JPEGs and skip when it is missing. SMART tests
+never run smartctl or sudo: `tests/smart_fake.py` fakes smartctl, sudo, lsblk, losetup and
+dmesg as an injected runner (CLI tests patch `dpf.smartctl.run_captured` and friends).
 
 ## Architecture
 
@@ -97,9 +103,9 @@ Data flows **scan → index → match → group → report**.
 
 | Module | Role |
 |---|---|
-| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `exif`, `find` (`--mode 1` or `1b`), `drives` (`--forget`), `space` (`--missing`, `--set`), `folders`, `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
+| `src/dpf/cli.py` | argparse front end. Subcommands `scan`, `exif`, `find` (`--mode 1` or `1b`), `drives` (`--forget`; Health column once `dpf smart` has stored readings), `space` (`--missing`, `--set`), `smart` (PATHs / `--pool` / `--import JSON`, `--[no-]sudo`; as root via sudo it drops to `SUDO_UID` before opening the index: `_sudo_user`/`_drop_root`), `folders`, `pools`. Resolves roots: online paths, offline roots from the index, or `--pool`. Guards output locations. Runs the pipeline and writes reports. Modes 2/3 currently exit 2 "not implemented". |
 | `src/dpf/scanner.py` | Read-only inventory. `walk()` is an iterative `os.scandir` walk: no symlinks, skips `media.SKIP_DIRS` and junk files, and counts non-media/unreadable entries per folder (`dir_stats`). `scan_roots()` runs one thread per physical device (`st_dev`) and streams batches to the calling thread, which alone writes SQLite. Also `normalize_roots`, `split_roots` (online vs missing), `drop_nested`, and `drive_space` (one `os.statvfs` + `ismount`, taken once per root after its walk). |
-| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries), `exif` (schema v6/v7: the `dpf exif` cache of photos keyed by (dir, name) with the read_size/read_mtime it was read at, valid only while they equal the files row's; kept apart from `files` so rescans keep it; `shot`/`ident` keys, `shutter_mode`, index `exif_shot`). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root` (also drops exif rows), `set_space` (updates an existing roots row only); EXIF: `exif_todo`, `put_exif`, `exif_row`, `exif_status`, `multi_format_shots`, `shot_groups`, `shot_name_buckets`, `shot_coverage_buckets` (adds each file's shot and whether the other side holds it, 2 = with the same size, via a subquery on `exif_shot`); `_shot_guard` (temp table `bad_shots`: keys held by files with different camera numbers or under two match keys in one folder, index-wide; every shot query leaves them out; recomputed after writes); `__del__` closes the connection. |
+| `src/dpf/index.py` | SQLite at `~/.cache/dpf/index.db`. Tables: `roots` (also the drive's `used_bytes`, `capacity_bytes`, `is_mount`, `space_source` = statvfs/manual, `space_at`), `files` (dir, name, name_key, match_key, size, mtime, kind), `staging` (atomic per-root swap during scans), `dirs` (per-folder counts of other/unreadable entries), `exif` (schema v6/v7: the `dpf exif` cache of photos keyed by (dir, name) with the read_size/read_mtime it was read at, valid only while they equal the files row's; kept apart from `files` so rescans keep it; `shot`/`ident` keys, `shutter_mode`, index `exif_shot`), `smart` (schema v8: every SMART reading, UNIQUE (serial, read_at); JSON columns labels, mounts, summary, flags, kernel, partitions, smartctl; `source` = smartctl/import). Roots are selected by **path-prefix range scans** (`dir >= 'R/' AND dir < 'R0'`), not LIKE. Key methods: `begin_root`/`add_records`/`finish_root`, `replace_root`, `name_buckets`, `coverage_buckets`, `name_keys`, `empty_files`, `extras_under`, `list_dir`, `subdirs`, `dir_extras`, `totals`, `roots`, `indexed`, `containing_root`, `forget_root` (also drops exif rows, never smart rows), `put_smart` (INSERT OR IGNORE: re-imports add nothing), `smart_latest`, `smart_history`, `set_space` (updates an existing roots row only); EXIF: `exif_todo`, `put_exif`, `exif_row`, `exif_status`, `multi_format_shots`, `shot_groups`, `shot_name_buckets`, `shot_coverage_buckets` (adds each file's shot and whether the other side holds it, 2 = with the same size, via a subquery on `exif_shot`); `_shot_guard` (temp table `bad_shots`: keys held by files with different camera numbers or under two match keys in one folder, index-wide; every shot query leaves them out; recomputed after writes); `__del__` closes the connection. |
 | `src/dpf/names.py` | `match_key(name)`: the similar-name key for mode 1 (copy marks stripped; around a camera-number token only *neutral* text (dates, separators) is dropped, other text is kept; extension kept). `copy_numbers(name)` feeds the matcher's copy-number rules. `match_key` is stored in the index, so **any change to it needs a schema-version bump and a backfill**, never a wipe. |
 | `src/dpf/match_name.py` | Mode 1 matcher; `bucket_groups` holds the per-bucket rules and is shared with coverage. Buckets come from `Index.name_buckets` (same `match_key`, or `name_key` with `--exact-names`, and same size unless `--ignore-size`; 0-byte files excluded). A bucket where one folder holds two different copy numbers (`X (1)`, `X (2)`) is a renamed series and falls back to exact names (`is_series`). Within a bucket, mtime clusters are **anchored on the earliest file** (tolerance default 2 s), so no two members differ by more than the tolerance; then (unless `--strict-time`) whole clusters are merged across **whole-hour shifts** (`_hour_merge`: all residues mod 3600 within the tolerance, span ≤ 14 h + tol), so every pair in a group satisfies `times_match` and nothing chains; strict clusters are never split. A cluster with several copy numbers is then split by number. `DuplicateGroup.hours` holds each file's offset in hours. |
 | `src/dpf/grouping.py` | The core value. `group_duplicates()` turns `DuplicateGroup`s into `FolderPair`s with `Run`s of consecutive files (natural sort). Relations: `identical_tree`, `identical`, `a_in_b`/`b_in_a`, `near_identical`, `partial`. Strict tree roll-up is bounded by roots and blocked by unindexed files. `tree_pairs()` builds the **tree overview** by stripping common trailing path parts (`tree_tops`). Groups spanning more than 16 folders pair only with their first folder (`capped_groups`). Pairs, runs and trees carry `hour_shift` (offsets B after A that some match needed) and `category` (OTHER only when both folders are other media); roll-up never crosses a category boundary; `GroupingResult.only(cat)` filters. |
@@ -111,6 +117,8 @@ Data flows **scan → index → match → group → report**.
 | `src/dpf/overview.py` | The Drives section/sheet (`build_overview`, `format_overview`, `personal_lines`): per drive space, photos/videos, personal/other bytes, not-media (used − media), **only copy** (personal media with no copy on another drive: in the coverage `missing` list and not in a within-pool group spanning another drive; counts lean high) and **name match** (`Coverage.near`: a same-name file within `coverage.NEAR_SIZE` = 64 kB in size; likely re-saved, unproven). Per pool personal total and unique (groups counted once); across exactly two pools, unique = A's + B's groups/singles entirely missing from A. Built only for `--category all`, since it needs every group. |
 | `src/dpf/dumps.py` | Optional `[dumps]` table (`dump`, `sorted`, `min_photos`): dump folders (path contains the dump word) under the run's roots holding ≥ min_photos photos with no mode-1 match in a sorted folder (path contains the sorted word, not the dump word) on any indexed drive. `find_missing` with `index.Words` path filters (SQL `instr(lower(dir))`), so both sides may share roots. Section/sheet "Dumps not in Photography", JSON `dumps`. |
 | `src/dpf/months.py` | "Photos and videos by month" (`month_totals`, `format_months`): per pool, photos/videos per month (EXIF DateTimeOriginal when cached and valid, else mtime; before 1990 or after next year = "unknown"), each duplicate group once (earliest file), personal only with `[categories]`. Built only for `--category all`. Text section, xlsx "<pool> Months" sheets with a stacked column chart (`xlsx_report._months_tables`), JSON `months`. Data from `Index.media_dates`. |
+| `src/dpf/smartctl.py` | `dpf smart` reading, ported from the owner's former smart-summary tool (merged; that project is abandoned). `Commands` (runner injection; `run_root` = `sudo -n …`, on a sudo refusal `sudo -v` on the terminal once, then retry; root: no sudo), `find_smartctl` (also /usr/sbin), `scan_devices`, `read_drive` (`-a`, SAT retry when the autodetected protocol is SCSI or has no data), `has_smart_data`, `error_reason`, `detect_flags`, `build_record` (smart-summary record + `labels` + `mounts`), `get_partitions` (lsblk), `read_kernel_log` (plain dmesg, then `sudo -n` without prompting), `kernel_issues` (lines naming the disk, its ata/usb port), `read_mounts` (/proc/mounts, octal escapes), `mount_of`, `BlockMap`/`block_map` (`lsblk -l` PKNAME + `losetup` BACK-FILE: partition → loop → backing disk), `disk_mounts`, `resolve_disks`, `read_smart` (skips a second drive with the same serial). Never opens a filesystem. |
+| `src/dpf/smart.py` | SMART display layer. `DriveHealth` (status OK/warning/FAILED, `name`: label, else mount folder name; `trend`; `stale()` > `STALE_DAYS` = 30), `from_record`, `labels_of`, `load_report` (smart-summary JSON, for `--import`), `trend` (TRENDED counters first vs newest reading: "Pending 1 → 3 since …"), `load_health(idx)` (newest per serial with trend), `load_links` (`[smart] links`), `match_drives` (link → mount point = root → label = root folder name), `display_name`, `health_cells`, `format_health` (text table, warnings + trend lines, old-reading note). `find` always takes health from the index (`cli._add_health`; drives of indexed roots outside the run are left out, unscanned drives listed apart); xlsx `_drives_tables`/`_health_cells` (SMART trend column, amber stale date). |
 | `src/dpf/exif.py` | Mode 1b EXIF reading (photos only). `parse_entry` (exiftool `-json -n` → `ExifData`; serial tag per make: Sony `InternalSerialNumber`, others `SerialNumber`; `norm_serial`: -n byte lists to hex, numeric without leading zeros; shutter mode from Sony `Shutter`, Pentax `ShutterType`/`LiveView`: electronic = no identity), `ExifData.ident` (make\|model\|serial\|shutter\|DateTimeOriginal) and `.shot` (+ format family + pixel size; non-RAW needs one), `needs_more`, `ExifTool` (one `-stay_open` process, 60 s watchdog), `read_exif` (file list from `Index.exif_todo`; per `st_dev` 4 reader threads copy the first 512 kB with O_NOATIME (EPERM: skipped, counted) to `/dev/shm`; TIFF-based files get a sparse copy of their true size with the IFDs and needed tag data found past the head (`walk_tiff`, `_Reader`: 64 kB windows, the last 1 MB at once when IFD0 lies there, ≤ 8 MB per file), for Lightroom DNGs with IFD0 at the end; min(6, CPUs) exiftool processes parse batches of 16; more needed: a 16 MB copy (also sparse), then the whole file up to 256 MB, never the original; steps counted (`sparse`/`big`/`whole`); I/O errors and exiftool failures not cached; one writer commits every 500 rows/1 s, so Ctrl-C keeps progress; stale temp dirs cleaned). |
 | `src/dpf/match_shot.py` | Mode 1b matcher. `split_by_shot` (the veto: a mode-1 group with two shot keys splits by key, keyless files apart), `find_shot_duplicates` (shot groups from `Index.shot_groups` unioned with the vetoed mode-1 groups of the same key; disjoint, no chaining; shot groups get basis `SHOT_BASIS`, `shot=True` and no hours; `DuplicateGroup.sizes_differ` feeds `Run`/`FolderPair`/`TreePair.sizes_differ`, "; same shot, sizes differ"), `ShotStats` (summary["shots"]), `basis`. Coverage lists files copied only as a shot of another size (`Coverage.resaved`: text section, "… re-saved" sheet, missing.csv `status`). |
 | `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` / `missing_files` (`shots=True`: mode 1b via `_missing_by_shot`, counting `by_shot` and `vetoed` per dir) (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
@@ -123,7 +131,7 @@ Each `find` writes `report.txt`, `report.json`, `files.csv` and `report.xlsx` (p
 `--out`). With several `--pool`s they are combined: text sections per pool, one workbook
 with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV column.
 
-## Current status (2026-10-27)
+## Current status (2026-10-31)
 
 **Done, on `main`, pushed to github.com/abcasada/duplicate-photos-finder.**
 
@@ -287,6 +295,22 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   first run** (v7 migrates on open). The reviewer's burst repro is
   `ShotDuplicatesTest.test_silent_burst_is_not_one_shot`.
 
+- **Drive health, smart-summary merged (2026-10-31, user request):** the owner's separate
+  `~/apps/smart-summary` tool is folded into dpf and that project is abandoned (README
+  "Drive health (SMART)"). `dpf smart [PATH… | --pool NAME | --import JSON]` reads SMART
+  with smartctl through `sudo -n` (one `sudo -v` password prompt when needed; dpf never
+  runs as root itself, and drops to `SUDO_UID` when started as root) and stores **every
+  reading** in the index (**schema v8**: `smart` table, CREATE TABLE only, nothing else
+  changes; back up `index.db` first). Default: every drive smartctl finds, including ones
+  dpf does not scan (Backup 2TB, SSDs, NVMe). PATHs resolve via /proc/mounts → lsblk
+  PKNAME → losetup backing disk (Storage 4A: `/dev/loop24p2` → `/dev/sdb`). `find` always
+  shows the newest readings on the Drives section/sheet, with a trend ("Pending 1 → 3
+  since …", xlsx "SMART trend" column) and a note for readings older than 30 days;
+  `dpf drives` has a Health column (fits the 150-column budget: 147 with categories and
+  pools). `find --smart-report` (the first, file-based step) is removed: import the file
+  once with `dpf smart --import ~/apps/smart-summary/smart_report.json` (12 drives).
+  Not yet run against real drives or the real index.
+
 ## Next steps (agreed with the user)
 
 1. **Mode 1b on real data.** Back up `index.db`, run `dpf exif` per pool (1A ≈ 50 min
@@ -299,6 +323,12 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
    that ImageWidth is the same for an original and its Lightroom re-saved DNG, and that
    Sony `Shutter` is present on the A7R IV files. Not done: video identity (videos are
    not read).
+   - **First `dpf smart` run** (after the running `dpf exif` finishes: any dpf command
+     migrates the index to v8 on open). Back up `index.db`, then
+     `dpf smart --import ~/apps/smart-summary/smart_report.json` and `dpf smart` with the
+     drives connected; check that Storage 4A resolves through its loop device and that
+     `dpf drives` / `find` show every drive's Health. Then the user can delete
+     `~/apps/smart-summary`.
 2. **Phase 2: mode 2 (content):** `--compare exact|visual|both`.
    - Exact: rmlint (`-T df`, `-o json`, paths via stdin `-0`, **no `--xattr`**).
    - Same pixels, different metadata: exiftool `ImageDataHash`.
