@@ -229,8 +229,8 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   in B); unique 16.5 TB in A, 15.5 TB in B, **18.5 TB across all drives**; only copy
   4.8 TB, of which 3.5 TB has a same-name file in the other pool (mostly 1A ↔ 1B
   re-saved DNGs). **4A (may be failing): 673 GB personal only-copy, 160 GB of it name
-  matches**; biggest is `Photography/2026` (413 GB, 138 files). Storage 1TB has no space
-  recorded on 2026-10-31 (`dpf space --missing`).
+  matches**; biggest is `Photography/2026` (413 GB, 138 files). Storage 1TB's space was
+  recorded on 2026-10-31 (1.0 TB, 430.6 GB used); every drive now has space data.
 - **Coverage review fixes (2026-10-27):** coverage says "media files" and adds a line
   "N other files (non-media) in M folders are not compared by this check …"; warnings
   for a stale other-pool index (> 1 day older than this pool's newest scan; fires on
