@@ -32,8 +32,9 @@ class FindMissingTest(unittest.TestCase):
     def missing(self, a, b, **kw):
         self.idx.replace_root("/a", a)
         self.idx.replace_root("/b", b)
-        missing, totals, similar, shifted = find_missing(self.idx, ["/a"], ["/b"], **kw)
+        missing, totals, similar, shifted, near = find_missing(self.idx, ["/a"], ["/b"], **kw)
         self.similar = similar
+        self.near = near
         self.totals = totals
         self.shifted = shifted
         return [f.path for f in missing]
@@ -100,6 +101,14 @@ class FindMissingTest(unittest.TestCase):
             ["/a/d/2023-08-26_DSC00002.ARW", "/a/d/DSC00001.ARW"],
         )
         self.assertEqual(self.similar, set())
+
+    def test_near_size_same_names(self):
+        """A same-name file a few kB larger is likely re-saved; megabytes apart is another shot."""
+        a = [rec("/a/d", "IMGQ0001.DNG", 30_000_000), rec("/a/d", "DSC00001.ARW", 61_500_000)]
+        b = [rec("/b/d", "IMGQ0001.DNG", 30_007_500), rec("/b/d", "DSC00001.ARW", 53_000_000)]
+        self.assertEqual(len(self.missing(a, b)), 2)
+        self.assertEqual(self.similar, {"/a/d/IMGQ0001.DNG", "/a/d/DSC00001.ARW"})
+        self.assertEqual(self.near, {"/a/d/IMGQ0001.DNG"})
 
     def test_copy_numbers(self):
         """X (1) never counts as a copy of X (2); X and X (1) are copies."""

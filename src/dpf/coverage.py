@@ -21,6 +21,7 @@ counted.
 
 from __future__ import annotations
 
+import bisect
 import re
 from collections import Counter
 from collections.abc import Callable, Sequence
@@ -28,13 +29,16 @@ from dataclasses import dataclass, field
 
 from dpf.categories import ALL, CATEGORIES, OTHER, PERSONAL, Category
 from dpf.grouping import Run, beside_sibling, natural_key
-from dpf.index import Index
+from dpf.index import Index, Words
 from dpf.match_name import basis, bucket_groups, hour_offsets, shifts_hours
 from dpf.models import FileRecord
 
 NOT_BACKED_UP = "not_backed_up"  # the other pool is the backup of this one
 ONLY_IN_BACKUP = "only_in_backup"  # this pool is the backup of the other one
 NOT_IN_OTHER = "not_in_other"  # pools not linked by [backups] (--coverage-against)
+# A same-name file this close in size is likely the same photo with re-written metadata
+# (re-saved DNGs grow by a few kB); a reused camera number differs by megabytes.
+NEAR_SIZE = 65_536
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,7 @@ class Coverage:
     by_category: dict[str, dict[str, int]] = field(default_factory=dict)  # see check_coverage
     category: str = ALL  # the category shown (--category); ALL for both
     warnings: list[str] = field(default_factory=list)  # e.g. a stale index of the other pool
+    near: set[str] = field(default_factory=set)  # of `similar`: a size within NEAR_SIZE there
 
     @property
     def missing_dirs(self) -> int:
@@ -138,30 +143,45 @@ def find_missing(
     ignore_mtime: bool = False,
     exact_names: bool = False,
     hour_shift: bool = True,
-) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str]]:
+    words: Words = Words(),
+    other_words: Words = Words(),
+) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str], set[str]]:
     """Non-empty files under `roots` with no copy under `other_roots`.
 
     Returns (missing files, compared files per dir, paths of the missing files whose
-    name key does occur under `other_roots` with another size or date, and per dir the
-    files whose only copies differ from them by whole hours). `roots` and `other_roots`
-    must not overlap.
+    name key does occur under `other_roots` with another size or date, per dir the
+    files whose only copies differ from them by whole hours, and the paths of the similar
+    ones with such a file within NEAR_SIZE bytes in size). `roots` and `other_roots`
+    must not overlap, unless the `words` filters keep the two sides apart.
     """
     missing: list[FileRecord] = []
     similar: set[str] = set()
+    near: set[str] = set()
     totals: Counter[str] = Counter()
     shifted: Counter[str] = Counter()
-    other_keys = index.name_keys(other_roots, exact_names=exact_names)
+    other_sizes = index.name_sizes(other_roots, exact_names=exact_names, words=other_words)
+
+    def note_similar(key: str, files: list[FileRecord]) -> None:
+        sizes = other_sizes.get(key)
+        if not sizes:
+            return
+        for f in files:
+            similar.add(f.path)
+            i = bisect.bisect_left(sizes, f.size - NEAR_SIZE)
+            if i < len(sizes) and sizes[i] <= f.size + NEAR_SIZE:
+                near.add(f.path)
+
     buckets = index.coverage_buckets(
-        roots, other_roots, by_size=not ignore_size, exact_names=exact_names
-    )
+        roots, other_roots, by_size=not ignore_size, exact_names=exact_names,
+        words=words, other_words=other_words,
+    )  # fmt: skip
     for key, bucket in buckets:
         mine = [f for f, other in bucket if not other]
         for f in mine:
             totals[f.dir] += 1
         if len(mine) == len(bucket):
             missing += mine
-            if key in other_keys:
-                similar.update(f.path for f in mine)
+            note_similar(key, mine)
             continue
         others = {id(f) for f, other in bucket if other}
         covered: set[int] = set()
@@ -180,9 +200,9 @@ def find_missing(
                         shifted[f.dir] += 1
         left = [f for f in mine if id(f) not in covered]
         missing += left
-        similar.update(f.path for f in left)
+        note_similar(key, left)
     missing.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
-    return missing, totals, similar, shifted
+    return missing, totals, similar, shifted, near
 
 
 def roll_up(
@@ -378,7 +398,7 @@ def check_coverage(
         for o in other_roots:
             if _related(r, o):
                 raise ValueError(f"coverage roots overlap: {r} and {o}")
-    missing, totals, similar, shifted = find_missing(
+    missing, totals, similar, shifted, near = find_missing(
         index, roots, other_roots, mtime_tolerance=mtime_tolerance, ignore_size=ignore_size,
         ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift,
     )  # fmt: skip
@@ -402,6 +422,7 @@ def check_coverage(
         shifted = Counter({d: n for d, n in shifted.items() if cat(d) == only})
         extras = {d: n for d, n in extras.items() if cat(d) == only}
         similar = {p for p in similar if cat(p.rsplit("/", 1)[0] or "/") == only}
+        near &= similar
     folders = roll_up(missing, totals, roots, index.list_dir, extras, similar, category)
     nbytes = index.totals(roots)[1]
     shift = not ignore_mtime and shifts_hours(mtime_tolerance, hour_shift)
@@ -412,6 +433,7 @@ def check_coverage(
         basis_words(**flags, hour_shift=shift), sum(totals.values()), nbytes, missing,
         similar, sum(f.size for f in missing), index.empty_files(roots), folders,
     )  # fmt: skip
+    cov.near = near
     cov.shifted = sum(shifted.values())
     cov.unindexed = sum(extras.values())
     cov.unindexed_dirs = len(extras)

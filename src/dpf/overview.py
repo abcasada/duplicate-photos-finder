@@ -46,7 +46,7 @@ class DriveLine:
     other_bytes: int | None
     sole_files: int | None = None  # None without a coverage check for its pool
     sole_bytes: int | None = None
-    sole_similar: int | None = None  # bytes of those with a same-name file in the other pool
+    sole_similar: int | None = None  # bytes of those with a same-name, near-size file there
 
     @property
     def free(self) -> int | None:
@@ -77,7 +77,7 @@ class Overview:
     pools: list[PoolPersonal] = field(default_factory=list)
     all_unique: tuple[int, int] | None = None  # (files, bytes) across exactly two pools
     sole: tuple[int, int] | None = None  # (files, bytes) with no copy on any other drive
-    sole_similar: int = 0  # bytes of those with a same-name file in the other pool
+    sole_similar: int = 0  # bytes of those with a same-name, near-size file in the other pool
 
     def to_json(self) -> dict:
         return {
@@ -191,7 +191,7 @@ def build_overview(
                 continue
             sole[root] += 1
             sole_bytes[root] += size
-            if any(m.path in cov.similar for m in members):
+            if any(m.path in cov.near for m in members):
                 similar[root] += size
         for root in p.roots:
             lines[root].sole_files = sole[root]
@@ -343,8 +343,9 @@ def format_overview(ov: Overview) -> str:
         notes.append(f"Only copy = {what} with no copy on any other drive (in this pool or "
                      "its backup pool): what would be lost with that drive.")  # fmt: skip
         notes.append("Name match = the part of Only copy with a same-name file in the other "
-                     "pool that differs in size or date (often re-saved with new metadata): "
-                     "probably a copy after all; mode 1b/2 will tell.")  # fmt: skip
+                     "pool within 64 kB in size: likely the same photo re-saved with new "
+                     "metadata, but not proven (mode 1b/2 will tell). Count it as at risk "
+                     "until then.")  # fmt: skip
         dates = sorted(d.scanned_at for d in ov.drives if d.scanned_at is not None)
         if dates:
             notes.append(f"Copies are counted as of each drive's last scan (oldest {_date(dates[0])}"
@@ -386,7 +387,7 @@ def personal_lines(ov: Overview) -> list[str]:
         if ov.sole_similar:
             lines.append(
                 f"  {''.ljust(width)}of which {human_bytes(ov.sole_similar)} have a same-name "
-                "file in the other pool with another size or date: probably copies"
+                "file within 64 kB in size in the other pool: likely re-saved copies, unproven"
             )
     lines.append(
         f"  Matched on {ov.basis}, not contents: a re-saved or renamed copy counts "

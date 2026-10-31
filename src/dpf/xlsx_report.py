@@ -32,6 +32,7 @@ from dpf.grouping import (
     GroupingResult,
     TreePair,
 )
+from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
 from dpf.overview import Overview, personal_lines
 from dpf.report import (
@@ -99,6 +100,7 @@ def write_xlsx(
     path: str,
     coverage: Sequence[Coverage] = (),
     overview: Overview | None = None,
+    dumps: DumpCheck | None = None,
 ) -> None:
     """Write report.xlsx. Raises ModuleNotFoundError if XlsxWriter is not installed.
 
@@ -114,6 +116,7 @@ def write_xlsx(
         drives = _drives_tables(wb, fmt, overview, used)
         tables = drives + _pool_tables(wb, fmt, result, groups, "", used)
         tables += _coverage_tables(wb, fmt, coverage, used)
+        tables += _dump_tables(wb, fmt, dumps, used)
         for t in tables:
             t.finish()
         w = _SummaryWriter(summary_ws, fmt)
@@ -132,6 +135,7 @@ def write_combined_xlsx(
     summary: dict,
     path: str,
     overview: Overview | None = None,
+    dumps: DumpCheck | None = None,
 ) -> None:
     """One workbook for several pools: each pool's sheets prefixed with its name.
 
@@ -148,6 +152,7 @@ def write_combined_xlsx(
         drives = _drives_tables(wb, fmt, overview, used)
         per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
         cov_tables = _coverage_tables(wb, fmt, coverage, used)
+        cov_tables += _dump_tables(wb, fmt, dumps, used)
         tables = drives + [t for ts in per_pool for t in ts] + cov_tables
         for t in tables:
             t.finish()
@@ -610,6 +615,42 @@ def _coverage_tables(
     wb, fmt: _Formats, coverage: Sequence[Coverage], used: set[str]
 ) -> list[_Table]:
     return [_coverage_sheet(wb, fmt, cov, sheet_name(cov.label, used)) for cov in coverage]
+
+
+def _dump_tables(wb, fmt: _Formats, check: DumpCheck | None, used: set[str]) -> list[_Table]:
+    """One row per dump folder with min_photos+ photos in no sorted folder ([dumps])."""
+    if check is None:
+        return []
+    c = check.config
+    columns = [
+        ("#", 6), ("Unsorted size", 13), ("Folder", None), ("Pool", 6),
+        ("Unsorted photos", 10), ("Unsorted videos", 10), ("Files in folder", 10),
+        ("Unsorted %", 10), ("Likely re-saved in sorted", 12), ("Runs", 7),
+        ("First unsorted run", 60),
+    ]  # fmt: skip
+    note = (f'folders with "{c.dump}" in the path holding {c.min_photos:,}+ photos that are '
+            f'in no "{c.sorted}" folder (without "{c.dump}") on any drive')  # fmt: skip
+    t = _Table(wb, fmt, sheet_name(check.label, used), columns, freeze_cols=1, note=note)
+    for n, f in enumerate(check.folders, 1):
+        if not t.next_row():
+            continue
+        t.num(0, n)
+        t.num(1, f.bytes, fmt.size)
+        t.folder(2, f.dir)
+        t.text(3, f.pool)
+        t.num(4, f.photos)
+        t.num(5, f.videos)
+        t.num(6, f.total)
+        t.share(7, f.unsorted, f.total)
+        t.num(8, f.similar, fmt.amber if f.similar else None)
+        t.num(9, len(f.runs))
+        if f.runs:
+            label = "in a sorted folder"
+            first = run_lines(f.runs[:1], 1, indent="", align=False, skipped_label=label)[0]
+            more = len(f.runs) - 1
+            t.text(10, f"{first}  (+{more:,} more runs)" if more else first)
+    t.data_bar(1)
+    return [t]
 
 
 def _coverage_sheet(wb, fmt: _Formats, cov: Coverage, name: str) -> _Table:

@@ -40,3 +40,12 @@ other = [
     "*/_Torrents",
     "/run/media/adam/Storage 2A 8TB/Films",
 ]
+
+# Optional: dump folders whose photos never made it into a sorted folder. Each find then
+# gets a "Dumps not in Photography" section/sheet: every folder whose path contains the
+# dump word and holds at least min_photos photos that no folder whose path contains the
+# sorted word (and not the dump word) holds, on any indexed drive. Words ignore case.
+# [dumps]
+# dump = "dump"
+# sorted = "photography"
+# min_photos = 100

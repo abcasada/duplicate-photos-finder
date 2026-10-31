@@ -31,6 +31,7 @@ from dpf.coverage import (
     same_drive_warnings,
     stale_warnings,
 )
+from dpf.dumps import DumpCheck, check_dumps, dumps_json, format_dumps, load_dumps
 from dpf.overview import Overview, PoolInput, build_overview, format_overview
 from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
@@ -537,6 +538,8 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             idx, pool_inputs, [] if loose else coverages, cats, basis=_basis(args)
         )
 
+    dumps = _check_dumps(idx, targets, args)
+
     os.makedirs(out, exist_ok=True)
     paths = {
         "csv_path": os.path.join(out, "files.csv"),
@@ -564,9 +567,12 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         summary = {**run.summary, **paths}
         if overview is not None:
             summary["overview"] = overview.to_json()
+        if dumps is not None:
+            summary["dumps"] = dumps_json(dumps)
         if not args.no_xlsx and _write_xlsx(
-            xlsx_path, run.result, run.groups, summary, coverages=coverages, overview=overview
-        ):
+            xlsx_path, run.result, run.groups, summary, coverages=coverages, overview=overview,
+            dumps=dumps,
+        ):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)  # a stale workbook from an earlier run into the same --out
@@ -585,10 +591,12 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             "elapsed": elapsed,
             **({"category": args.category} if args.category != ALL else {}),
             **({"overview": overview.to_json()} if overview is not None else {}),
+            **({"dumps": dumps_json(dumps)} if dumps is not None else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
-                                            coverages=coverages, overview=overview):  # fmt: skip
+                                            coverages=coverages, overview=overview,
+                                            dumps=dumps):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)
@@ -609,6 +617,9 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             parts.append(_banner("Backup coverage"))
     for cov in coverages:
         parts.append(format_coverage(cov, top=args.coverage_top, max_runs=args.max_runs))
+    if dumps is not None:
+        parts.append(_banner(dumps.label))
+        parts.append(format_dumps(dumps, top=args.coverage_top, max_runs=args.max_runs))
     parts.append("\n".join(footer_lines(summary)))
     text = "\n\n".join(p.rstrip("\n") for p in parts) + "\n"
     with open(text_path, "w", encoding="utf-8") as fh:
@@ -617,6 +628,33 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
     if not args.quiet:
         print(f"report saved to {text_path}", file=sys.stderr)
     return 0
+
+
+def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -> DumpCheck | None:
+    """The [dumps] check over this run's roots against every indexed drive; None if unset."""
+    from dpf.scanner import drop_nested
+
+    try:
+        config = load_dumps(args.pools_file)
+    except PoolError as e:
+        print(f"dpf: warning: {e}; dump check skipped", file=sys.stderr)
+        return None
+    if config is None:
+        return None
+    roots = drop_nested(r for t in targets for r in t.roots)
+    everywhere = drop_nested([*roots, *(r.root for r in idx.roots())])
+    owners = [(r, t.name or "") for t in targets for r in t.roots]
+
+    def pool_of(d: str) -> str:
+        found = [(r, name) for r, name in owners if d == r or d.startswith(r.rstrip("/") + "/")]
+        return max(found, key=lambda e: len(e[0]))[1] if found else ""
+
+    return check_dumps(
+        idx, roots, everywhere, config, pool_of, basis=_basis(args),
+        mtime_tolerance=args.mtime_tolerance, ignore_size=args.ignore_size,
+        ignore_mtime=args.ignore_mtime, exact_names=args.exact_names,
+        hour_shift=not args.strict_time,
+    )  # fmt: skip
 
 
 def _banner(title: str) -> str:
@@ -1195,16 +1233,17 @@ def _write_xlsx(
     runs: list[_PoolRun] | None = None,
     coverages: list[Coverage] | None = None,
     overview: Overview | None = None,
+    dumps: DumpCheck | None = None,
 ) -> bool:
     """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
     from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
 
     try:
         if runs is None:
-            write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview)
+            write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview, dumps)
         else:
             sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
-            write_combined_xlsx(sheets, coverages or [], summary or {}, path, overview)
+            write_combined_xlsx(sheets, coverages or [], summary or {}, path, overview, dumps)
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":
             raise

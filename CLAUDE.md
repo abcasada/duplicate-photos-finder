@@ -51,7 +51,8 @@ tool has.
    single, explicit cross-pool comparison is **backup coverage** (`[backups]` in
    pools.toml, `src/dpf/coverage.py`): which files of one pool have no copy anywhere in
    the other. It reads the other pool from the index only (never scans it) and reports
-   missing files, never duplicates.
+   missing files, never duplicates. The `[dumps]` check (`src/dpf/dumps.py`) works the
+   same way across every indexed drive: dump-folder photos missing from sorted folders.
 
 ## Environment
 
@@ -104,7 +105,8 @@ Data flows **scan → index → match → group → report**.
 | `src/dpf/pools.py` | Loads `pools.toml` (stdlib `tomllib`), including the optional `[backups]` table (`B = "A"`: B backs up A; validated: known pools, no self-link, no cycles) into `Pool.backs_up`; `coverage_partners` lists a pool's linked pools. A pattern is matched against mounted dirs **and** indexed roots, so unplugged drives stay in their pool. Matching is per path segment (`*` never spans `/`); `cli` refuses a pool run when a root matches more than one pool. |
 | `src/dpf/categories.py` | Personal vs other media from the optional `[categories] other = [...]` table of pools.toml. `Categories.of(dir)` (memoised; ancestors count; per-segment patterns, case-insensitive; absolute = anchored, relative = any depth), `of_dirs` (OTHER only if every folder is), `tally` (via `Index.dir_totals`), `load_categories`/`parse_categories`. |
 | `src/dpf/folders.py` | `dpf folders`: CSV overview (`write_folders_csv`), one row per folder two levels below each indexed root, with subtree totals (`summarize`, via `Index.file_rows` and `extras_under`) and blank Personal?/Notes columns for the owner to classify folders by hand. Index only; pools are matched against indexed roots, never by globbing mounts, so no drive is touched. |
-| `src/dpf/overview.py` | The Drives section/sheet (`build_overview`, `format_overview`, `personal_lines`): per drive space, photos/videos, personal/other bytes, not-media (used − media), **only copy** (personal media with no copy on another drive: in the coverage `missing` list and not in a within-pool group spanning another drive; counts lean high) and **name match** (`Coverage.similar`). Per pool personal total and unique (groups counted once); across exactly two pools, unique = A's + B's groups/singles entirely missing from A. Built only for `--category all`, since it needs every group. |
+| `src/dpf/overview.py` | The Drives section/sheet (`build_overview`, `format_overview`, `personal_lines`): per drive space, photos/videos, personal/other bytes, not-media (used − media), **only copy** (personal media with no copy on another drive: in the coverage `missing` list and not in a within-pool group spanning another drive; counts lean high) and **name match** (`Coverage.near`: a same-name file within `coverage.NEAR_SIZE` = 64 kB in size; likely re-saved, unproven). Per pool personal total and unique (groups counted once); across exactly two pools, unique = A's + B's groups/singles entirely missing from A. Built only for `--category all`, since it needs every group. |
+| `src/dpf/dumps.py` | Optional `[dumps]` table (`dump`, `sorted`, `min_photos`): dump folders (path contains the dump word) under the run's roots holding ≥ min_photos photos with no mode-1 match in a sorted folder (path contains the sorted word, not the dump word) on any indexed drive. `find_missing` with `index.Words` path filters (SQL `instr(lower(dir))`), so both sides may share roots. Section/sheet "Dumps not in Photography", JSON `dumps`. |
 | `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
 | `src/dpf/media.py` | Extension sets (images incl. RAW/HEIC, videos), `SKIP_DIRS` (`$RECYCLE.BIN`, `System Volume Information`, …), `is_junk` (`._*`, Thumbs.db, desktop.ini, .DS_Store). |
 | `src/dpf/models.py` | `FileRecord`, `DuplicateGroup`, `RootStats` (frozen dataclasses). |
@@ -228,8 +230,20 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   personal totals". Real index: 42.1 TB personal media on 9 drives (21.1 TB in A, 21.0 TB
   in B); unique 16.5 TB in A, 15.5 TB in B, **18.5 TB across all drives**; only copy
   4.8 TB, of which 3.5 TB has a same-name file in the other pool (mostly 1A ↔ 1B
-  re-saved DNGs). **4A (may be failing): 673 GB personal only-copy, 160 GB of it name
-  matches**; biggest is `Photography/2026` (413 GB, 138 files). Storage 1TB's space was
+  re-saved DNGs). **4A (may be failing): 673 GB personal only-copy, 93 GB of it name
+  matches** (≈580 GB truly at risk); biggest is `Photography/2026` (413 GB, 138 files).
+  - Name match was first any same-name file (3.5 TB). Sony counters repeat every 10,000
+    shots and there are two A7R IV bodies, so same-name ARWs months apart (sizes MBs
+    apart) are different photos. Since 2026-10-31 it needs the size within 64 kB
+    (`Coverage.near`): 3.1 TB. `Coverage.similar` (any size) still drives the coverage
+    report's "with a similar name there" note.
+- **Dumps check (2026-10-31, user request):** `[dumps] dump = "dump", sorted =
+  "photography", min_photos = 100` in the user's pools.toml (backup
+  `pools.toml.bak-20261031b`). Real index: 173,172 files in 13,681 dump folders;
+  77,156 (7.2 TB) not in any Photography folder; 100 folders with 100+ such photos
+  (52,822 files, 3.6 TB), mostly 3A `_Dumps/_PhotographyDumps` and its 3B backup
+  `_Dumps BU`. Many of the unsorted photos share names with sorted ones but are other
+  shots (counter wrap). The combined report now takes ~77 s. Storage 1TB's space was
   recorded on 2026-10-31 (1.0 TB, 430.6 GB used); every drive now has space data.
 - **Coverage review fixes (2026-10-27):** coverage says "media files" and adds a line
   "N other files (non-media) in M folders are not compared by this check …"; warnings

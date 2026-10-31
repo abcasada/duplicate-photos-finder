@@ -1227,6 +1227,38 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class DumpsCliTest(CliFixture):
+    def test_dump_sheet_and_section(self):
+        dump = os.path.join(self.drives, "one", "Camera dump")
+        sorted_ = os.path.join(self.drives, "two", "Photography")
+        os.makedirs(dump)
+        os.makedirs(sorted_)
+        for i in range(1, 11):
+            for d in (dump, sorted_) if i <= 3 else (dump,):
+                path = os.path.join(d, f"DSC{i:05}.ARW")
+                with open(path, "wb") as fh:
+                    fh.write(b"x" * (100 + i))
+                os.utime(path, (1_600_000_000 + i, 1_600_000_000 + i))
+        pools = os.path.join(self.tmp, "pools.toml")
+        with open(pools, "w") as fh:
+            fh.write('[pools]\nA = ["/nowhere"]\n[dumps]\ndump = "dump"\n'
+                     'sorted = "photography"\nmin_photos = 5\n')  # fmt: skip
+        code, out, _ = self.run_cli("--pools-file", pools, "find", "-q", "-o", self.out,
+                                    self.drives)  # fmt: skip
+        self.assertEqual(code, 0)
+        self.assertIn("===== Dumps not in Photography =====", out)
+        self.assertIn(f"{dump}   (7 photos unsorted, of 10 files)", out)
+        self.assertIn("DSC00004.ARW … DSC00010.ARW  7 files", out)
+        with open(os.path.join(self.out, "report.json")) as fh:
+            self.assertEqual(json.load(fh)["summary"]["dumps"]["folders"][0]["photos"], 7)
+        if HAVE_XLSXWRITER:
+            from tests.test_xlsx_report import Workbook
+
+            wb = Workbook(os.path.join(self.out, "report.xlsx"))
+            self.addCleanup(wb.close)
+            self.assertIn("Dumps not in Photography", wb.names)
+
+
 class FoldersCliTest(CliFixture):
     def test_folders_csv_from_index(self):
         self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)

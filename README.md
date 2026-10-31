@@ -391,14 +391,36 @@ Storage 4A 8TB      A       8.0 TB  5.1 TB*   2.9 TB  112,186   8,285  4.0 TB   
 - **Only copy** = personal media with no copy on any other drive, in its pool or the
   backup pool: what you would lose with that drive. It needs the coverage check, so it
   appears when the pool has a `[backups]` partner. **Name match** is the part of it that
-  has a file of the same name in the other pool with another size or date, usually the
-  same photo re-saved with new metadata, so probably a copy after all (mode 1b/2 will
-  tell).
+  has a file of the same name in the other pool within 64 kB in size: likely the same
+  photo re-saved with new metadata, but unproven (mode 1b/2 will tell), so count it as at
+  risk until then. (A same-name file megabytes apart is another photo: camera numbers
+  repeat every 10,000 shots.)
 
 Under the table: personal media per pool, in total and **unique** (each set of
 duplicates counted once), unique across all drives (a file in both A and B counts once),
 and the only-copy total. Matching is by name, size and date, so these lean high: a
 re-saved copy counts as another file, never the other way round.
+
+### Dumps not yet sorted
+
+With a `[dumps]` table in the pools file, every `find` also lists **dump folders whose
+photos never made it into a sorted folder**:
+
+```toml
+[dumps]
+dump = "dump"            # a dump folder: its path contains this (any case)
+sorted = "photography"   # a sorted folder: its path contains this, and not the dump word
+min_photos = 100         # list a dump folder from this many unsorted photos
+```
+
+A photo counts as sorted when mode 1 matches it (similar name, size and date) to a file
+in a sorted folder on **any** indexed drive of any pool. The report gets a "Dumps not in
+Photography" section and sheet: one row per dump folder with at least `min_photos`
+unsorted photos, largest first, with its unsorted runs (`DSC04682.ARW … DSC08897.ARW
+3,640 files`), the files in the folder and how many are "likely re-saved there" (a file
+of the same name within 64 kB in size in a sorted folder). Camera numbers repeat every
+10,000 shots, so a same-name file of a quite different size is another photo. Drives
+need not be connected: everything comes from the index.
 
 ### Reading the report
 

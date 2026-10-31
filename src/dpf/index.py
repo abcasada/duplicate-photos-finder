@@ -18,6 +18,7 @@ import os
 import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
 
 from dpf.models import DriveSpace, FileRecord, RootStats
 from dpf.names import match_key
@@ -124,6 +125,23 @@ def _prefix_clause(roots: Sequence[str]) -> tuple[str, list[str]]:
         parts.append("(dir = ? OR (dir >= ? AND dir < ?))")
         params += [root, root + "/", root + "0"]
     return "(" + " OR ".join(parts) + ")", params
+
+
+@dataclass(frozen=True, slots=True)
+class Words:
+    """Keeps files whose folder path holds every word of `contains` and none of `excludes`.
+
+    Case is ignored for ASCII letters (SQLite lower()). Empty: no filter.
+    """
+
+    contains: tuple[str, ...] = ()
+    excludes: tuple[str, ...] = ()
+
+    def clause(self) -> tuple[str, list[str]]:
+        parts = ["instr(lower(dir), ?) > 0"] * len(self.contains)
+        parts += ["instr(lower(dir), ?) = 0"] * len(self.excludes)
+        params = [w.lower() for w in (*self.contains, *self.excludes)]
+        return (" AND " + " AND ".join(parts) if parts else ""), params
 
 
 def _subtree_range(root: str) -> tuple[str, str]:
@@ -469,17 +487,24 @@ class Index:
         *,
         by_size: bool = True,
         exact_names: bool = False,
+        words: Words = Words(),
+        other_words: Words = Words(),
     ) -> Iterator[tuple[str, list[tuple[FileRecord, bool]]]]:
         """Yield (key, bucket) for the name buckets (as name_buckets) of files under `roots`.
 
         Only non-empty files are included. Each bucket entry is (file, True if it lies
         under `other_roots`). Every non-empty file
         under `roots` is in exactly one bucket, with every file under `other_roots`
-        sharing its key; buckets without a file under `roots` are skipped. The two sets
-        of roots must not overlap. Streams from SQLite in key order.
+        sharing its key; buckets without a file under `roots` are skipped. The two sides
+        must not overlap: disjoint roots, or `words`/`other_words` filters that no folder
+        can pass both of. Streams from SQLite in key order.
         """
         where, params = _prefix_clause(roots)
         other, other_params = _prefix_clause(other_roots)
+        extra, extra_params = words.clause()
+        other_extra, other_extra_params = other_words.clause()
+        where, params = where + extra, params + extra_params
+        other, other_params = other + other_extra, other_params + other_extra_params
         column = "name_key" if exact_names else "match_key"
         order = "6, 3, 1, 2" if by_size else "6, 1, 2"
         sql = f"""
@@ -497,12 +522,22 @@ class Index:
             if any(not r[6] for r in bucket):
                 yield bucket[0][5], [(_record(r), bool(r[6])) for r in bucket]
 
-    def name_keys(self, roots: Sequence[str], *, exact_names: bool = False) -> set[str]:
-        """The match keys (or with `exact_names` the name keys) of non-empty files under `roots`."""
+    def name_sizes(
+        self, roots: Sequence[str], *, exact_names: bool = False, words: Words = Words()
+    ) -> dict[str, list[int]]:
+        """Match key (or name key) -> sorted sizes of the non-empty files under `roots`."""
         where, params = _prefix_clause(roots)
+        extra, extra_params = words.clause()
         column = "name_key" if exact_names else "match_key"
-        rows = self.conn.execute(f"SELECT {column} FROM files WHERE {where} AND size > 0", params)
-        return {k for (k,) in rows}
+        sizes: dict[str, list[int]] = {}
+        rows = self.conn.execute(
+            f"SELECT {column}, size FROM files WHERE {where}{extra} AND size > 0 "
+            f"ORDER BY {column}, size",
+            params + extra_params,
+        )
+        for key, size in rows:
+            sizes.setdefault(key, []).append(size)
+        return sizes
 
     def empty_files(self, roots: Sequence[str]) -> int:
         """Number of 0-byte files indexed under `roots`."""
