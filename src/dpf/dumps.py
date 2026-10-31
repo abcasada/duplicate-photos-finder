@@ -84,13 +84,17 @@ def check_dumps(
     ignore_mtime: bool = False,
     exact_names: bool = False,
     hour_shift: bool = True,
+    shots: bool = False,
 ) -> DumpCheck:
     """Dump folders under `roots` holding at least min_photos photos not in a sorted folder
-    under `sorted_roots` (which may overlap `roots`: the words keep the sides apart)."""
+    under `sorted_roots` (which may overlap `roots`: the words keep the sides apart).
+    `shots` (mode 1b) also counts a photo as sorted when a sorted folder holds the same
+    camera shot under another name, size or date."""
     missing, totals, _, _, near = find_missing(
         index, roots, sorted_roots, mtime_tolerance=mtime_tolerance, ignore_size=ignore_size,
         ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift,
         words=Words((config.dump,)), other_words=Words((config.sorted,), (config.dump,)),
+        shots=shots,
     )  # fmt: skip
     check = DumpCheck(config, basis)
     check.dump_folders = len(totals)
@@ -160,7 +164,7 @@ def format_dumps(check: DumpCheck, *, top: int, max_runs: int) -> str:
         f'Dump folders (path contains "{c.dump}") holding at least {c.min_photos:,} photos '
         f'that are in no sorted folder (path contains "{c.sorted}" but not "{c.dump}") '
         "on any indexed drive.",
-        f"Matched on {check.basis}, not contents: a renamed and re-saved copy counts as "
+        f"Matched on {check.basis}, not contents: a {_resaved(check)} copy counts as "
         "unsorted. Camera numbers repeat (every 10,000 shots), so a same-name file in a "
         "sorted folder is usually another photo unless its size is within 64 kB.",
         "",
@@ -187,6 +191,12 @@ def format_dumps(check: DumpCheck, *, top: int, max_runs: int) -> str:
     if len(listed) > top:
         lines += ["", f"… and {len(listed) - top:,} more folders (see report.xlsx / report.json)"]
     return "\n".join(lines) + "\n"
+
+
+def _resaved(check: DumpCheck) -> str:
+    if check.basis.startswith("same shot"):
+        return "re-saved (without camera EXIF, or none cached yet)"
+    return "renamed and re-saved"
 
 
 def dumps_json(check: DumpCheck) -> dict:

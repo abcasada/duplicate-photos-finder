@@ -410,6 +410,8 @@ def format_text(
     )
     if result.hour_shift_groups:
         out.append(f"{'':<13}{hour_shift_note(result.hour_shift_groups)}")
+    for i, line in enumerate(shot_lines(summary.get("shots"))):
+        out.append(f"{'Shots:' if i == 0 else '':<13}{line}")
     if result.capped_groups:
         out.append(
             f"             {plural(result.capped_groups, 'group')} spread over very many "
@@ -448,6 +450,67 @@ def category_tally(tallies: dict) -> str:
         for c in CATEGORIES
         if c in tallies
     )
+
+
+def shot_lines(shots: dict | None) -> list[str]:
+    """Mode 1b header lines from summary["shots"] (match_shot.ShotStats.to_json)."""
+    if not shots:
+        return []
+    files = shots["files"]
+    lines = [
+        f"{shots['with_identity']:,} of {files:,} photos/videos have a camera shot "
+        "identity (body serial + shutter count)"
+    ]
+    if shots["no_exif"]:
+        lines.append(
+            f"{plural(shots['no_exif'], 'file')} {'has' if shots['no_exif'] == 1 else 'have'} "
+            "no EXIF cached yet (run `dpf exif`); matched by name, size and date only"
+        )
+    if shots["errors"]:
+        lines.append(f"{plural(shots['errors'], 'file')} could not be read by exiftool")
+    if shots["shot_groups"]:
+        lines.append(
+            f"{plural(shots['shot_groups'], 'group')} matched as the same shot; "
+            f"{shots['resaved_groups']:,} of them hold files of different sizes "
+            "(re-saved / metadata differs)"
+        )
+    if shots["vetoed"]:
+        lines.append(
+            f"{plural(shots['vetoed'], 'name/size/date group')} split: their files are "
+            "different shots (serial or shutter count differ)"
+        )
+    if shots["multi_format"]:
+        lines.append(
+            f"{plural(shots['multi_format'], 'shot')} exist in two or more formats "
+            "(e.g. RAW+JPG): never counted as duplicates"
+        )
+    return lines
+
+
+def coverage_shot_lines(cov: Coverage) -> list[str]:
+    """Mode 1b lines of a coverage section."""
+    if not cov.shots:
+        return []
+    lines = []
+    if cov.by_shot:
+        lines.append(
+            f"{plural(cov.by_shot, 'file')} {'counts' if cov.by_shot == 1 else 'count'} as "
+            f"copied only as the same camera shot in pool {cov.other} (another name, size or "
+            "date: re-saved / metadata differs)"
+        )
+    if cov.vetoed:
+        lines.append(
+            f"{plural(cov.vetoed, 'missing file')} {'has' if cov.vetoed == 1 else 'have'} a "
+            "name/size/date match that is another shot (serial or shutter count differ)"
+        )
+    if cov.no_exif or cov.other_no_exif:
+        mine = f"pool {cov.pool}" if cov.pool else "these folders"
+        lines.append(
+            f"No EXIF cached yet for {cov.no_exif:,} compared files in {mine} and "
+            f"{cov.other_no_exif:,} in pool {cov.other} (run `dpf exif`): those match by "
+            "name, size and date only"
+        )
+    return lines
 
 
 def hour_shift_note(n: int, what: str = "group") -> str:
@@ -760,7 +823,7 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
         out.extend(f"{'':<18}{p}" for p in cov.never_scanned)
     for warning in cov.warnings:
         out.append(f"{'Warning:':<16}{warning}")
-    out.append(f"{'':<16}{caveat(cov.basis_words)}")
+    out.append(f"{'':<16}{caveat(cov.basis_words, cov.shots)}")
     if cov.category != ALL:
         out.append(f"{'Showing:':<16}{TITLES[cov.category].lower()} only")
     head = {NOT_BACKED_UP: "Not backed up", ONLY_IN_BACKUP: "Only in backup"}.get(
@@ -775,6 +838,7 @@ def format_coverage(cov: Coverage, *, top: int | None = COVERAGE_TOP, max_runs: 
     out.extend(f"{'':<16}{line}" for line in coverage_category_lines(cov))
     if cov.shifted:
         out.append(f"{'':<16}{shifted_note(cov)}")
+    out.extend(f"{'':<16}{line}" for line in coverage_shot_lines(cov))
     if cov.similar:
         out.append(f"{'':<16}{similar_note(cov)}")
     if cov.unindexed:
@@ -837,7 +901,7 @@ def coverage_data(cov: Coverage) -> dict:
         "title": cov.title,
         "relation": coverage_relation(cov),
         "basis": cov.basis,
-        "caveat": caveat(cov.basis_words),
+        "caveat": caveat(cov.basis_words, cov.shots),
         "roots": cov.roots,
         "other_roots": cov.other_status or cov.other_roots,
         "never_scanned": cov.never_scanned,
@@ -850,6 +914,9 @@ def coverage_data(cov: Coverage) -> dict:
         "missing_folders": cov.missing_dirs,
         "similar_name_files": len(cov.similar),
         "hour_shift_files": cov.shifted,
+        **({"same_shot_files": cov.by_shot, "other_shot_files": cov.vetoed,
+            "no_exif_files": cov.no_exif, "other_no_exif_files": cov.other_no_exif}
+           if cov.shots else {}),
         "empty_files": cov.empty,
         "other_files_not_compared": cov.unindexed,
         "other_files_folders": cov.unindexed_dirs,

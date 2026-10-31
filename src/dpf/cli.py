@@ -1,4 +1,4 @@
-"""Command-line interface: `dpf scan`, `find`, `drives`, `space`, `folders` and `pools`."""
+"""Command-line interface: `dpf scan`, `exif`, `find`, `drives`, `space`, `folders`, `pools`."""
 
 from __future__ import annotations
 
@@ -53,6 +53,7 @@ from dpf.report import (
     FROM_INDEX,
     SCANNED_NOW,
     TREE_TOP,
+    duration,
     footer_lines,
     format_coverage,
     format_text,
@@ -67,9 +68,13 @@ from dpf.report import (
     write_pools_json,
 )
 
-MODES = {"1": "name", "name": "name", "2": "content", "content": "content", "3": "both", "both": "both"}
+MODES = {
+    "1": "name", "name": "name", "1b": "shot", "shot": "shot", "2": "content",
+    "content": "content", "3": "both", "both": "both",
+}  # fmt: skip
 MODE_TITLES = {
     "name": "1 (name/date)",
+    "shot": "1b (camera shot, else name/date)",
     "content": "2 (content comparison)",
     "both": "3 (name/date, then content)",
 }
@@ -115,6 +120,32 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Index the files under PATHs, or under the connected drives of --pool.",
     )  # fmt: skip
 
+    e = sub.add_parser(
+        "exif", help="read camera EXIF of indexed files, for mode 1b (slow, read-only)",
+        description="Read the camera make, model, body serial, shutter count and capture "
+        "time of the indexed photos/videos under PATHs (or the connected drives of --pool) "
+        "with exiftool, and cache them in the index for `dpf find --mode 1b`. Only files "
+        "of the last scan without a cached reading are read, so a rerun resumes; Ctrl-C "
+        "keeps what was read. Files are only read, never written.",
+    )  # fmt: skip
+    e.add_argument("roots", nargs="*", metavar="PATH", help="scanned drives or folders")
+    e.add_argument(
+        "--pool", metavar="NAME", action="append",
+        help="read the connected drives of this pool (repeatable)",
+    )  # fmt: skip
+    e.add_argument(
+        "--jobs", type=int, default=None, metavar="N",
+        help="exiftool processes parsing in parallel (default: min(6, CPUs))",
+    )  # fmt: skip
+    e.add_argument(
+        "--readers", type=int, default=4, metavar="N",
+        help="reader threads per physical drive (default: 4)",
+    )  # fmt: skip
+    e.add_argument(
+        "--retry-errors", action="store_true", help="read again files that failed before"
+    )
+    e.add_argument("-q", "--quiet", action="store_true", help="no progress output")
+
     d = sub.add_parser(
         "drives", help="list the drives/folders in the index", description="List every "
         "scanned root in the index, or remove one from it (the drive itself is never touched).",
@@ -132,8 +163,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     f.add_argument(
         "-m", "--mode", default="1", choices=sorted(MODES),
-        help="1/name: similar name+size+date (fast, metadata only); 2/content: compare file "
-        "contents; 3/both: mode 1 then mode 2 (default: 1)",
+        help="1/name: similar name+size+date (fast, metadata only); 1b/shot: the same "
+        "camera shot (body serial + shutter count, cached by `dpf exif`), else mode 1; "
+        "2/content: compare file contents; 3/both: mode 1 then mode 2 (default: 1)",
     )  # fmt: skip
     f.add_argument(
         "--compare", choices=["exact", "visual", "both"], default="exact",
@@ -282,9 +314,12 @@ def _progress_printer(quiet: bool):
     return progress
 
 
+CLEAR_LINE = "\r\033[K"
+
+
 def _end_progress(quiet: bool) -> None:
     if not quiet and sys.stderr.isatty():
-        sys.stderr.write("\r\033[K")
+        sys.stderr.write(CLEAR_LINE)
 
 
 def _scan(
@@ -401,11 +436,13 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
     from dpf.coverage import check_coverage
     from dpf.grouping import group_duplicates
     from dpf.match_name import find_name_duplicates
+    from dpf.match_shot import find_shot_duplicates
 
     mode = MODES[args.mode]
-    if mode != "name":
+    if mode not in ("name", "shot"):
         print("dpf: mode 2/3 (content comparison) is not implemented yet", file=sys.stderr)
         return 2
+    shots = mode == "shot"
 
     cats = _load_categories(args)
     if cats is None:
@@ -464,17 +501,17 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
 
     runs: list[_PoolRun] = []
     status_of: dict[int, list[dict]] = {}
+    match_opts = {
+        "mtime_tolerance": args.mtime_tolerance, "ignore_size": args.ignore_size,
+        "ignore_mtime": args.ignore_mtime, "exact_names": args.exact_names,
+        "hour_shift": not args.strict_time,
+    }  # fmt: skip
     for t in targets:
-        groups = list(
-            find_name_duplicates(
-                idx, t.roots,
-                mtime_tolerance=args.mtime_tolerance,
-                ignore_size=args.ignore_size,
-                ignore_mtime=args.ignore_mtime,
-                exact_names=args.exact_names,
-                hour_shift=not args.strict_time,
-            )
-        )  # fmt: skip
+        shot_stats = None
+        if shots:
+            groups, shot_stats = find_shot_duplicates(idx, t.roots, **match_opts)
+        else:
+            groups = list(find_name_duplicates(idx, t.roots, **match_opts))
         if args.category != ALL:
             groups = [g for g in groups if _group_category(cats, g) == args.category]
         result = group_duplicates(
@@ -496,6 +533,8 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             "files": files,
             "bytes": nbytes,
         }
+        if shot_stats is not None:
+            summary["shots"] = shot_stats.to_json()
         if category is not None:
             summary["categories"] = _sum_tallies(status)
             summary["category_patterns"] = list(cats.other)
@@ -513,9 +552,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         cov = check_coverage(
             idx, plan.target.roots, plan.roots,
             pool=plan.target.name, other=plan.other.name, direction=plan.direction,
-            mtime_tolerance=args.mtime_tolerance, ignore_size=args.ignore_size,
-            ignore_mtime=args.ignore_mtime, exact_names=args.exact_names,
-            hour_shift=not args.strict_time, category=category, only=args.category,
+            **match_opts, category=category, only=args.category, shots=shots,
         )  # fmt: skip
         offline = plan.in_run.offline if plan.in_run else {
             r for r in plan.roots if not os.path.isdir(r)
@@ -630,6 +667,76 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
     return 0
 
 
+_NO_EXIFTOOL = "dpf: exiftool not found; install it (apt install libimage-exiftool-perl)"
+
+
+def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
+    """`dpf exif`: cache camera EXIF of the indexed media under connected `roots`."""
+    from dpf.exif import ExifRun, ExifToolMissing, exiftool_available, read_exif
+
+    if not exiftool_available():
+        print(_NO_EXIFTOOL, file=sys.stderr)
+        return 1
+    if (args.jobs is not None and args.jobs < 1) or args.readers < 1:
+        print("dpf: --jobs and --readers must be at least 1", file=sys.stderr)
+        return 1
+    for r in roots:
+        if not idx.indexed(r):
+            print(f"dpf: nothing indexed under {r}; run `dpf scan` on it first", file=sys.stderr)
+            return 1
+    if not args.quiet:
+        for r in roots:
+            print(f"reading EXIF under {r}", file=sys.stderr)
+    tty = sys.stderr.isatty()
+    logged = [0.0]
+
+    def progress(run: ExifRun) -> None:
+        done = run.read + run.gone
+        rate = done / run.elapsed if run.elapsed else 0.0
+        eta = duration((run.todo - done) / rate) if rate else "?"
+        line = f"exif: {done:,} of {run.todo:,} files, {rate:,.0f} files/s, ETA {eta}"
+        if tty:
+            sys.stderr.write(CLEAR_LINE + line)
+        elif run.elapsed - logged[0] >= 60:  # a log line a minute when not on a terminal
+            logged[0] = run.elapsed
+            sys.stderr.write(line + "\n")
+        sys.stderr.flush()
+
+    try:
+        run = read_exif(
+            idx, roots, jobs=args.jobs, readers=args.readers, retry_errors=args.retry_errors,
+            progress=None if args.quiet else progress,
+        )  # fmt: skip
+    except ExifToolMissing:
+        print(_NO_EXIFTOOL, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        _end_progress(args.quiet)
+        print("dpf: interrupted; what was read is kept, run again to resume", file=sys.stderr)
+        return 130
+    _end_progress(args.quiet)
+    for r in run.skipped_roots:
+        print(f"dpf: warning: {r} looks empty or unreadable (not mounted?); skipped",
+              file=sys.stderr)  # fmt: skip
+    if not run.todo:
+        print("nothing to read: every indexed photo/video there has EXIF cached")
+        return 0
+    rate = run.read / run.elapsed if run.elapsed else 0.0
+    print(
+        f"read EXIF of {plural(run.read, 'file')} in {duration(run.elapsed)} ({rate:,.0f}/s): "
+        f"{run.ok:,} with a camera shot identity, {run.none:,} without, "
+        f"{plural(run.errors, 'error')}"
+    )
+    if run.full_reads:
+        what = plural(run.full_reads, "file")
+        print(f"  {what} re-read in full (tags beyond the first 512 kB)")
+    if run.gone:
+        print(f"  {plural(run.gone, 'file')} no longer there; rescan to update the index")
+    if run.errors:
+        print("  errors are cached too; `dpf exif --retry-errors` reads them again")
+    return 0
+
+
 def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -> DumpCheck | None:
     """The [dumps] check over this run's roots against every indexed drive; None if unset."""
     from dpf.scanner import drop_nested
@@ -653,7 +760,7 @@ def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -
         idx, roots, everywhere, config, pool_of, basis=_basis(args),
         mtime_tolerance=args.mtime_tolerance, ignore_size=args.ignore_size,
         ignore_mtime=args.ignore_mtime, exact_names=args.exact_names,
-        hour_shift=not args.strict_time,
+        hour_shift=not args.strict_time, shots=MODES[args.mode] == "shot",
     )  # fmt: skip
 
 
@@ -669,7 +776,7 @@ def _coverage_plans(
     Without --coverage-against, each pool of the run is checked against the pools linked
     to it by [backups]; a link that can't be used is skipped with a warning.
     """
-    if args.no_coverage or MODES[args.mode] != "name":
+    if args.no_coverage or MODES[args.mode] not in ("name", "shot"):
         return []
     in_run = {t.pool.name.casefold(): t for t in targets if t.pool}
     wanted: list[tuple[_Target, Pool, str]] = []
@@ -1254,12 +1361,14 @@ def _write_xlsx(
 
 def _basis(args: argparse.Namespace) -> str:
     from dpf.match_name import basis
+    from dpf.match_shot import basis as shot_basis
 
-    return basis(
+    text = basis(
         exact_names=args.exact_names, ignore_size=args.ignore_size,
         ignore_mtime=args.ignore_mtime, tolerance=args.mtime_tolerance,
         hour_shift=not args.strict_time,
     )  # fmt: skip
+    return shot_basis(text) if MODES[args.mode] == "shot" else text
 
 
 def _offline_root(idx: Index, path: str) -> str:
@@ -1331,9 +1440,10 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as e:
             print(f"dpf: {e}", file=sys.stderr)
             return 1
-        if args.command == "scan" and missing:
+        if args.command in ("scan", "exif") and missing:
             if pool is None:
-                print(f"dpf: {missing[0]} is not connected; nothing to scan", file=sys.stderr)
+                what = "scan" if args.command == "scan" else "read"
+                print(f"dpf: {missing[0]} is not connected; nothing to {what}", file=sys.stderr)
                 return 1
             if not online:
                 print(f"dpf: no drives in pool {pool.name} are connected", file=sys.stderr)
@@ -1367,6 +1477,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "scan":
                 _scan(idx, drop_nested(r for t in targets for r in t.roots), args)
                 return 0
+            if args.command == "exif":
+                return _exif(idx, drop_nested(r for t in targets for r in t.roots), args)
             return _find(idx, targets, pools, args)
     except KeyboardInterrupt:
         _end_progress(False)

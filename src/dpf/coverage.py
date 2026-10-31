@@ -90,6 +90,11 @@ class Coverage:
     category: str = ALL  # the category shown (--category); ALL for both
     warnings: list[str] = field(default_factory=list)  # e.g. a stale index of the other pool
     near: set[str] = field(default_factory=set)  # of `similar`: a size within NEAR_SIZE there
+    shots: bool = False  # mode 1b: matched by camera shot first
+    by_shot: int = 0  # files counted as copied only as the same camera shot
+    vetoed: int = 0  # missing files whose name/size/date match was refused (shots differ)
+    no_exif: int = 0  # compared files with no EXIF cached (mode 1b): name rules only
+    other_no_exif: int = 0  # the same, in the other pool
 
     @property
     def missing_dirs(self) -> int:
@@ -126,14 +131,53 @@ def basis_words(
     return parts[0] if len(parts) == 1 else ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
-def caveat(cov_basis_words: str) -> str:
+def caveat(cov_basis_words: str, shots: bool = False) -> str:
+    if shots:
+        return (
+            f"Matched by {cov_basis_words}, not by contents; a re-saved copy without camera "
+            "EXIF (or with none cached yet: run `dpf exif`) counts as missing."
+        )
     return (
         f"Matched by {cov_basis_words}, not by contents; a renamed-and-re-saved copy "
         "counts as missing."
     )
 
 
+@dataclass(slots=True)
+class Missing:
+    """What find_missing found (see there)."""
+
+    missing: list[FileRecord]
+    totals: Counter[str]
+    similar: set[str]
+    shifted: Counter[str]
+    near: set[str]
+    by_shot: Counter[str] = field(default_factory=Counter)  # per dir: copied as a shot only
+    vetoed: Counter[str] = field(default_factory=Counter)  # per dir: missing, name match refused
+
+    def astuple(self) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str], set[str]]:
+        return self.missing, self.totals, self.similar, self.shifted, self.near
+
+
 def find_missing(
+    index: Index,
+    roots: Sequence[str],
+    other_roots: Sequence[str],
+    **kw,
+) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str], set[str]]:
+    """Non-empty files under `roots` with no copy under `other_roots`.
+
+    Returns (missing files, compared files per dir, paths of the missing files whose
+    name key does occur under `other_roots` with another size or date, per dir the
+    files whose only copies differ from them by whole hours, and the paths of the similar
+    ones with such a file within NEAR_SIZE bytes in size). `roots` and `other_roots`
+    must not overlap, unless the `words` filters keep the two sides apart. Options are
+    those of missing_files.
+    """
+    return missing_files(index, roots, other_roots, **kw).astuple()
+
+
+def missing_files(
     index: Index,
     roots: Sequence[str],
     other_roots: Sequence[str],
@@ -145,32 +189,21 @@ def find_missing(
     hour_shift: bool = True,
     words: Words = Words(),
     other_words: Words = Words(),
-) -> tuple[list[FileRecord], Counter[str], set[str], Counter[str], set[str]]:
-    """Non-empty files under `roots` with no copy under `other_roots`.
-
-    Returns (missing files, compared files per dir, paths of the missing files whose
-    name key does occur under `other_roots` with another size or date, per dir the
-    files whose only copies differ from them by whole hours, and the paths of the similar
-    ones with such a file within NEAR_SIZE bytes in size). `roots` and `other_roots`
-    must not overlap, unless the `words` filters keep the two sides apart.
-    """
+    shots: bool = False,
+) -> Missing:
+    """find_missing as a Missing. With `shots` (mode 1b), a file also has a copy when a
+    file of the other side is the same camera shot, and a name match between two
+    different shots does not count (match_shot)."""
+    if shots:
+        return _missing_by_shot(
+            index, roots, other_roots, mtime_tolerance=mtime_tolerance,
+            ignore_size=ignore_size, ignore_mtime=ignore_mtime, exact_names=exact_names,
+            hour_shift=hour_shift, words=words, other_words=other_words,
+        )  # fmt: skip
+    note_similar, similar, near = _similar_noter(index, other_roots, exact_names, other_words)
     missing: list[FileRecord] = []
-    similar: set[str] = set()
-    near: set[str] = set()
     totals: Counter[str] = Counter()
     shifted: Counter[str] = Counter()
-    other_sizes = index.name_sizes(other_roots, exact_names=exact_names, words=other_words)
-
-    def note_similar(key: str, files: list[FileRecord]) -> None:
-        sizes = other_sizes.get(key)
-        if not sizes:
-            return
-        for f in files:
-            similar.add(f.path)
-            i = bisect.bisect_left(sizes, f.size - NEAR_SIZE)
-            if i < len(sizes) and sizes[i] <= f.size + NEAR_SIZE:
-                near.add(f.path)
-
     buckets = index.coverage_buckets(
         roots, other_roots, by_size=not ignore_size, exact_names=exact_names,
         words=words, other_words=other_words,
@@ -192,17 +225,144 @@ def find_missing(
             if not any(id(f) in others for f in group):
                 continue
             covered.update(id(f) for f in group)
-            hours = () if ignore_mtime else hour_offsets(group)
-            if hours:
-                there = {h for f, h in zip(group, hours) if id(f) in others}
-                for f, h in zip(group, hours):
-                    if id(f) not in others and h not in there:
-                        shifted[f.dir] += 1
+            _count_shifted(group, others, ignore_mtime, shifted)
         left = [f for f in mine if id(f) not in covered]
         missing += left
         note_similar(key, left)
     missing.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
-    return missing, totals, similar, shifted, near
+    return Missing(missing, totals, similar, shifted, near)
+
+
+def _similar_noter(
+    index: Index, other_roots: Sequence[str], exact_names: bool, other_words: Words
+) -> tuple[Callable[[str, list[FileRecord]], None], set[str], set[str]]:
+    """(note(key, files), similar, near): note() records which missing files have a
+    file of their name key under `other_roots`, and which of those one within NEAR_SIZE."""
+    similar: set[str] = set()
+    near: set[str] = set()
+    other_sizes = index.name_sizes(other_roots, exact_names=exact_names, words=other_words)
+
+    def note(key: str, files: list[FileRecord]) -> None:
+        sizes = other_sizes.get(key)
+        if not sizes:
+            return
+        for f in files:
+            similar.add(f.path)
+            i = bisect.bisect_left(sizes, f.size - NEAR_SIZE)
+            if i < len(sizes) and sizes[i] <= f.size + NEAR_SIZE:
+                near.add(f.path)
+
+    return note, similar, near
+
+
+def _missing_by_shot(
+    index: Index,
+    roots: Sequence[str],
+    other_roots: Sequence[str],
+    *,
+    mtime_tolerance: float,
+    ignore_size: bool,
+    ignore_mtime: bool,
+    exact_names: bool,
+    hour_shift: bool,
+    words: Words,
+    other_words: Words,
+) -> Missing:
+    """missing_files for mode 1b.
+
+    A file is covered when its group (match_shot: shot groups joined with the name
+    groups left after the veto) holds a file of the other side: directly, through a name
+    group holding one, or through its shot key, which the other side holds itself
+    (Index.shot_coverage_buckets "elsewhere") or holds through a name group elsewhere.
+    The last case is only known once every bucket was seen, so such files wait in
+    `pending` until the end.
+    """
+    from dpf.match_shot import split_by_shot
+
+    note_similar, similar, near = _similar_noter(index, other_roots, exact_names, other_words)
+    missing: list[FileRecord] = []
+    totals: Counter[str] = Counter()
+    shifted: Counter[str] = Counter()
+    covered_keys: set[str] = set()  # shot keys whose group holds a file of the other side
+    pending: list[tuple[FileRecord, str, str, bool]] = []  # (file, bucket key, shot, vetoed)
+    by_shot: Counter[str] = Counter()
+    vetoed: Counter[str] = Counter()
+    buckets = index.shot_coverage_buckets(
+        roots, other_roots, by_size=not ignore_size, exact_names=exact_names,
+        words=words, other_words=other_words,
+    )  # fmt: skip
+    for key, bucket in buckets:
+        files = [f for f, _, _, _ in bucket]
+        other = {id(f) for f, side, _, _ in bucket if side}
+        shot_of = {id(f): s for f, _, s, _ in bucket}
+        elsewhere = {id(f) for f, _, _, e in bucket if e}
+        mine = [f for f, side, _, _ in bucket if not side]
+        for f in mine:
+            totals[f.dir] += 1
+        direct: set[int] = set()
+        refused: set[int] = set()  # a name match with the other side, refused by the veto
+        group_key: dict[int, str] = {}  # files without a key -> the key of their name group
+        group_elsewhere: set[str] = set()  # keys a file of this bucket holds elsewhere
+        if len(files) > 1:
+            for group in bucket_groups(
+                files, mtime_tolerance=mtime_tolerance, ignore_mtime=ignore_mtime,
+                exact_names=exact_names, hour_shift=hour_shift,
+            ):  # fmt: skip
+                had_other = any(id(f) in other for f in group)
+                for part, k in split_by_shot(group, lambda f: shot_of[id(f)]):
+                    if len(part) < 2:
+                        if had_other:
+                            refused.update(id(f) for f in part)
+                        continue
+                    if any(id(f) in other for f in part):
+                        direct.update(id(f) for f in part)
+                        if k:
+                            covered_keys.add(k)
+                        _count_shifted(part, other, ignore_mtime, shifted)
+                        continue
+                    if had_other:
+                        refused.update(id(f) for f in part)
+                    if k:
+                        for f in part:
+                            group_key.setdefault(id(f), k)
+                            if id(f) in elsewhere:
+                                group_elsewhere.add(k)
+        left: list[FileRecord] = []
+        for f in mine:
+            if id(f) in direct:
+                continue
+            k = shot_of[id(f)] or group_key.get(id(f))
+            if k is None:
+                left.append(f)
+                vetoed[f.dir] += id(f) in refused
+            elif id(f) in elsewhere or k in group_elsewhere or k in covered_keys:
+                by_shot[f.dir] += 1
+            else:
+                pending.append((f, key, k, id(f) in refused))
+        missing += left
+        note_similar(key, left)
+    for f, key, k, was_refused in pending:
+        if k in covered_keys:
+            by_shot[f.dir] += 1
+            continue
+        missing.append(f)
+        vetoed[f.dir] += was_refused
+        note_similar(key, [f])
+    missing.sort(key=lambda f: (f.dir, natural_key(f.name), f.name))
+    return Missing(missing, totals, similar, shifted, near, by_shot, vetoed)
+
+
+def _count_shifted(
+    group: list[FileRecord], other: set[int], ignore_mtime: bool, shifted: Counter[str]
+) -> None:
+    """Count the files of `group` whose copies on the other side all differ by whole hours."""
+    hours = () if ignore_mtime else hour_offsets(group)
+    if not hours:
+        return
+    there = {h for f, h in zip(group, hours) if id(f) in other}
+    for f, h in zip(group, hours):
+        if id(f) not in other and h not in there:
+            shifted[f.dir] += 1
 
 
 def roll_up(
@@ -387,21 +547,25 @@ def check_coverage(
     hour_shift: bool = True,
     category: Category | None = None,
     only: str = ALL,
+    shots: bool = False,
 ) -> Coverage:
     """Find and roll up the files under `roots` that have no copy under `other_roots`.
 
     Raises ValueError when a root of one side equals or lies inside a root of the other.
     With `category`, `by_category` holds per category the compared, missing and shifted
     files and missing bytes; `only` (PERSONAL or OTHER) keeps the files of one category.
+    `shots` matches by camera shot first (mode 1b, see missing_files).
     """
     for r in roots:
         for o in other_roots:
             if _related(r, o):
                 raise ValueError(f"coverage roots overlap: {r} and {o}")
-    missing, totals, similar, shifted, near = find_missing(
+    found = missing_files(
         index, roots, other_roots, mtime_tolerance=mtime_tolerance, ignore_size=ignore_size,
-        ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift,
+        ignore_mtime=ignore_mtime, exact_names=exact_names, hour_shift=hour_shift, shots=shots,
     )  # fmt: skip
+    missing, totals, similar, shifted, near = found.astuple()
+    by_shot, vetoed = found.by_shot, found.vetoed
     extras = index.extras_under(roots)
 
     def cat(d: str) -> str:
@@ -420,6 +584,8 @@ def check_coverage(
         missing = [f for f in missing if cat(f.dir) == only]
         totals = Counter({d: n for d, n in totals.items() if cat(d) == only})
         shifted = Counter({d: n for d, n in shifted.items() if cat(d) == only})
+        by_shot = Counter({d: n for d, n in by_shot.items() if cat(d) == only})
+        vetoed = Counter({d: n for d, n in vetoed.items() if cat(d) == only})
         extras = {d: n for d, n in extras.items() if cat(d) == only}
         similar = {p for p in similar if cat(p.rsplit("/", 1)[0] or "/") == only}
         near &= similar
@@ -428,12 +594,23 @@ def check_coverage(
     shift = not ignore_mtime and shifts_hours(mtime_tolerance, hour_shift)
     flags = {"exact_names": exact_names, "ignore_size": ignore_size, "ignore_mtime": ignore_mtime}
     how = basis(**flags, tolerance=mtime_tolerance, hour_shift=hour_shift)
+    words = basis_words(**flags, hour_shift=shift)
+    if shots:
+        from dpf.match_shot import SHOT_WORDS, basis as shot_basis
+
+        how, words = shot_basis(how), f"{SHOT_WORDS}, else {words}"
     cov = Coverage(
-        pool, other, direction, list(roots), list(other_roots), how,
-        basis_words(**flags, hour_shift=shift), sum(totals.values()), nbytes, missing,
-        similar, sum(f.size for f in missing), index.empty_files(roots), folders,
+        pool, other, direction, list(roots), list(other_roots), how, words,
+        sum(totals.values()), nbytes, missing, similar, sum(f.size for f in missing),
+        index.empty_files(roots), folders,
     )  # fmt: skip
     cov.near = near
+    if shots:
+        cov.shots = True
+        cov.by_shot = sum(by_shot.values())
+        cov.vetoed = sum(vetoed.values())
+        cov.no_exif = index.exif_status(roots)["missing"]
+        cov.other_no_exif = index.exif_status(other_roots)["missing"]
     cov.shifted = sum(shifted.values())
     cov.unindexed = sum(extras.values())
     cov.unindexed_dirs = len(extras)

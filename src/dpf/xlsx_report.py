@@ -42,6 +42,7 @@ from dpf.report import (
     category_tally,
     coverage_category_lines,
     coverage_relation,
+    coverage_shot_lines,
     duration,
     floor_percent,
     hour_shift_note,
@@ -54,6 +55,7 @@ from dpf.report import (
     name_list,
     shift_cell,
     shifted_note,
+    shot_lines,
     tree_label,
     tree_tags,
     unindexed_note,
@@ -771,6 +773,8 @@ def _pool_block(
     w.line("Duplicate groups", result.groups)
     if result.hour_shift_groups:
         w.line("", hour_shift_note(result.hour_shift_groups))
+    for i, line in enumerate(shot_lines(summary.get("shots"))):
+        w.line("Shots" if i == 0 else "", line)
     w.line("Could free (keeping one copy)", result.redundant_bytes, fmt.left_size)
     for warning in summary.get("warnings", ()):
         w.line("Warning", warning, fmt.warning)
@@ -865,6 +869,8 @@ def _coverage_block(w: _SummaryWriter, coverage: Sequence[Coverage], tables) -> 
             w.line("", f"  {line}")
         if cov.shifted:
             w.line("", f"  {shifted_note(cov)}")
+        for line in coverage_shot_lines(cov):
+            w.line("", f"  {line}")
         if cov.unindexed:
             w.line("", f"  {unindexed_note(cov)}", fmt.warning)
         for warning in cov.warnings:
@@ -879,7 +885,7 @@ def _coverage_block(w: _SummaryWriter, coverage: Sequence[Coverage], tables) -> 
                 f"scanned (not compared): {', '.join(cov.never_scanned)}",
                 fmt.warning,
             )  # fmt: skip
-    w.line("", caveat(coverage[0].basis_words), fmt.warning)
+    w.line("", caveat(coverage[0].basis_words, coverage[0].shots), fmt.warning)
     w.skip()
 
 

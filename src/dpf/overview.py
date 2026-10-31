@@ -342,10 +342,16 @@ def format_overview(ov: Overview) -> str:
         what = "personal media" if ov.categories else "media"
         notes.append(f"Only copy = {what} with no copy on any other drive (in this pool or "
                      "its backup pool): what would be lost with that drive.")  # fmt: skip
-        notes.append("Name match = the part of Only copy with a same-name file in the other "
-                     "pool within 64 kB in size: likely the same photo re-saved with new "
-                     "metadata, but not proven (mode 1b/2 will tell). Count it as at risk "
-                     "until then.")  # fmt: skip
+        if ov.basis.startswith("same shot"):
+            notes.append("Name match = the part of Only copy with a same-name file in the "
+                         "other pool within 64 kB in size that is not proven the same shot "
+                         "(no EXIF cached on one side, no camera identity, or another shot). "
+                         "Count it as at risk.")  # fmt: skip
+        else:
+            notes.append("Name match = the part of Only copy with a same-name file in the "
+                         "other pool within 64 kB in size: likely the same photo re-saved with "
+                         "new metadata, but not proven (mode 1b/2 will tell). Count it as at "
+                         "risk until then.")  # fmt: skip
         dates = sorted(d.scanned_at for d in ov.drives if d.scanned_at is not None)
         if dates:
             notes.append(f"Copies are counted as of each drive's last scan (oldest {_date(dates[0])}"
