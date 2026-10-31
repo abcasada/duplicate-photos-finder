@@ -486,10 +486,14 @@ the same rule in mode 1b.
 **`dpf exif` only reads, and leaves even access times alone.** It opens every file
 read-only with `O_NOATIME`; a file the kernel will not open that way (not owned by
 you) is skipped and counted, unless `--allow-atime`. It copies the first 512 kB to
-`/dev/shm` and exiftool parses only that copy, never the original. When a tag is
-missing from the head, it copies the first 16 MB, then (for missing camera tags, not
-just a missing pixel size) the whole file up to 256 MB; a larger file is cached
-without identity ("too large"). Read errors from a failing or unplugged drive (I/O
+`/dev/shm` and exiftool parses only that copy, never the original. A TIFF-based file
+(DNG, ARW, PEF, NEF, CR2, TIF, …) whose directories lie further on (Lightroom writes a
+re-saved DNG's IFD0 at the end) gets a sparse copy instead: the head plus each
+directory and the tag data dpf needs, read where they lie (the last 1 MB in one go when
+IFD0 is there), at their own offsets in a file of the original's size. When a tag is
+still missing, it copies the first 16 MB, then (for missing camera tags, not just a
+missing pixel size) the whole file up to 256 MB; a larger file is cached without
+identity ("too large"). The summary counts the files that needed each step. Read errors from a failing or unplugged drive (I/O
 error, device gone) and exiftool runs that hang (60 s watchdog) or crash are counted
 and not cached, so a rerun tries those files again. Leftover temp folders of a run that
 died are removed at the next start. exiftool must be installed (`apt install

@@ -226,3 +226,13 @@ only verify the mode 1 candidates (fast), or do a full content scan?
   not cached), I/O errors not cached, stale `/dev/shm/dpf-exif-*` removed. Same-shot
   matches between files of different sizes are flagged on pairs/runs/trees and, in
   coverage, listed per folder (text, "… re-saved" sheet, missing.csv `status`).
+- **2026-10-31: sparse TIFF copies.** A real sample (1,384 photos) ran at 4 files/s:
+  341 Lightroom re-saved DNGs on 1A keep IFD0 at the end of the file ("Bad IFD0
+  directory" on the 512 kB head), so each needed a 16 MB and then a ~50 MB read. Now a
+  TIFF-based file gets a sparse copy of its true size: the head, the last 1 MB when IFD0
+  lies there, and every IFD (IFD0 chain, SubIFDs, ExifIFD, GPS, Interop) and the data of
+  the tags dpf needs (Make, Model, dates, BodySerialNumber, MakerNote, DNGPrivateData, …)
+  found by following the TIFF offsets (64 kB windows, ≤ 8 MB per file). Holes read as
+  zeros and tmpfs stores only what was written. Pointers inside MakerNotes are not
+  followed; such files fall back to the 16 MB / whole-file steps, which `dpf exif`
+  counts.
