@@ -4,6 +4,7 @@ import os
 import shutil
 import sqlite3
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -26,12 +27,14 @@ from dpf.exif import (
     ExifToolTimeout,
     NoAtimeDenied,
     clean_stale_temp,
+    copy_head,
     fmt_of,
     needs_more,
     norm_serial,
     parse_entry,
     read_exif,
     row_values,
+    walk_tiff,
 )
 from dpf.index import _EXIF_TABLE, _VERSION, Index
 from dpf.models import FileRecord
@@ -343,7 +346,7 @@ class ExifToolTest(unittest.TestCase):
         scan_roots(self.idx, [self.root])
         seen = self.watch_exiftool()
         run = read_exif(self.idx, [self.root], head_bytes=16)  # b.dng needs a bigger part
-        self.assertEqual(run.rereads, 1)
+        self.assertEqual((run.big, run.whole), (1, 0))  # 16 MB covers the small file
         self.assertTrue(seen)
         self.assertFalse([p for p in seen if p.startswith(self.root)])  # copies only
         after = os.stat(path)
@@ -359,7 +362,7 @@ class ExifToolTest(unittest.TestCase):
         self.jpeg("y.jpg", "-Make=PENTAX")  # JPEG: the head is trusted
         scan_roots(self.idx, [self.root])
         run = read_exif(self.idx, [self.root], head_bytes=16, big_head=32)
-        self.assertEqual((run.read, run.rereads, run.too_large), (2, 1, 0))
+        self.assertEqual((run.read, run.big, run.whole, run.too_large), (2, 1, 1, 0))
         self.assertEqual(self.idx.exif_row(self.dir, "x.dng")["make"], "PENTAX")  # whole file
         self.assertIsNone(self.idx.exif_row(self.dir, "y.jpg")["make"])
         self.idx.conn.execute("DELETE FROM exif")
@@ -424,6 +427,131 @@ class ExifToolTest(unittest.TestCase):
     def test_missing_exiftool(self):
         with self.assertRaises(ExifToolMissing):
             read_exif(self.idx, [self.root], exe="no-such-exiftool-binary")
+
+
+def tiff_at_end(pad: int, order: str = "<", make: str = "PENTAX",
+                taken: str = "2023:08:26 17:16:18") -> bytes:  # fmt: skip
+    """A TIFF whose IFD0, ExifIFD and tag data all follow `pad` zero bytes, as in a DNG
+    re-saved by Lightroom (IFD0 at the end of the file)."""
+    model = "PENTAX K-1 Mark II"
+    ifd0 = 8 + pad
+    exif_ifd = ifd0 + 2 + 12 * 5 + 4
+    data = exif_ifd + 2 + 12 * 1 + 4
+    blob = b""
+
+    def text(tag: int, value: str) -> bytes:
+        nonlocal blob
+        raw = value.encode() + b"\0"
+        entry = struct.pack(order + "HHII", tag, 2, len(raw), data + len(blob))
+        blob += raw
+        return entry
+
+    def short(tag: int, value: int) -> bytes:
+        return struct.pack(order + "HHIHH", tag, 3, 1, value, 0)
+
+    first = struct.pack(order + "H", 5) + short(0x0100, 8) + short(0x0101, 8)
+    first += text(0x010F, make) + text(0x0110, model)
+    first += struct.pack(order + "HHII", 0x8769, 4, 1, exif_ifd) + struct.pack(order + "I", 0)
+    second = struct.pack(order + "H", 1) + text(0x9003, taken) + struct.pack(order + "I", 0)
+    head = (b"II" if order == "<" else b"MM") + struct.pack(order + "HI", 42, ifd0)
+    return head + bytes(pad) + first + second + blob
+
+
+class TiffWalkTest(unittest.TestCase):
+    def reader(self, data: bytes):
+        reads = []
+
+        def read(offset: int, n: int) -> bytes:
+            reads.append((offset, n))
+            return data[offset:offset + n]
+
+        return read, reads
+
+    def test_follows_ifds_and_needed_data(self):
+        for order in ("<", ">"):
+            data = tiff_at_end(1000, order)
+            read, reads = self.reader(data)
+            self.assertEqual(walk_tiff(read, len(data)), 2)  # IFD0 and ExifIFD
+            covered = {off for off, _ in reads}
+            self.assertIn(1008, covered)  # IFD0
+            self.assertIn(data.index(b"PENTAX\0"), covered)  # Make's data
+            self.assertIn(data.index(b"2023:08:26"), covered)  # DateTimeOriginal's data
+
+    def test_not_tiff(self):
+        read, _ = self.reader(TINY_JPEG)
+        self.assertEqual(walk_tiff(read, len(TINY_JPEG)), 0)
+
+    def test_sparse_copy_keeps_offsets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "x.tif")
+            data = tiff_at_end(3 * 1024 * 1024)
+            with open(src, "wb") as fh:
+                fh.write(data)
+            dest = os.path.join(tmp, "copy.tif")
+            st, got, extra = copy_head(src, dest, 1024)
+            self.assertEqual(st.st_size, len(data))
+            self.assertEqual(os.path.getsize(dest), len(data))  # true size, holes inside
+            self.assertLess(got, 2 * 1024 * 1024)  # not the whole file
+            self.assertGreater(extra, 0)
+            with open(dest, "rb") as fh:
+                copy = fh.read()
+            ifd0 = 8 + 3 * 1024 * 1024
+            self.assertEqual(copy[ifd0:], data[ifd0:])
+            self.assertEqual(copy[:1024], data[:1024])
+            plain = os.path.join(tmp, "plain.jpg")
+            with open(plain, "wb") as fh:
+                fh.write(TINY_JPEG * 100)
+            self.assertEqual(copy_head(plain, dest, 1024)[2], 0)  # not TIFF: head only
+            self.assertEqual(os.path.getsize(dest), 1024)
+
+
+@unittest.skipUnless(HAVE_EXIFTOOL, "exiftool not installed")
+class SparseExifToolTest(unittest.TestCase):
+    """Lightroom-style DNG/TIFF with IFD0 past the 512 kB head: no 16 MB or full read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.root = os.path.join(self.tmp, "drive")
+        os.makedirs(self.root)
+        self.idx = Index(os.path.join(self.tmp, "index.db"))
+        self.addCleanup(self.idx.close)
+
+    def write(self, name: str, data: bytes) -> None:
+        with open(os.path.join(self.root, name), "wb") as fh:
+            fh.write(data)
+
+    # Make "Canon": a make without shutter counts, so a found Make ends the search; a
+    # synthetic PENTAX file lacks the MakerNote that would carry its count.
+
+    def test_ifd0_at_the_end_resolves_without_a_full_read(self):
+        self.write("IMGQ0001.tif", tiff_at_end(700_000, make="Canon"))
+        self.write("IMGQ0002.tif", tiff_at_end(700_000, ">", make="Canon",
+                                               taken="2024:01:02 03:04:05"))  # fmt: skip
+        scan_roots(self.idx, [self.root])
+        run = read_exif(self.idx, [self.root])
+        self.assertEqual((run.read, run.sparse, run.big, run.whole), (2, 2, 0, 0))
+        row = self.idx.exif_row(self.root, "IMGQ0001.tif")
+        self.assertEqual((row["make"], row["model"], row["taken"], row["width"]),
+                         ("Canon", "PENTAX K-1 Mark II", "2023:08:26 17:16:18", 8))  # fmt: skip
+        self.assertEqual(self.idx.exif_row(self.root, "IMGQ0002.tif")["taken"],
+                         "2024:01:02 03:04:05")  # fmt: skip
+
+    def test_head_alone_would_need_the_big_read(self):
+        self.write("x.tif", tiff_at_end(700_000, make="Canon"))
+        scan_roots(self.idx, [self.root])
+        with mock.patch.object(exif, "tiff_ifd0", return_value=None):  # treat as not TIFF
+            run = read_exif(self.idx, [self.root])
+        self.assertEqual((run.sparse, run.big), (0, 1))
+
+    def test_structures_far_apart_are_each_read(self):
+        # With tiny windows, IFD0, the ExifIFD and each tag's data need reads of their own.
+        self.write("x.tif", tiff_at_end(2_000_000, make="Canon"))
+        scan_roots(self.idx, [self.root])
+        with mock.patch.object(exif, "WINDOW", 16), mock.patch.object(exif, "TAIL", 16):
+            run = read_exif(self.idx, [self.root])
+        self.assertEqual((run.sparse, run.big, run.whole), (1, 0, 0))
+        self.assertEqual(self.idx.exif_row(self.root, "x.tif")["taken"], "2023:08:26 17:16:18")
 
 
 class HangingExifToolTest(unittest.TestCase):

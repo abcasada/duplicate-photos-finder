@@ -740,9 +740,12 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         f"{run.ok:,} with a camera shot identity, {run.none:,} without, "
         f"{plural(run.errors, 'error')}"
     )
-    if run.rereads:
-        print(f"  {plural(run.rereads, 'file')} read again with a bigger part (tags beyond "
-              "the first 512 kB)")  # fmt: skip
+    if run.sparse or run.big or run.whole:
+        print(
+            f"  past the first 512 kB: {plural(run.sparse, 'file')} with TIFF directories "
+            f"further on (read where they lie), {run.big:,} read again up to 16 MB, "
+            f"{run.whole:,} in full"
+        )
     if run.too_large:
         print(f"  {plural(run.too_large, 'file')} over 256 MB needed in full: cached without "
               "a shot identity")  # fmt: skip

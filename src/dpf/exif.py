@@ -20,8 +20,12 @@ pixel size has no shot key.
 Speed (docs/PLAN.md, "EXIF research"): per physical device, READERS threads read the
 first HEAD_BYTES of each file in folder order and copy them to a temp dir on the system
 disk (/dev/shm when available); a pool of `exiftool -stay_open` processes parses those
-copies. When a head lacks tags its format should carry, a BIG_HEAD copy is parsed, then
-(for missing tags, not just a missing pixel size) the whole file up to MAX_WHOLE bytes.
+copies. A TIFF-based file (DNG, ARW, PEF, NEF, CR2, TIF, …) may keep its directories
+past the head (Lightroom re-saved DNGs put IFD0 at the end): its IFDs and the tag data
+dpf needs are found by following the TIFF offsets (walk_tiff) and read into a sparse copy
+of the file's true size, so the offsets stay right and the holes read as zeros. When a
+copy still lacks tags its format should carry, a BIG_HEAD copy is parsed, then (for
+missing tags, not just a missing pixel size) the whole file up to MAX_WHOLE bytes.
 
 The drives are only read, and their access times never change: dpf itself opens every
 file read-only with O_NOATIME (a file where the kernel refuses it is skipped and counted,
@@ -38,6 +42,7 @@ import queue
 import re
 import select
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
@@ -50,6 +55,10 @@ from dpf.index import Index
 HEAD_BYTES = 512 * 1024
 BIG_HEAD = 16 * 1024 * 1024
 MAX_WHOLE = 256 * 1024 * 1024
+WINDOW = 64 * 1024  # read around a TIFF structure that lies past the head
+TAIL = 1024 * 1024  # read at once when IFD0 lies in the file's last TAIL bytes
+SPARSE_BUDGET = 8 * 1024 * 1024  # most bytes read past the head for one copy
+MAX_IFDS = 64
 READERS = 4  # reader threads per physical device
 BATCH = 16  # files per exiftool command
 TIMEOUT = 60.0  # seconds per exiftool command before the process is killed
@@ -89,6 +98,21 @@ _BYTES = re.compile(r"\d{1,3}(?: \d{1,3})+")
 TRANSIENT_ERRNOS = frozenset(
     {errno.EIO, errno.ENODEV, errno.ENXIO, errno.ETIMEDOUT, errno.ESTALE, errno.ENOTCONN}
 )
+
+# TIFF: bytes per value of each field type; IFD pointer tags (SubIFDs, ExifIFD, GPS,
+# Interop); tags whose out-of-line data dpf needs (Make, Model, Software, dates and
+# their offsets/sub-seconds, BodySerialNumber, MakerNote, DNGPrivateData, UniqueCameraModel).
+_TIFF_TYPES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+_TIFF_MAGIC = frozenset({42, 0x55, 0x4F52, 0x5352})  # TIFF, Panasonic RW2, Olympus ORF
+_IFD_POINTERS = frozenset({0x014A, 0x8769, 0x8825, 0xA005})
+_DATA_TAGS = frozenset(
+    {0x010F, 0x0110, 0x0131, 0x0132, 0x9003, 0x9004, 0x9010, 0x9011, 0x9012, 0x9290, 0x9291,
+     0x9292, 0xA431, 0x927C, 0xC634, 0xC614}
+)  # fmt: skip
+
+# Copy steps a file may need (counted per run): a sparse copy with TIFF structures past the
+# head, a BIG_HEAD copy, the whole file.
+SPARSE, BIG, WHOLE = "sparse", "big", "whole"
 
 # What a read of a head copy still lacks (needs_more).
 MORE_TAGS = "tags"  # identity tags: worth a bigger head, then the whole file
@@ -371,6 +395,7 @@ class _Job:
     whole: bool = False  # the copy holds the whole file
     error: str | None = None  # why it could not be read
     outcome: str = "row"  # "row" (cache it), "gone", "transient" or "noatime"
+    steps: list[str] = field(default_factory=list)  # SPARSE, BIG, WHOLE: the copies it took
 
     @property
     def path(self) -> str:
@@ -386,7 +411,9 @@ class ExifRun:
     ok: int = 0  # with a shot key
     none: int = 0
     errors: int = 0  # cached as unparseable
-    rereads: int = 0  # files read again with a bigger head or in full
+    sparse: int = 0  # copies with TIFF structures read from past the head (walk_tiff)
+    big: int = 0  # files read again with a BIG_HEAD copy
+    whole: int = 0  # files read again in full
     too_large: int = 0  # needed in full but over MAX_WHOLE: cached without identity
     gone: int = 0  # files no longer there (deleted since the scan): not cached
     transient: int = 0  # read errors (I/O, device gone) or exiftool timeouts: not cached
@@ -423,24 +450,135 @@ def _open_read(path: str, allow_atime: bool = False) -> int:
         raise NoAtimeDenied(errno.EPERM, "O_NOATIME refused", path) from e
 
 
+def _pread(fd: int, n: int, offset: int) -> bytes:
+    chunks, got = [], 0
+    while got < n:
+        chunk = os.pread(fd, min(1 << 20, n - got), offset + got)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        got += len(chunk)
+    return b"".join(chunks)
+
+
+def tiff_ifd0(head: bytes) -> tuple[str, int] | None:
+    """(struct byte order, IFD0 offset) from a TIFF-based file's 8-byte header, else None."""
+    if len(head) < 8 or head[:2] not in (b"II", b"MM"):
+        return None
+    order = "<" if head[:2] == b"II" else ">"
+    magic, ifd0 = struct.unpack(order + "HI", head[2:8])
+    return (order, ifd0) if magic in _TIFF_MAGIC else None
+
+
+def walk_tiff(read: Callable[[int, int], bytes], size: int) -> int:
+    """Follow the IFDs of a TIFF-based file of `size` bytes, reading through `read(offset,
+    n)` every IFD (IFD0 and the next ones, SubIFDs, ExifIFD, GPS, Interop) and the
+    out-of-line data of the tags dpf needs (_DATA_TAGS: MakerNote, DNGPrivateData, …).
+
+    Image data is never read. Returns the number of IFDs found (0: not TIFF).
+    """
+    header = tiff_ifd0(read(0, 8))
+    if header is None:
+        return 0
+    order, ifd0 = header
+    todo, seen = [ifd0], set()
+    while todo and len(seen) < MAX_IFDS:
+        off = todo.pop(0)
+        if off in seen or off < 8 or off + 2 > size:
+            continue
+        seen.add(off)
+        raw = read(off, 2)
+        if len(raw) < 2:
+            continue
+        (n,) = struct.unpack(order + "H", raw)
+        if not 0 < n <= 1024:
+            continue
+        table = read(off + 2, 12 * n + 4)
+        if len(table) < 12 * n + 4:
+            continue
+        for i in range(n):
+            tag, kind, count = struct.unpack(order + "HHI", table[12 * i:12 * i + 8])
+            value = table[12 * i + 8:12 * i + 12]
+            nbytes = _TIFF_TYPES.get(kind, 0) * count
+            if not nbytes:
+                continue
+            (pointer,) = struct.unpack(order + "I", value)
+            if tag in _IFD_POINTERS:
+                if nbytes <= 4:
+                    todo.append(pointer)
+                elif count <= MAX_IFDS and kind in (4, 13):
+                    block = read(pointer, nbytes)
+                    whole = len(block) // 4
+                    todo += struct.unpack(f"{order}{whole}I", block[: whole * 4])
+            elif tag in _DATA_TAGS and 4 < nbytes <= SPARSE_BUDGET:
+                read(pointer, nbytes)
+        (nxt,) = struct.unpack(order + "I", table[12 * n:12 * n + 4])
+        if nxt:
+            todo.append(nxt)
+    return len(seen)
+
+
+class _Reader:
+    """Serves reads from the head, or with pread in WINDOW-sized chunks it keeps (up to
+    SPARSE_BUDGET bytes past the head in all)."""
+
+    def __init__(self, fd: int, head: bytes, size: int) -> None:
+        self.fd, self.head, self.size = fd, head, size
+        self.chunks: dict[int, bytes] = {}
+        self.extra = 0
+
+    def read(self, offset: int, n: int) -> bytes:
+        if offset < 0 or offset >= self.size:
+            return b""
+        n = min(n, self.size - offset)
+        if offset + n <= len(self.head):
+            return self.head[offset:offset + n]
+        for start, data in self.chunks.items():
+            if start <= offset and offset + n <= start + len(data):
+                return data[offset - start:offset - start + n]
+        want = min(max(n, WINDOW), self.size - offset)
+        if self.extra + want > SPARSE_BUDGET:
+            want = n
+            if self.extra + want > SPARSE_BUDGET:
+                return b""
+        data = _pread(self.fd, want, offset)
+        self.chunks[offset] = data
+        self.extra += len(data)
+        return data[:n]
+
+
 def copy_head(
     path: str, dest: str, limit: int, allow_atime: bool = False
-) -> tuple[os.stat_result, int]:
-    """Copy the first `limit` bytes of `path` to `dest`: (stat of the open file, bytes)."""
+) -> tuple[os.stat_result, int, int]:
+    """Copy `path` to `dest` for exiftool: (stat of the open file, bytes read, of which
+    past the first `limit`).
+
+    `dest` gets the first `limit` bytes. For a larger TIFF-based file it also gets the
+    TIFF structures that lie further on (walk_tiff; when IFD0 sits in the last TAIL bytes,
+    those are read in one go): then `dest` is a sparse file of the original's size, so
+    exiftool finds everything at its offset and reads zeros in the holes.
+    """
     fd = _open_read(path, allow_atime)
     try:
         st = os.fstat(fd)
-        got = 0
-        with open(dest, "wb") as out:
-            while got < limit:
-                chunk = os.read(fd, min(1 << 20, limit - got))
-                if not chunk:
-                    break
-                out.write(chunk)
-                got += len(chunk)
+        head = _pread(fd, limit, 0)
+        reader = _Reader(fd, head, st.st_size)
+        header = tiff_ifd0(head)
+        if header is not None and len(head) < st.st_size:
+            ifd0 = header[1]
+            if ifd0 >= len(head) and ifd0 >= st.st_size - TAIL:
+                reader.read(max(len(head), st.st_size - TAIL), TAIL)
+            walk_tiff(reader.read, st.st_size)
     finally:
         os.close(fd)
-    return st, got
+    with open(dest, "wb") as out:
+        out.write(head)
+        for start, data in sorted(reader.chunks.items()):
+            out.seek(start)
+            out.write(data)
+        if reader.chunks:
+            out.truncate(st.st_size)
+    return st, len(head) + reader.extra, reader.extra
 
 
 def _temp_base(db_path: str) -> str:
@@ -668,9 +806,11 @@ def read_exif(
     return run
 
 
-def _tally(run: ExifRun, pending: list[tuple], job: _Job, data: ExifData, reread: bool) -> None:
+def _tally(run: ExifRun, pending: list[tuple], job: _Job, data: ExifData) -> None:
     """Count one result, and queue its row when it is to be cached."""
-    run.rereads += reread
+    run.sparse += SPARSE in job.steps
+    run.big += BIG in job.steps
+    run.whole += WHOLE in job.steps
     if job.outcome == "gone":
         run.gone += 1
         return
@@ -709,7 +849,7 @@ class _Reading:
         ext = "".join(c for c in fmt_of(job.name) if c.isalnum())
         dest = os.path.join(self.tmp, f"{next(self.seq)}.{ext or 'bin'}")
         try:
-            st, got = copy_head(job.path, dest, limit, self.allow_atime)
+            st, got, extra = copy_head(job.path, dest, limit, self.allow_atime)
         except NoAtimeDenied:
             job.outcome, job.error = "noatime", "O_NOATIME refused"
             return
@@ -723,8 +863,10 @@ class _Reading:
             _remove(dest)
             return
         job.size, job.mtime = st.st_size, st.st_mtime
-        job.whole = got >= st.st_size
+        job.whole = not extra and got >= st.st_size  # a sparse copy is never the whole file
         job.head = dest
+        if extra and not job.steps:
+            job.steps.append(SPARSE)
 
     def parse_batch(self, tool: ExifTool, batch: list[_Job], results: queue.Queue) -> ExifTool:
         """Parse one batch of head copies, reading bigger copies where needed; returns the
@@ -732,47 +874,47 @@ class _Reading:
         readable = [j for j in batch if j.error is None and j.head is not None]
         for j in batch:
             if j.error is not None:
-                results.put(("row", (j, error_data(j.name, j.error), False)))
+                results.put(("row", (j, error_data(j.name, j.error))))
         found, tool, lost = self._run(tool, [j.head for j in readable])
         for j in readable:
             head = j.head
             if head in lost:
                 j.outcome = "transient"
-                results.put(("row", (j, error_data(j.name, "exiftool failed"), False)))
+                results.put(("row", (j, error_data(j.name, "exiftool failed"))))
                 _remove(head)
                 continue
             entry = found.get(head)
             data = parse_entry(entry, j.name) if entry else error_data(j.name, "not read")
             _remove(head)
-            data, tool, reread = self._more(tool, j, data)
-            results.put(("row", (j, data, reread)))
+            data, tool = self._more(tool, j, data)
+            results.put(("row", (j, data)))
         return tool
 
-    def _more(self, tool: ExifTool, job: _Job, data: ExifData) -> tuple[ExifData, ExifTool, bool]:
+    def _more(self, tool: ExifTool, job: _Job, data: ExifData) -> tuple[ExifData, ExifTool]:
         """Read a bigger head, then the whole file, while needs_more asks for it."""
-        reread = False
-        for limit, wanted in ((self.big_head, (MORE_TAGS, MORE_SIZE)), (None, (MORE_TAGS,))):
+        steps = ((BIG, self.big_head, (MORE_TAGS, MORE_SIZE)), (WHOLE, None, (MORE_TAGS,)))
+        for step, limit, wanted in steps:
             want = needs_more(data)
             if job.whole or want not in wanted:
                 break
             if limit is None:
                 if job.size > self.max_whole:
-                    return replace(data, note=TOO_LARGE), tool, reread
+                    return replace(data, note=TOO_LARGE), tool
                 limit = job.size
-            reread = True
+            job.steps.append(step)
             job.head = None
             self.copy(job, limit)
             if job.head is None:  # unreadable now: keep the outcome the copy decided
-                return (error_data(job.name, job.error or "unreadable"), tool, reread)
+                return error_data(job.name, job.error or "unreadable"), tool
             found, tool, lost = self._run(tool, [job.head])
             entry = found.get(job.head)
             _remove(job.head)
             if job.head in lost:
                 job.outcome = "transient"
-                return error_data(job.name, "exiftool failed"), tool, reread
+                return error_data(job.name, "exiftool failed"), tool
             if entry:
                 data = parse_entry(entry, job.name)
-        return data, tool, reread
+        return data, tool
 
     def _run(
         self, tool: ExifTool, paths: list[str]
