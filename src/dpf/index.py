@@ -512,6 +512,13 @@ class Index:
         )
         return [_record(r) for r in rows]
 
+    def file_rows(self, roots: Sequence[str]) -> Iterator[tuple[str, str, int, float, str]]:
+        """(dir, name, size, mtime, kind) of every file indexed under `roots`, unordered."""
+        where, params = _prefix_clause(roots)
+        yield from self.conn.execute(
+            f"SELECT dir, name, size, mtime, kind FROM files WHERE {where}", params
+        )
+
     def dir_extras(self, dir: str) -> tuple[int, int]:
         """(other, errors): entries directly in `dir` that were not indexed."""
         row = self.conn.execute(

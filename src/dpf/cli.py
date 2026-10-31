@@ -1,4 +1,4 @@
-"""Command-line interface: `dpf scan`, `dpf find`, `dpf drives`, `dpf space` and `dpf pools`."""
+"""Command-line interface: `dpf scan`, `find`, `drives`, `space`, `folders` and `pools`."""
 
 from __future__ import annotations
 
@@ -221,6 +221,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     s.add_argument("--used", type=_size, metavar="SIZE", help="with --set: e.g. 5.09TB")
     s.add_argument("--capacity", type=_size, metavar="SIZE", help="with --set: e.g. 8.00TB")
+
+    fo = sub.add_parser(
+        "folders", help="CSV of the folders two levels deep, to note what is personal",
+        description="Write a CSV with one row per folder, two levels below each indexed "
+        "drive: media counts, size, file dates and main types, plus blank Personal? and "
+        "Notes columns to fill in. Reads the index only; the drives are not touched.",
+    )  # fmt: skip
+    fo.add_argument(
+        "--pool", metavar="NAME", action="append",
+        help="only the indexed drives of this pool (repeatable; default: every drive)",
+    )  # fmt: skip
+    fo.add_argument(
+        "-o", "--out", default=None, metavar="FILE",
+        help="CSV file (default: ~/.cache/dpf/reports/<timestamp>-folders/folders.csv)",
+    )  # fmt: skip
 
     sub.add_parser(
         "pools", help="list the drive pools and their drives",
@@ -1032,6 +1047,40 @@ def _pools(args: argparse.Namespace) -> int:
     return 0
 
 
+def _folders(idx: Index, args: argparse.Namespace) -> int:
+    """`dpf folders`: the folder overview CSV, from the index only."""
+    from dpf.folders import sort_roots, write_folders_csv
+    from dpf.scanner import drop_nested
+
+    try:
+        pools = load_pools(args.pools_file) if args.pool else _pools_for_drives(args.pools_file)
+        wanted = {get_pool(pools, n).name for n in args.pool or ()}
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+
+    def pool_of(root: str) -> str:
+        return ", ".join(pools_of(pools, root))
+
+    # Matched against indexed roots only: globbing mount folders would touch the drives.
+    roots = drop_nested(r.root for r in idx.roots())
+    if wanted:
+        roots = [r for r in roots if wanted & set(pools_of(pools, r))]
+    if not roots:
+        print("dpf: no indexed drives" + (" in that pool" if wanted else ""), file=sys.stderr)
+        return 1
+    out = args.out or os.path.join(_default_out_dir("folders"), "folders.csv")
+    _check_output_location(
+        out, roots, "the folder list", allow_same_drive=args.allow_same_drive,
+        offline=set(roots),
+    )  # fmt: skip
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    roots = sort_roots(roots, pool_of)
+    rows = write_folders_csv(idx, roots, out, pool_of)
+    print(f"{rows:,} folders from {plural(len(roots), 'drive')} written to {out}")
+    return 0
+
+
 def _pool_members(pool: Pool, idx: Index | None) -> list[tuple[str, bool]]:
     """(root, connected) for each drive a pool resolves to, nested roots dropped."""
     from dpf.scanner import drop_nested
@@ -1177,6 +1226,13 @@ def main(argv: list[str] | None = None) -> int:
         return _pools(args)
     if args.command == "space":
         return _space(args, parser)
+    if args.command == "folders":
+        db = args.db or default_db_path()
+        if not os.path.exists(db):
+            print(f"dpf: nothing indexed yet ({db}); run `dpf scan PATH`", file=sys.stderr)
+            return 1
+        with Index(db) as idx:
+            return _folders(idx, args)
     if args.command == "drives":
         db = args.db or default_db_path()
         if not os.path.exists(db):

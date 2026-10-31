@@ -1213,3 +1213,23 @@ class SpaceCliTest(PoolsCliTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FoldersCliTest(CliFixture):
+    def test_folders_csv_from_index(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
+        out = os.path.join(self.tmp, "folders.csv")
+        code, stdout, err = self.run_cli("folders", "-o", out)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"4 folders from 1 drive written to {out}", stdout)
+        with open(out, encoding="utf-8-sig", newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        self.assertEqual(
+            [(r["Folder"], r["Subfolder"], r["Media files"]) for r in rows],
+            [("one", "", "10"), ("one", "DCIM", "10"), ("two", "", "10"), ("two", "Backup", "10")],
+        )  # fmt: skip
+
+    def test_folders_refuses_output_inside_a_drive(self):
+        self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
+        with self.assertRaises(SystemExit):
+            self.run_cli("folders", "-o", os.path.join(self.drives, "one", "f.csv"))

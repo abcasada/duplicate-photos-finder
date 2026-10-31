@@ -168,6 +168,17 @@ their folders in the pools file and dpf keeps them apart:
 other = ["*/Plex*", "*/_Torrents", "/run/media/adam/Storage 2A 8TB/Films"]
 ```
 
+To decide which folders those are, `dpf folders` writes a CSV (from the index only; the
+drives need not be connected and are never touched) with one row per folder, two levels
+below each drive: pool, drive, folder, subfolder, blank **Personal?** and **Notes**
+columns to fill in, then media files, photos, videos, size in GB, other (non-media)
+files, folders inside, oldest/newest file date, the main file types and the full path.
+Counts include everything below a folder; files lying directly in a top-level folder
+that also has subfolders get a `(files directly here)` row. Folders without media get no
+row. `--pool A` limits it to one pool, `-o FILE` picks the file (default
+`~/.cache/dpf/reports/<timestamp>-folders/folders.csv`). The CSV is UTF-8 with a BOM so
+Excel shows accented names correctly.
+
 Every indexed photo/video is **personal** unless its folder, or a folder above it, matches
 an `other` pattern. Patterns use the pool syntax (`*` never spans a `/`) but ignore case;
 an absolute pattern is anchored at `/`, a relative one matches at any depth (`*/Plex*` is
