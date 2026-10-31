@@ -690,7 +690,7 @@ class CoverageCliTest(PoolsFixture):
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertEqual(wb.names[-1], "A not in B")
-            self.assertEqual(wb.names[1:3], ["Drives", "Trees"])
+            self.assertEqual(wb.names[1:4], ["Drives", "A Months", "Trees"])
 
     def test_pool_b_from_index_reports_only_in_backup(self):
         self.assertEqual(self.run_cli("scan", "-q", "--pool", "A")[0], 0)
@@ -837,7 +837,7 @@ class CoverageCliTest(PoolsFixture):
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertEqual(wb.names, [
-                "Summary", "Drives",
+                "Summary", "Drives", "A Months", "B Months",
                 "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
                 "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
                 "A not in B", "B not in A",

@@ -625,6 +625,19 @@ class Index:
             f"SELECT dir, name, size, mtime, kind FROM files WHERE {where}", params
         )
 
+    def media_dates(
+        self, roots: Sequence[str]
+    ) -> Iterator[tuple[str, str, int, float, str, str | None]]:
+        """(dir, name, size, mtime, kind, taken) of the non-empty photos/videos under
+        `roots`; `taken` is the cached EXIF DateTimeOriginal when valid, else None."""
+        where, params = _prefix_clause(roots)
+        yield from self.conn.execute(
+            f"SELECT dir, name, size, mtime, kind, CASE WHEN {_VALID_EXIF} THEN e.taken END "
+            f"FROM files LEFT JOIN exif e USING (dir, name) "
+            f"WHERE {where} AND size > 0 AND kind != 'other'",
+            params,
+        )
+
     def dir_extras(self, dir: str) -> tuple[int, int]:
         """(other, errors): entries directly in `dir` that were not indexed."""
         row = self.conn.execute(

@@ -422,6 +422,21 @@ of the same name within 64 kB in size in a sorted folder). Camera numbers repeat
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 
+### Photos and videos by month
+
+Every `find` run with the default `--category all` adds "Photos and videos by month": per
+pool, one row per month with the number and size of photos and videos taken then. In
+report.xlsx each pool gets a "Months" sheet ("A Months", "B Months") with every month
+from the first to the last (empty ones too) and a stacked column chart of the sizes.
+
+- The date is the camera's capture time (EXIF DateTimeOriginal) when `dpf exif` has read
+  it, else the file's modified time. A copy usually keeps the modified time; an edit or
+  re-save changes it, so files without cached EXIF can land in a later month.
+- Each set of duplicates within a pool counts once (its earliest file), so a month shows
+  what was taken, not how many copies exist.
+- With `[categories]`, only personal media counts.
+- Dates before 1990 or after next year are counted as "unknown".
+
 ### Mode 1b: the same camera shot (EXIF)
 
 Mode 1 needs equal sizes, so a photo re-saved with new metadata (Lightroom writing

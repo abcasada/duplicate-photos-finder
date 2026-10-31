@@ -32,6 +32,7 @@ from dpf.coverage import (
     stale_warnings,
 )
 from dpf.dumps import DumpCheck, check_dumps, dumps_json, format_dumps, load_dumps
+from dpf.months import PoolMonths, format_months, month_totals
 from dpf.overview import Overview, PoolInput, build_overview, format_overview
 from dpf.models import SPACE_MANUAL, DriveSpace, DuplicateGroup, RootStats
 from dpf.pools import (
@@ -577,6 +578,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         coverages.append(cov)
 
     overview = None
+    months: list[PoolMonths] = []
     if args.category == ALL:  # personal totals need every group
         pool_inputs = [PoolInput(r.target.name or "", r.target.roots, r.groups) for r in runs]
         # Loosened matching would count different files as copies: no only-copy figures.
@@ -584,6 +586,8 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         overview = build_overview(
             idx, pool_inputs, [] if loose else coverages, cats, basis=_basis(args)
         )
+        months = [month_totals(idx, r.target.name or "", r.target.roots, r.groups, cats)
+                  for r in runs]  # fmt: skip
 
     dumps = _check_dumps(idx, targets, args)
 
@@ -616,9 +620,11 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             summary["overview"] = overview.to_json()
         if dumps is not None:
             summary["dumps"] = dumps_json(dumps)
+        if months:
+            summary["months"] = [m.to_json() for m in months]
         if not args.no_xlsx and _write_xlsx(
             xlsx_path, run.result, run.groups, summary, coverages=coverages, overview=overview,
-            dumps=dumps,
+            dumps=dumps, months=months,
         ):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
@@ -639,11 +645,12 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             **({"category": args.category} if args.category != ALL else {}),
             **({"overview": overview.to_json()} if overview is not None else {}),
             **({"dumps": dumps_json(dumps)} if dumps is not None else {}),
+            **({"months": [m.to_json() for m in months]} if months else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
                                             coverages=coverages, overview=overview,
-                                            dumps=dumps):  # fmt: skip
+                                            dumps=dumps, months=months):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)
@@ -667,6 +674,9 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
     if dumps is not None:
         parts.append(_banner(dumps.label))
         parts.append(format_dumps(dumps, top=args.coverage_top, max_runs=args.max_runs))
+    if months:
+        parts.append(_banner("Photos and videos by month"))
+        parts.append(format_months(months))
     parts.append("\n".join(footer_lines(summary)))
     text = "\n\n".join(p.rstrip("\n") for p in parts) + "\n"
     with open(text_path, "w", encoding="utf-8") as fh:
@@ -1366,16 +1376,20 @@ def _write_xlsx(
     coverages: list[Coverage] | None = None,
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
+    months: list[PoolMonths] | None = None,
 ) -> bool:
     """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
     from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
 
     try:
         if runs is None:
-            write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview, dumps)
+            write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview, dumps,
+                       months or [])
         else:
             sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
-            write_combined_xlsx(sheets, coverages or [], summary or {}, path, overview, dumps)
+            write_combined_xlsx(
+                sheets, coverages or [], summary or {}, path, overview, dumps, months or []
+            )
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":
             raise

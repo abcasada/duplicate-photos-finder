@@ -35,6 +35,7 @@ from dpf.grouping import (
 )
 from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
+from dpf.months import PoolMonths
 from dpf.overview import Overview, personal_lines
 from dpf.report import (
     OFFLINE_NOTE,
@@ -104,6 +105,7 @@ def write_xlsx(
     coverage: Sequence[Coverage] = (),
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
+    months: Sequence[PoolMonths] = (),
 ) -> None:
     """Write report.xlsx. Raises ModuleNotFoundError if XlsxWriter is not installed.
 
@@ -117,6 +119,7 @@ def write_xlsx(
         summary_ws = wb.add_worksheet(SHEETS[0])
         used = {SHEETS[0].casefold()}
         drives = _drives_tables(wb, fmt, overview, used)
+        drives += _months_tables(wb, fmt, months, used)
         tables = drives + _pool_tables(wb, fmt, result, groups, "", used)
         tables += _coverage_tables(wb, fmt, coverage, used)
         tables += _dump_tables(wb, fmt, dumps, used)
@@ -139,6 +142,7 @@ def write_combined_xlsx(
     path: str,
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
+    months: Sequence[PoolMonths] = (),
 ) -> None:
     """One workbook for several pools: each pool's sheets prefixed with its name.
 
@@ -153,6 +157,7 @@ def write_combined_xlsx(
         summary_ws = wb.add_worksheet(SHEETS[0])
         used = {SHEETS[0].casefold()}
         drives = _drives_tables(wb, fmt, overview, used)
+        drives += _months_tables(wb, fmt, months, used)
         per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
         cov_tables = _coverage_tables(wb, fmt, coverage, used)
         cov_tables += _dump_tables(wb, fmt, dumps, used)
@@ -168,7 +173,7 @@ def write_combined_xlsx(
         w.skip()
         _personal_block(w, overview)
         if drives:
-            _sheet_list(w, drives, title="Drive sheet")
+            _sheet_list(w, drives, title="Drive sheets")
         for p, ts in zip(pools, per_pool):
             w.heading(f"Pool {p.name}")
             _pool_block(w, p.result, p.summary, elapsed=False, basis=False)
@@ -244,6 +249,54 @@ def _drives_tables(wb, fmt: _Formats, ov: Overview | None, used: set[str]) -> li
         if d.scanned_at is not None:
             t.ws.write_datetime(t.row, c + 1, datetime.fromtimestamp(d.scanned_at), fmt.date)
     return [t]
+
+
+def _months_tables(
+    wb, fmt: _Formats, months: Sequence[PoolMonths], used: set[str]
+) -> list[_Table]:
+    """One sheet per pool: media by month (every month from the first to the last, so the
+    chart has no gaps), "unknown" last, and a stacked column chart of the sizes."""
+    tables = []
+    columns = [("Month", 9), ("Photos", 10), ("Photo size", 11), ("Videos", 9),
+               ("Video size", 11), ("Total size", 11), ("Files", 10)]  # fmt: skip
+    for p in months:
+        what = "personal photos/videos" if p.personal_only else "photos/videos"
+        note = (f"{what} by month taken (capture time, else file date); "
+                "each set of duplicates once")  # fmt: skip
+        name = sheet_name(f"{p.pool} Months" if p.pool else "Months", used)
+        t = _Table(wb, fmt, name, columns, 1, note=note)
+        rows = [*p.months, *([p.unknown] if p.unknown.files else [])]
+        for m in rows:
+            if not t.next_row():
+                break
+            t.text(0, m.month)
+            t.num(1, m.photos)
+            t.num(2, m.photo_bytes, fmt.size)
+            t.num(3, m.videos)
+            t.num(4, m.video_bytes, fmt.size)
+            t.num(5, m.bytes, fmt.size)
+            t.num(6, m.files)
+        last = min(len(p.months), t.row)  # chart the dated months only
+        if last:
+            chart = wb.add_chart({"type": "column", "subtype": "stacked"})
+            for col, label, color in ((2, "Photos", "#4472C4"), (4, "Videos", "#ED7D31")):
+                chart.add_series({
+                    "name": label,
+                    "categories": [name, 1, 0, last, 0],
+                    "values": [name, 1, col, last, col],
+                    "fill": {"color": color},
+                    "gap": 20,
+                })  # fmt: skip
+            chart.set_title({"name": f"{what.capitalize()} by month" +
+                             (f", pool {p.pool}" if p.pool else "")})  # fmt: skip
+            chart.set_y_axis({"name": "Size", "num_format": '#,##0,,," GB"',
+                              "major_gridlines": {"visible": True}})  # fmt: skip
+            chart.set_x_axis({"num_font": {"rotation": -45}})
+            chart.set_legend({"position": "top"})
+            chart.set_size({"width": 1100, "height": 480})
+            t.ws.insert_chart(1, len(columns) + 1, chart)
+        tables.append(t)
+    return tables
 
 
 def _personal_block(w: _SummaryWriter, ov: Overview | None) -> None:
