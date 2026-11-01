@@ -18,9 +18,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from dpf import media
-from dpf.coverage import NOT_IN_OTHER, Coverage, _related, caveat, check_coverage, missing_files
+from dpf.coverage import NOT_IN_OTHER, Coverage, _related, caveat, check_coverage
 from dpf.grouping import natural_key
 from dpf.index import Index
+from dpf.match_name import bucket_groups
 from dpf.models import FileRecord
 from dpf.report import (
     _iso,
@@ -38,6 +39,7 @@ FOUND = "found"
 NOT_FOUND = "not found"
 CSV_FIELDS = (
     "path", "dir", "name", "size", "mtime", "kind", "status", "similar_name_on_drive", "drives",
+    "copies",
 )  # fmt: skip
 
 
@@ -49,6 +51,8 @@ class CardDrive:
     scanned_at: float | None
     files: int  # card files with a copy there
     bytes: int
+    folders: tuple[tuple[str, int], ...] = ()  # (folder holding copies, card files copied
+    # there), most files first
 
 
 @dataclass(slots=True)
@@ -57,7 +61,7 @@ class CardCheck:
     cov: Coverage  # card files with no copy on any compared drive (basis, folders, notes)
     compared: list[FileRecord]  # every non-empty media file of the card, by folder and name
     drives: list[CardDrive]  # most files first; a file counts for every drive holding it
-    copies: dict[str, list[str]]  # card file path -> the drive roots holding a copy
+    copies: dict[str, list[FileRecord]]  # card file path -> the drive files that match it
     drives_compared: int
     scanned: int  # entries read from the card (media files, empty ones too)
     unreadable: int  # card entries that could not be read
@@ -119,22 +123,54 @@ def check_card(
              if size > 0 and kind != media.OTHER),
             key=lambda f: (f.dir, natural_key(f.name), f.name),
         )  # fmt: skip
-        lost = {f.path for f in cov.missing}
-        copies: dict[str, list[str]] = {}
-        per_drive: list[CardDrive] = []
+        copies = _copies(temp, card, others, match)
+        by_file = {f.path: f for f in compared}
+        per_drive = []
         for root in others:
-            gone = {f.path for f in missing_files(temp, [card], [root], **match).missing}
-            here = [f for f in compared if f.path not in gone and f.path not in lost]
-            for f in here:
-                copies.setdefault(f.path, []).append(root)
-            if here:
-                per_drive.append(
-                    CardDrive(root, indexed.get(root), len(here), sum(f.size for f in here))
-                )  # fmt: skip
+            counts: Counter[str] = Counter()
+            found: set[str] = set()
+            for path, files in copies.items():
+                for d in {f.dir for f in files if _under(f.dir, root)}:
+                    counts[d] += 1
+                    found.add(path)
+            if found:
+                per_drive.append(CardDrive(
+                    root, indexed.get(root), len(found), sum(by_file[p].size for p in found),
+                    tuple(sorted(counts.items(), key=lambda e: (-e[1], e[0]))),
+                ))  # fmt: skip
     per_drive.sort(key=lambda d: (-d.files, d.root))
     return CardCheck(
         card, cov, compared, per_drive, copies, len(others), stats.files, stats.errors, ignored
     )  # fmt: skip
+
+
+def _under(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _copies(
+    temp: Index, card: str, others: Sequence[str], match: dict
+) -> dict[str, list[FileRecord]]:
+    """Card file path -> the files of `others` it matches, by the rules of
+    coverage.missing_files: every pair of a group matches, so a card file has a copy exactly
+    when its group holds a file of the drives."""
+    copies: dict[str, list[FileRecord]] = {}
+    buckets = temp.coverage_buckets(
+        [card], others, by_size=not match["ignore_size"], exact_names=match["exact_names"]
+    )
+    for _, bucket in buckets:
+        theirs = {id(f) for f, other in bucket if other}
+        for group in bucket_groups(
+            [f for f, _ in bucket], mtime_tolerance=match["mtime_tolerance"],
+            ignore_mtime=match["ignore_mtime"], exact_names=match["exact_names"],
+            hour_shift=match["hour_shift"],
+        ):  # fmt: skip
+            drive_files = sorted((f for f in group if id(f) in theirs), key=lambda f: f.path)
+            if drive_files:
+                for f in group:
+                    if id(f) not in theirs:
+                        copies[f.path] = drive_files
+    return copies
 
 
 def format_card(check: CardCheck, *, top: int, max_runs: int) -> str:
@@ -186,14 +222,19 @@ def format_card(check: CardCheck, *, top: int, max_runs: int) -> str:
         )
     if check.drives:
         out += ["", "Copies are on:"]
-        width = max(len(d.root) for d in check.drives)
         for d in check.drives:
             out.append(
-                f"  {d.root:<{width}}  {plural(d.files, 'file'):>14}  {human_bytes(d.bytes):>9}"
-                f"   (index scanned {scan_date(d.scanned_at)})"
+                f"  {d.root}   ({plural(d.files, 'file')}, {human_bytes(d.bytes)}; "
+                f"index scanned {scan_date(d.scanned_at)})"
             )
-        if len(check.drives) > 1:
-            out.append("  (a file with copies on several drives counts for each of them)")
+            width = len(f"{d.folders[0][1]:,}") if d.folders else 0
+            out.extend(f"      {n:>{width},}  {folder}" for folder, n in d.folders[:top])
+            if len(d.folders) > top:
+                out.append(
+                    f"      … {plural(len(d.folders) - top, 'more folder')} (every copy is in "
+                    "the CSV: -o DIR)"
+                )
+        out.append("  (a file with several copies counts for each folder and drive holding one)")
     out.append("")
     if check.unreadable:
         out.append(
@@ -245,18 +286,19 @@ def _lines(check: CardCheck, top: int, max_runs: int) -> list[str]:
 
 
 def write_card_csv(check: CardCheck, path: str) -> int:
-    """One row per media file of the card, found or not, with the drives holding a copy;
-    returns the rows written."""
-    lost = {f.path for f in check.cov.missing}
+    """One row per media file of the card, found or not: the drives holding a copy and the
+    exact path of every matching file there; returns the rows written."""
+    roots = [d.root for d in check.drives]
     with open(path, "w", encoding="utf-8", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(CSV_FIELDS)
         for f in check.compared:
+            files = check.copies.get(f.path, ())
+            drives = [r for r in roots if any(_under(g.dir, r) for g in files)]
             w.writerow(
                 (f.path, f.dir, f.name, f.size, _iso(f.mtime), f.kind,
-                 NOT_FOUND if f.path in lost else FOUND,
+                 FOUND if files else NOT_FOUND,
                  "yes" if f.path in check.cov.similar else "no",
-                 "; ".join(check.copies.get(f.path, ())))
+                 "; ".join(drives), "; ".join(g.path for g in files))
             )  # fmt: skip
     return len(check.compared)
-

@@ -294,11 +294,13 @@ dpf card /run/media/adam/EOS_DIGITAL -o ~/card   # also write ~/card/card.csv
 ```
 
 The report gives the card's totals, how many files are already on a drive and how many
-are on none, **which drives hold copies** (with when each was last scanned: a drive
-indexed long ago may since have lost files), and the folders with files found nowhere,
-with the runs of consecutive files that are on a drive. `card.csv` (with `-o`) has one
-row per media file, found or not: path, size, date, status, `similar_name_on_drive` and
-the drives holding a copy. Matching options are those of `find`: `--mtime-tolerance`,
+are on none, **where the copies are** and the folders with files found nowhere, with the
+runs of consecutive files that are on a drive. Under "Copies are on:" each drive is listed
+with when it was last scanned (a drive indexed long ago may since have lost files), then
+the exact folders on it that hold copies, with how many card files each holds (`--top`
+limits the folders per drive). `card.csv` (with `-o`) has one row per media file, found or
+not: path, size, date, status, `similar_name_on_drive`, the drives holding a copy and the
+exact path of every matching file (`copies`). Matching options are those of `find`: `--mtime-tolerance`,
 `--strict-time`, `--ignore-size`, `--ignore-mtime`, `--exact-names`; `--top` and
 `--max-runs` shape the listing.
 

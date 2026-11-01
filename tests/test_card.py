@@ -61,13 +61,27 @@ class CardCheckTest(unittest.TestCase):
         self.assertEqual((check.cov.files, check.found), (7, 5))
         self.assertEqual(sorted(f.name for f in check.cov.missing), ["IMG_90.JPG", "IMG_91.JPG"])
         self.assertEqual([(d.root, d.files) for d in check.drives], [(A, 4), (B, 2)])
-        copies = {os.path.basename(p): v for p, v in check.copies.items()}
-        self.assertEqual(copies["IMG_1.JPG"], [A, B])  # on both drives
-        self.assertEqual(copies["IMG_4.JPG"], [A])  # through the whole-hour shift
-        self.assertEqual(copies["IMG_5.JPG"], [B])  # through the copy mark
+        copies = {os.path.basename(p): [g.path for g in v] for p, v in check.copies.items()}
+        self.assertEqual(copies["IMG_1.JPG"],  # the exact files, on both drives
+                         [f"{A}/Photos/IMG_1.JPG", f"{B}/Backup/IMG_1 (1).JPG"])  # fmt: skip
+        self.assertEqual(copies["IMG_4.JPG"], [f"{A}/Photos/IMG_4.JPG"])  # through the shift
+        self.assertEqual(copies["IMG_5.JPG"], [f"{B}/Backup/IMG_5 (1).JPG"])  # the copy mark
+        self.assertEqual(set(check.copies), {f.path for f in check.compared}
+                         - {f.path for f in check.cov.missing})  # fmt: skip
         self.assertNotIn(os.path.join(self.card, "DCIM/100/IMG_90.JPG"), check.copies)
         (folder,) = check.cov.folders
         self.assertEqual((folder.missing, folder.total), (2, 7))
+
+    def test_text_lists_the_folders_holding_copies(self):
+        self.idx.replace_root(B, on_drive(B, "Backup", [1, 5], mark=" (1)")
+                              + on_drive(B, "Old/2020", [1]))  # fmt: skip
+        text = format_card(self.check(), top=5, max_runs=5)
+        self.assertIn(f"  {A}   (4 files, 410 B; index scanned ", text)
+        self.assertIn(f"\n      4  {A}/Photos\n", text)
+        self.assertIn(f"  {B}   (2 files, 206 B; index scanned ", text)
+        self.assertIn(f"\n      2  {B}/Backup\n      1  {B}/Old/2020\n", text)
+        short = format_card(self.check(), top=1, max_runs=5)
+        self.assertIn("      … 1 more folder (every copy is in the CSV: -o DIR)", short)
 
     def test_strict_time_and_exact_names_drop_the_loose_matches(self):
         check = self.check(hour_shift=False, exact_names=True)
@@ -172,6 +186,10 @@ class CardCliTest(CliFixture):
         self.assertEqual(rows["IMG_77.JPG"]["drives"], "")
         self.assertEqual(rows["IMG_2.JPG"]["status"], "found")
         self.assertEqual(rows["IMG_2.JPG"]["drives"].count(";"), 1)  # both drives
+        self.assertEqual(rows["IMG_2.JPG"]["copies"].split("; "),
+                         [os.path.join(self.drives, d, p, "IMG_2.JPG")
+                          for d, p in (("one", "DCIM"), ("two", "Backup"))])  # fmt: skip
+        self.assertEqual(rows["IMG_77.JPG"]["copies"], "")
         self.assertFalse(os.path.exists(os.path.join(self.card, "card.csv")))
 
     def test_refuses_to_write_inside_the_card_and_bad_paths(self):
