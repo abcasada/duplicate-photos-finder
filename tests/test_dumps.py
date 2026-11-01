@@ -1,12 +1,15 @@
 import os
 import shutil
 import tempfile
+import time
 import unittest
+from datetime import date
 
-from dpf.dumps import DumpConfig, check_dumps, format_dumps, parse_dumps
+from dpf.dumps import DumpConfig, check_dumps, format_days, format_dumps, parse_dumps
 from dpf.index import Index
 from dpf.models import FileRecord
 from dpf.pools import PoolError
+from tests.test_match_shot import shot
 
 T = 1_600_000_000
 A, B = "/d/Storage 1A", "/d/Storage 1B"
@@ -77,3 +80,45 @@ class DumpsTest(unittest.TestCase):
                     {"dump": "a", "sorted": "b", "extra": 1}):  # fmt: skip
             with self.assertRaises(PoolError, msg=bad):
                 parse_dumps({"dumps": bad})
+
+
+def noon(y, m, d):
+    return time.mktime((y, m, d, 12, 0, 0, 0, 0, -1))
+
+
+class DumpDatesTest(unittest.TestCase):
+    def test_format_days(self):
+        d = [date(2026, 9, n) for n in (1, 2, 3, 5, 7, 8, 10, 11, 12, 13, 15)]
+        self.assertEqual(
+            format_days(d[::-1] + d),  # order and repeats do not matter
+            "2026-09-01 - 2026-09-03, 2026-09-05, 2026-09-07, 2026-09-08, "
+            "2026-09-10 - 2026-09-13, 2026-09-15",
+        )
+        self.assertEqual(format_days([date(2026, 12, 30), date(2027, 1, 1)]),
+                         "2026-12-30, 2027-01-01")  # fmt: skip
+        self.assertEqual(format_days([date(2026, 12, 31), date(2027, 1, 1), date(2027, 1, 2)]),
+                         "2026-12-31 - 2027-01-02")  # fmt: skip
+        self.assertEqual(format_days([]), "")
+
+    def test_folder_dates_come_from_unsorted_files_exif_first(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        idx = Index(os.path.join(tmp, "index.db"))
+        self.addCleanup(idx.close)
+        dump = A + "/_Dumps/trip"
+        days = [(2026, 9, 1), (2026, 9, 2), (2026, 9, 3), (2026, 9, 5), (2026, 9, 7)]
+        recs = [FileRecord(dump, f"IMG{i}.JPG", 100 + i, noon(*day), "image")
+                for i, day in enumerate(days)]
+        exif = FileRecord(dump, "IMG_E.JPG", 200, noon(2026, 9, 20), "image")  # taken earlier
+        bad = FileRecord(dump, "IMG_B.JPG", 201, noon(2026, 9, 7), "image")  # EXIF unusable
+        video = FileRecord(dump, "C1.MP4", 300, noon(2026, 9, 8), "video")
+        sorted_ = FileRecord(A + "/Photography/x", "IMG3.JPG", 103, noon(*days[3]), "image")
+        idx.replace_root(A, [*recs, exif, bad, video, sorted_])
+        idx.put_exif([shot(exif, taken="2026:08:30 18:00:00"),
+                      shot(bad, taken="0000:00:00 00:00:00")])  # fmt: skip
+        check = check_dumps(
+            idx, [A], [A], DumpConfig("dump", "photography", 1), lambda d: "A", basis="b",
+        )  # fmt: skip
+        (f,) = check.folders
+        # 09-05 is left out: that photo is in a sorted folder
+        self.assertEqual(f.dates, "2026-08-30, 2026-09-01 - 2026-09-03, 2026-09-07, 2026-09-08")

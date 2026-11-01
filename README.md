@@ -496,7 +496,10 @@ in a sorted folder on **any** indexed drive of any pool. The report gets a "Dump
 Photography" section and sheet: one row per dump folder with at least `min_photos`
 unsorted photos, largest first, with its unsorted runs (`DSC04682.ARW … DSC08897.ARW
 3,640 files`), the files in the folder and how many are "likely re-saved there" (a file
-of the same name within 64 kB in size in a sorted folder). Camera numbers repeat every
+of the same name within 64 kB in size in a sorted folder). The "Dates" column lists the
+days of the unsorted files (EXIF capture day when `dpf exif` cached it, else the modified
+day), with three or more consecutive days as a range: `2024-06-01 - 2024-06-05,
+2024-06-11, 2024-06-14 - 2024-06-16`. Camera numbers repeat every
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 

@@ -69,6 +69,7 @@ SHEETS = ("Summary", "Trees", "Folder pairs", "Sequences", "Same folder", "Files
 MAX_URL = 2079  # Excel's limit on a hyperlink target
 MAX_URLS = 65_530  # Excel's limit on hyperlinks per worksheet
 MAX_ROWS = 1_048_576
+MAX_CELL_CHARS = 32_767  # Excel's limit on the text of one cell
 _SKIPPED_NAMES = 20  # names listed per run on the Sequences sheet
 PATH_WIDTH = 70
 
@@ -766,7 +767,7 @@ def _dump_tables(wb, fmt: _Formats, check: DumpCheck | None, used: set[str]) -> 
     columns = [
         ("#", 6), ("Unsorted size", 13), ("Folder", None), ("Pool", 6),
         ("Unsorted photos", 10), ("Unsorted videos", 10), ("Files in folder", 10),
-        ("Unsorted %", 10), ("Likely re-saved in sorted", 12), ("Runs", 7),
+        ("Unsorted %", 10), ("Likely re-saved in sorted", 12), ("Dates", 45), ("Runs", 7),
         ("First unsorted run", 60),
     ]  # fmt: skip
     note = (f'folders with "{c.dump}" in the path holding {c.min_photos:,}+ photos that are '
@@ -784,12 +785,16 @@ def _dump_tables(wb, fmt: _Formats, check: DumpCheck | None, used: set[str]) -> 
         t.num(6, f.total)
         t.share(7, f.unsorted, f.total)
         t.num(8, f.similar, fmt.amber if f.similar else None)
-        t.num(9, len(f.runs))
+        dates = f.dates
+        if len(dates) > MAX_CELL_CHARS:
+            dates = dates[: MAX_CELL_CHARS - 1] + "…"
+        t.text(9, dates)
+        t.num(10, len(f.runs))
         if f.runs:
             label = "in a sorted folder"
             first = run_lines(f.runs[:1], 1, indent="", align=False, skipped_label=label)[0]
             more = len(f.runs) - 1
-            t.text(10, f"{first}  (+{more:,} more runs)" if more else first)
+            t.text(11, f"{first}  (+{more:,} more runs)" if more else first)
     t.data_bar(1)
     return [t]
 

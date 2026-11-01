@@ -665,6 +665,16 @@ class Index:
             params,
         )
 
+    def taken_in(self, dir: str) -> dict[str, str]:
+        """Name -> cached EXIF DateTimeOriginal of the photos directly in `dir` whose EXIF
+        row is still valid for the file as indexed."""
+        rows = self.conn.execute(
+            f"SELECT name, e.taken FROM files JOIN exif e USING (dir, name) "
+            f"WHERE dir = ? AND e.taken IS NOT NULL AND {_VALID_EXIF}",
+            (dir,),
+        )
+        return dict(rows)
+
     def dir_extras(self, dir: str) -> tuple[int, int]:
         """(other, errors): entries directly in `dir` that were not indexed."""
         row = self.conn.execute(

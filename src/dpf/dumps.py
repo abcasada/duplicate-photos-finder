@@ -16,19 +16,26 @@ Like backup coverage, this reports files missing elsewhere, never duplicates.
 
 from __future__ import annotations
 
+import re
+import time
 import tomllib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import date, timedelta
 
 from dpf import media
 from dpf.coverage import _runs, find_missing
 from dpf.grouping import Run
 from dpf.index import Index, Words
+from dpf.models import FileRecord
+from dpf.months import FIRST_YEAR
 from dpf.pools import PoolError, default_pools_path
 from dpf.report import human_bytes, plural, run_lines
 
 MIN_PHOTOS = 100
+MIN_RANGE = 3  # consecutive days shown as a range ("a - c") from this many
+_TAKEN_DAY = re.compile(r"(\d{4})[:-](\d{2})[:-](\d{2})")
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +57,11 @@ class DumpFolder:
     total: int  # compared (non-empty) photos and videos in the folder
     similar: int  # unsorted files with a same-name file of near size in a sorted folder
     runs: tuple[Run, ...] = ()
+    days: tuple[date, ...] = ()  # distinct days of the unsorted files, ascending
+
+    @property
+    def dates(self) -> str:
+        return format_days(self.days)
 
     @property
     def unsorted(self) -> int:
@@ -104,6 +116,7 @@ def check_dumps(
     by_dir: dict[str, list] = {}
     for f in missing:
         by_dir.setdefault(f.dir, []).append(f)
+    last_year = time.localtime().tm_year + 1
     for d, files in by_dir.items():
         kinds = Counter(f.kind for f in files)
         if kinds[media.IMAGE] < config.min_photos:
@@ -115,10 +128,57 @@ def check_dumps(
                 sum(f.size for f in files), totals[d],
                 sum(f.path in near for f in files),
                 _runs(index.list_dir(d), names if len(names) < totals[d] else None),
+                _days(files, index.taken_in(d), last_year),
             )
         )  # fmt: skip
     check.folders.sort(key=lambda f: (-f.bytes, f.dir))
     return check
+
+
+def _day(taken: str | None, mtime: float, last_year: int) -> date | None:
+    """The day a file dates from: its EXIF capture day when cached and valid, else its
+    modified day. None outside FIRST_YEAR..last_year."""
+    m = _TAKEN_DAY.match(taken) if taken else None
+    if m:
+        try:
+            day = date(*map(int, m.groups()))
+        except ValueError:
+            day = None
+        if day and FIRST_YEAR <= day.year <= last_year:
+            return day
+    try:
+        t = time.localtime(mtime)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return date(t.tm_year, t.tm_mon, t.tm_mday) if FIRST_YEAR <= t.tm_year <= last_year else None
+
+
+def _days(
+    files: Iterable[FileRecord], taken: Mapping[str, str], last_year: int
+) -> tuple[date, ...]:
+    days = {_day(taken.get(f.name), f.mtime, last_year) for f in files}
+    return tuple(sorted(days - {None}))
+
+
+def format_days(days: Iterable[date]) -> str:
+    """Days as "2026-09-01 - 2026-09-03, 2026-09-10, 2026-09-12": runs of MIN_RANGE or more
+    consecutive days become a range, shorter runs are listed one by one."""
+    out: list[str] = []
+    run: list[date] = []
+
+    def flush() -> None:
+        if len(run) >= MIN_RANGE:
+            out.append(f"{run[0]} - {run[-1]}")
+        else:
+            out.extend(map(str, run))
+
+    for day in sorted(set(days)):
+        if run and day - run[-1] != timedelta(days=1):
+            flush()
+            run = []
+        run.append(day)
+    flush()
+    return ", ".join(out)
 
 
 def parse_dumps(data: Mapping[str, object], path: str = "pools file") -> DumpConfig | None:
@@ -212,7 +272,7 @@ def dumps_json(check: DumpCheck) -> dict:
         "folders": [
             {
                 "dir": f.dir, "pool": f.pool, "photos": f.photos, "videos": f.videos,
-                "bytes": f.bytes, "total": f.total, "similar": f.similar,
+                "bytes": f.bytes, "total": f.total, "similar": f.similar, "dates": f.dates,
                 "runs": [{"first": r.a_first, "last": r.a_last, "files": r.count,
                           "bytes": r.bytes} for r in f.runs],
             }

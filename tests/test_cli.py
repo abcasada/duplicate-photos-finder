@@ -9,6 +9,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1250,13 +1251,20 @@ class DumpsCliTest(CliFixture):
         self.assertIn(f"{dump}   (7 photos unsorted, of 10 files)", out)
         self.assertIn("DSC00004.ARW … DSC00010.ARW  7 files", out)
         with open(os.path.join(self.out, "report.json")) as fh:
-            self.assertEqual(json.load(fh)["summary"]["dumps"]["folders"][0]["photos"], 7)
+            folder = json.load(fh)["summary"]["dumps"]["folders"][0]
+        self.assertEqual(folder["photos"], 7)
+        day = time.strftime("%Y-%m-%d", time.localtime(1_600_000_000))
+        dates = folder["dates"]
+        self.assertEqual(dates, day)  # all seven files date from one day
         if HAVE_XLSXWRITER:
             from tests.test_xlsx_report import Workbook
 
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertIn("Dumps not in Photography", wb.names)
+            cells = wb.cells("Dumps not in Photography")
+            self.assertIn("Dates", cells.values())
+            self.assertIn(dates, cells.values())
 
 
 class FoldersCliTest(CliFixture):
