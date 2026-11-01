@@ -142,6 +142,9 @@ dpf find --mode 1 --category personal --pool A --pool B
 # Plain paths work too, instead of --pool (not together with it)
 dpf find --mode 1 /run/media/adam/Storage\ 1TB
 
+# Is everything on this SD card already on a drive? (reads the card, never writes to it)
+dpf card /run/media/adam/EOS_DIGITAL
+
 # What's in the index: files, media size (personal / other with [categories]), used/total
 # space of each drive, last scan, which drives are plugged in, and which pool each belongs to
 dpf drives
@@ -274,6 +277,38 @@ explicitly (also for a run on plain PATHs, e.g. "which files of this card dump a
 pool A yet?"). Each coverage run adds `missing.csv`: one row per missing file with its
 pool, the pool it is missing from, path, size, mtime, kind, `similar_name_there` and
 `category`.
+
+### Checking a card
+
+`dpf card PATH` answers "is everything on this card already on a drive?" before you
+format it. It reads the photos and videos under PATH (an SD card's mount point, or any
+folder; read only, like a scan) and compares them with the **indexed** drives with the
+mode 1 rules of backup coverage: similar name, size and date, whole-hour date shifts
+allowed. The drives need not be connected. Only the card is read; the index is only read
+too, and the card is never added to it, so nothing is left behind.
+
+```sh
+dpf card /run/media/adam/EOS_DIGITAL             # against every indexed drive
+dpf card /run/media/adam/EOS_DIGITAL --pool A    # only the drives of pool A
+dpf card /run/media/adam/EOS_DIGITAL -o ~/card   # also write ~/card/card.csv
+```
+
+The report gives the card's totals, how many files are already on a drive and how many
+are on none, **which drives hold copies** (with when each was last scanned: a drive
+indexed long ago may since have lost files), and the folders with files found nowhere,
+with the runs of consecutive files that are on a drive. `card.csv` (with `-o`) has one
+row per media file, found or not: path, size, date, status, `similar_name_on_drive` and
+the drives holding a copy. Matching options are those of `find`: `--mtime-tolerance`,
+`--strict-time`, `--ignore-size`, `--ignore-mtime`, `--exact-names`; `--top` and
+`--max-runs` shape the listing.
+
+"Already on a drive" means a file with a matching name, size and date exists in the index.
+Contents are not compared, so a renamed-and-re-saved copy counts as not found. Non-media
+files and 0-byte files are counted but not compared. If PATH is itself in the index (a
+card scanned earlier) that entry is ignored; a PATH inside or around an indexed drive
+is refused. Entries on the card that cannot be read are warned about (the conclusion
+then only covers what could be read) and make the exit status 1. Mode 1b (EXIF shots) is
+not used for cards yet.
 
 ### Drive space
 
