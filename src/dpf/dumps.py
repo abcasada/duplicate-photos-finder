@@ -128,7 +128,7 @@ def check_dumps(
                 sum(f.size for f in files), totals[d],
                 sum(f.path in near for f in files),
                 _runs(index.list_dir(d), names if len(names) < totals[d] else None),
-                _days(files, index.taken_in(d), last_year),
+                file_days(files, index.taken_in(d), last_year),
             )
         )  # fmt: skip
     check.folders.sort(key=lambda f: (-f.bytes, f.dir))
@@ -153,7 +153,7 @@ def _day(taken: str | None, mtime: float, last_year: int) -> date | None:
     return date(t.tm_year, t.tm_mon, t.tm_mday) if FIRST_YEAR <= t.tm_year <= last_year else None
 
 
-def _days(
+def file_days(
     files: Iterable[FileRecord], taken: Mapping[str, str], last_year: int
 ) -> tuple[date, ...]:
     days = {_day(taken.get(f.name), f.mtime, last_year) for f in files}

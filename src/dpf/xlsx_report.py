@@ -35,6 +35,7 @@ from dpf.grouping import (
 )
 from dpf.backed_dupes import BOTH, BackedDupes, spots_by_pool
 from dpf.dumps import DumpCheck
+from dpf.onepool import OnlyInOne, only_lines
 from dpf.models import DuplicateGroup
 from dpf.months import PoolMonths
 from dpf.overview import Overview, personal_lines
@@ -149,6 +150,7 @@ def write_combined_xlsx(
     dumps: DumpCheck | None = None,
     months: Sequence[PoolMonths] = (),
     backed: BackedDupes | None = None,
+    only: OnlyInOne | None = None,
 ) -> None:
     """One workbook for several pools: each pool's sheets prefixed with its name.
 
@@ -163,6 +165,7 @@ def write_combined_xlsx(
         summary_ws = wb.add_worksheet(SHEETS[0])
         used = {SHEETS[0].casefold()}
         drives = _drives_tables(wb, fmt, overview, used)
+        drives += _only_tables(wb, fmt, only, used)
         drives += _months_tables(wb, fmt, months, used)
         per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
         cov_tables = _coverage_tables(wb, fmt, coverage, used)
@@ -179,6 +182,11 @@ def write_combined_xlsx(
         w.line("", "Duplicates are searched within each pool, never between pools.")
         w.skip()
         _personal_block(w, overview)
+        if only is not None:
+            w.heading(only.title)
+            for line in only_lines(only):
+                w.line("", line.strip())
+            w.skip()
         if drives:
             _sheet_list(w, drives, title="Drive sheets")
         for p, ts in zip(pools, per_pool):
@@ -296,6 +304,35 @@ def _health_cells(t: _Table, c: int, h: DriveHealth | None) -> None:
     t.text(c, h.date, t.fmt.warning_text if h.stale() else None)
     t.text(c + 1, "; ".join(h.trend))
     t.text(c + 2, "; ".join(h.flags))
+
+
+def _only_tables(wb, fmt: _Formats, only: OnlyInOne | None, used: set[str]) -> list[_Table]:
+    """Folders of files that exist in one pool only, both pools, largest first."""
+    if only is None:
+        return []
+    columns = [("#", 6), ("Size", 11), ("Only in", 8), ("Missing from", 8), ("Drive", 18),
+               ("Folder", None), ("Photos", 9), ("Videos", 8), ("Files in folder", 10),
+               ("Only-here %", 9), ("Likely re-saved in other pool", 12), ("Dates", 60)]  # fmt: skip
+    note = ("personal " if only.personal_only else "") + (
+        "photos/videos with no copy anywhere in the other pool, per folder")
+    t = _Table(wb, fmt, sheet_name("Only in one pool", used), columns, 2, note=note)
+    for n, f in enumerate(only.folders, 1):
+        if not t.next_row():
+            continue
+        t.num(0, n)
+        t.num(1, f.bytes, fmt.size)
+        t.text(2, f.pool)
+        t.text(3, f.other)
+        t.text(4, os.path.basename(f.drive) or f.drive)
+        t.folder(5, f.dir)
+        t.num(6, f.photos)
+        t.num(7, f.videos)
+        t.num(8, f.total)
+        t.share(9, f.files, f.total)
+        t.num(10, f.near, fmt.amber if f.near else None)
+        t.text(11, f.dates)
+    t.data_bar(1)
+    return [t]
 
 
 def _months_tables(

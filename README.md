@@ -540,6 +540,21 @@ day), with three or more consecutive days as a range: `2024-06-01 - 2024-06-05,
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 
+### Personal files in only one pool
+
+The main focus of a `--pool A --pool B` run. Right after the Drives section (and as the
+"Only in one pool" sheet, right after Drives in report.xlsx), the report lists the
+personal photos and videos that exist in one pool only: in A they have no backup in B,
+in B they are missing from the primary drives. It is built from the two backup-coverage
+checks, so it uses the same matching rules (mode 1, or the camera shot with `--mode 1b`),
+and leaves out other media from `[categories]`.
+
+- Totals per pool and per drive; then folders of both pools, largest first.
+- Per folder: photos, videos, size, how much of the folder it is, the days the files date
+  from (EXIF capture day when cached, else file date), and how many have a same-name file
+  within 64 kB in size in the other pool ("likely re-saved", unproven: `dpf exif` on both
+  drives settles it with `--mode 1b`).
+
 ### Duplicated in A and B
 
 When a pool and its backup pool are in one run (`--pool A --pool B`), the report adds

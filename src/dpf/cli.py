@@ -34,6 +34,7 @@ from dpf.coverage import (
     stale_warnings,
 )
 from dpf.backed_dupes import BackedDupes, backed_json, find_backed_dupes, format_backed
+from dpf.onepool import OnlyInOne, build_only_in_one, format_only
 from dpf.dumps import DumpCheck, check_dumps, dumps_json, format_dumps, load_dumps
 from dpf.months import PoolMonths, format_months, month_totals
 from dpf.overview import Overview, PoolInput, build_overview, format_overview
@@ -665,6 +666,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
 
     dumps = _check_dumps(idx, targets, args)
     backed = _backed_dupes(idx, plans, args, match_opts, shots, cats)
+    only = build_only_in_one(idx, coverages, cats, _basis(args))
 
     os.makedirs(out, exist_ok=True)
     paths = {
@@ -722,12 +724,13 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             **({"dumps": dumps_json(dumps)} if dumps is not None else {}),
             **({"months": [m.to_json() for m in months]} if months else {}),
             **({"backed_duplicates": backed_json(backed)} if backed else {}),
+            **({"only_in_one_pool": only.to_json()} if only else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
                                             coverages=coverages, overview=overview,
                                             dumps=dumps, months=months,
-                                            backed=backed):  # fmt: skip
+                                            backed=backed, only=only):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)
@@ -741,6 +744,9 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
         ]
         if overview is not None:
             parts.append(_banner("Drives") + "\n" + format_overview(overview))
+        if only is not None:
+            parts.append(_banner(only.title))
+            parts.append(format_only(only, top=args.coverage_top))
         for r in runs:
             parts.append(_banner(f"Pool {r.target.name}"))
             parts.append(format_text(r.result, r.summary, **text_opts))
@@ -1755,6 +1761,7 @@ def _write_xlsx(
     dumps: DumpCheck | None = None,
     months: list[PoolMonths] | None = None,
     backed: BackedDupes | None = None,
+    only: OnlyInOne | None = None,
 ) -> bool:
     """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
     from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
@@ -1767,7 +1774,7 @@ def _write_xlsx(
             sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
             write_combined_xlsx(
                 sheets, coverages or [], summary or {}, path, overview, dumps, months or [],
-                backed,
+                backed, only,
             )
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":

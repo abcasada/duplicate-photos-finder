@@ -822,6 +822,9 @@ class CoverageCliTest(PoolsFixture):
         self.assertEqual(list(data["pools"]), ["A", "B"])
         self.assertEqual(data["summary"]["pools"], ["A", "B"])
         self.assertEqual(list(data["coverage"]), ["A not in B", "B not in A"])
+        only = data["summary"]["only_in_one_pool"]
+        self.assertEqual([p["pool"] for p in only["pools"]], ["A", "B"])
+        self.assertIn("===== Files in only one pool =====", self.read("report.txt"))
         for pair in data["pools"]["A"]["pairs"]:
             self.assertNotIn(self.b1, pair["dir_a"] + pair["dir_b"])
         self.assertEqual(data["pools"]["B"]["pairs"], [])
@@ -838,7 +841,7 @@ class CoverageCliTest(PoolsFixture):
             wb = Workbook(os.path.join(self.out, "report.xlsx"))
             self.addCleanup(wb.close)
             self.assertEqual(wb.names, [
-                "Summary", "Drives", "A Months", "B Months",
+                "Summary", "Drives", "Only in one pool", "A Months", "B Months",
                 "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
                 "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
                 "A not in B", "B not in A", "Duplicated in A and B",
