@@ -1,5 +1,5 @@
-"""Command-line interface: `dpf scan`, `exif`, `find`, `drives`, `space`, `smart`, `folders`,
-`pools`."""
+"""Command-line interface: `dpf scan`, `exif`, `find`, `card`, `drives`, `space`, `smart`,
+`folders`, `pools`."""
 
 from __future__ import annotations
 
@@ -311,6 +311,49 @@ def _build_parser() -> argparse.ArgumentParser:
         help="run smartctl (and dmesg, if the kernel log is restricted) through sudo when "
         "dpf is not root (default: on)",
     )  # fmt: skip
+
+    c = sub.add_parser(
+        "card", help="check which files of a card are already on an indexed drive",
+        description="Read the photos and videos under PATH (an SD card, or any folder; read "
+        "only) and report which of them have a copy on the indexed drives, which do not, "
+        "and which drives hold the copies. The drives need not be connected: they are "
+        "compared from the index, and the card is never added to it.",
+    )  # fmt: skip
+    c.add_argument("path", metavar="PATH", help="the card's mount point, or a folder")
+    c.add_argument(
+        "--pool", metavar="NAME", action="append",
+        help="only compare with the indexed drives of this pool (repeatable; default: "
+        "every indexed drive)",
+    )  # fmt: skip
+    c.add_argument(
+        "-o", "--out", default=None, metavar="DIR",
+        help="also write card.csv here: every media file, found or not, with its copies",
+    )  # fmt: skip
+    c.add_argument(
+        "--mtime-tolerance", type=float, default=2.0, metavar="SEC",
+        help="max modification-time difference for a match (default: 2)",
+    )  # fmt: skip
+    c.add_argument(
+        "--strict-time", action="store_true",
+        help="dates must match within the tolerance; by default dates that differ by whole "
+        "hours (1-14 h, time zones/DST) also match",
+    )  # fmt: skip
+    c.add_argument("--ignore-size", action="store_true", help="don't require equal size")
+    c.add_argument("--ignore-mtime", action="store_true", help="don't compare dates")
+    c.add_argument(
+        "--exact-names", action="store_true",
+        help="names must be equal (ignoring case); by default copy marks such as ' (1)' and "
+        "text around a camera file number (DSC01234) are ignored",
+    )  # fmt: skip
+    c.add_argument(
+        "--top", type=int, default=COVERAGE_TOP, metavar="N",
+        help=f"folders listed as not on any drive (default: {COVERAGE_TOP})",
+    )  # fmt: skip
+    c.add_argument(
+        "--max-runs", type=int, default=8, metavar="N",
+        help="runs of files listed per folder before summarising (default: 8)",
+    )  # fmt: skip
+    c.add_argument("-q", "--quiet", action="store_true", help="no progress output")
 
     sub.add_parser(
         "pools", help="list the drive pools and their drives",
@@ -1513,6 +1556,71 @@ def _pools(args: argparse.Namespace) -> int:
     return 0
 
 
+def _card(args: argparse.Namespace) -> int:
+    """`dpf card`: scan PATH read-only and compare it with the indexed drives."""
+    from dpf.card import check_card, format_card, write_card_csv
+
+    card = os.path.realpath(args.path)
+    if not os.path.isdir(card):
+        print(f"dpf: {args.path} is not a folder", file=sys.stderr)
+        return 1
+    db = args.db or default_db_path()
+    if not os.path.exists(db):
+        print(f"dpf: nothing indexed yet ({db}); run `dpf scan PATH` first", file=sys.stderr)
+        return 1
+    _check_output_location(db, [card], "the index", allow_same_drive=args.allow_same_drive)
+    if args.out:
+        _check_output_location(
+            args.out, [card], "card.csv", allow_same_drive=args.allow_same_drive
+        )  # fmt: skip
+    try:
+        pools = load_pools(args.pools_file) if args.pool else {}
+        wanted = {get_pool(pools, n).name for n in args.pool or ()}
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+    errors: list[str] = []
+    try:
+        with Index(db) as idx:
+            roots = None
+            if wanted:
+                # Indexed roots only: globbing mount folders would touch the drives.
+                roots = [r.root for r in idx.roots() if wanted & set(pools_of(pools, r.root))]
+                if not roots:
+                    print("dpf: no indexed drives in that pool", file=sys.stderr)
+                    return 1
+            try:
+                check = check_card(
+                    idx, card, drive_roots=roots, progress=_progress_printer(args.quiet),
+                    errors=errors, mtime_tolerance=args.mtime_tolerance,
+                    ignore_size=args.ignore_size, ignore_mtime=args.ignore_mtime,
+                    exact_names=args.exact_names, hour_shift=not args.strict_time,
+                )  # fmt: skip
+            finally:
+                _end_progress(args.quiet)
+    except ValueError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("dpf: interrupted", file=sys.stderr)
+        return 130
+    if check.unreadable:
+        print(f"dpf: warning: {plural(check.unreadable, 'entry')} on the card could not be read",
+              file=sys.stderr)  # fmt: skip
+    if errors and not args.quiet:
+        for e in errors[:5]:
+            print(f"  unreadable: {e}", file=sys.stderr)
+        if len(errors) > 5:
+            print(f"  … and {len(errors) - 5:,} more", file=sys.stderr)
+    print(format_card(check, top=args.top, max_runs=args.max_runs), end="")
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        path = os.path.join(args.out, "card.csv")
+        rows = write_card_csv(check, path)
+        print(f"\n{plural(rows, 'file')} listed in {path}")
+    return 1 if check.unreadable else 0
+
+
 def _folders(idx: Index, args: argparse.Namespace) -> int:
     """`dpf folders`: the folder overview CSV, from the index only."""
     from dpf.folders import sort_roots, write_folders_csv
@@ -1704,6 +1812,8 @@ def main(argv: list[str] | None = None) -> int:
         return _smart(args, parser)
     if args.command == "space":
         return _space(args, parser)
+    if args.command == "card":
+        return _card(args)
     if args.command == "folders":
         db = args.db or default_db_path()
         if not os.path.exists(db):

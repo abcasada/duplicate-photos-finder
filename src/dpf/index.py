@@ -164,6 +164,7 @@ _SPACE_COLUMNS = {
 _VERSION = 8
 
 _BATCH = 10_000
+_KEY_CHUNK = 500  # keys per IN (...) query, well under SQLite's variable limit
 
 DirStats = Mapping[str, tuple[int, int]]
 
@@ -651,6 +652,38 @@ class Index:
         yield from self.conn.execute(
             f"SELECT dir, name, size, mtime, kind FROM files WHERE {where}", params
         )
+
+    def keys_under(self, roots: Sequence[str]) -> tuple[set[str], set[str]]:
+        """(match keys, name keys) of the non-empty files under `roots`."""
+        where, params = _prefix_clause(roots)
+        rows = self.conn.execute(
+            f"SELECT DISTINCT match_key, name_key FROM files WHERE {where} AND size > 0", params
+        )
+        pairs = rows.fetchall()
+        return {m for m, _ in pairs}, {n for _, n in pairs}
+
+    def rows_with_keys(
+        self, roots: Sequence[str], match_keys: Iterable[str], name_keys: Iterable[str]
+    ) -> Iterator[tuple]:
+        """Raw rows (in `_COLUMNS` order) of the non-empty files under `roots` whose match
+        key is in `match_keys` or whose name key is in `name_keys`; a row may repeat."""
+        where, params = _prefix_clause(roots)
+        for column, keys in (("match_key", match_keys), ("name_key", name_keys)):
+            keys = list(keys)
+            for i in range(0, len(keys), _KEY_CHUNK):
+                chunk = keys[i : i + _KEY_CHUNK]
+                yield from self.conn.execute(
+                    f"SELECT {_COLUMNS} FROM files WHERE {where} AND size > 0 "
+                    f"AND {column} IN ({', '.join('?' * len(chunk))})",
+                    params + chunk,
+                )
+
+    def add_rows(self, rows: Iterable[tuple]) -> None:
+        """Insert raw rows from rows_with_keys (another index's files); no roots entry."""
+        with self.conn:
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO files ({_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)", rows
+            )
 
     def media_dates(
         self, roots: Sequence[str]
