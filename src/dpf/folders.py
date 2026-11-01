@@ -21,6 +21,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 
 from dpf import media
+from dpf.categories import OTHER, Categories
 from dpf.grouping import natural_key
 from dpf.index import Index
 
@@ -121,26 +122,31 @@ def _date(ts: float | None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(ts)) if ts is not None else ""
 
 
-def _row(pool: str, root: str, key: Key, s: FolderStats) -> list[str | int]:
+def _row(
+    pool: str, root: str, key: Key, s: FolderStats, cats: Categories | None = None
+) -> list[str | int]:
     folder, sub = key
     path = root if folder == HERE else os.path.join(root, folder)
     if sub and sub != HERE:
         path = os.path.join(path, sub)
     inside = len(s.dirs - {path})
     types = ", ".join(f"{ext} {n:,}" for ext, n in s.types.most_common(TYPES_SHOWN))
+    marked = "no" if cats and cats.of(path) == OTHER else ""
     return [
-        pool, os.path.basename(root) or root, folder, sub, "", "",
+        pool, os.path.basename(root) or root, folder, sub, marked, "",
         s.files, s.photos, s.videos, f"{s.bytes / 1e9:.2f}", s.other,
         inside, _date(s.oldest), _date(s.newest), types, path,
     ]  # fmt: skip
 
 
 def write_folders_csv(
-    idx: Index, roots: Sequence[str], path: str, pool_of: Callable[[str], str]
+    idx: Index, roots: Sequence[str], path: str, pool_of: Callable[[str], str],
+    cats: Categories | None = None,
 ) -> int:
     """Write the overview of `roots` (in the given order) to `path`; returns the row count.
 
-    UTF-8 with a byte-order mark, so Excel shows non-ASCII folder names correctly.
+    UTF-8 with a byte-order mark, so Excel shows non-ASCII folder names correctly. With
+    `cats`, folders already under a `[categories] other` pattern come marked "no".
     """
     n = 0
     with open(path, "w", encoding="utf-8-sig", newline="") as fh:
@@ -149,7 +155,7 @@ def write_folders_csv(
         for root in roots:
             rows = summarize(idx, root)
             for key in sorted(rows, key=_row_order):
-                w.writerow(_row(pool_of(root), root, key, rows[key]))
+                w.writerow(_row(pool_of(root), root, key, rows[key], cats))
                 n += 1
     return n
 

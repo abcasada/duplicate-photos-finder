@@ -28,14 +28,22 @@ class FoldersTest(unittest.TestCase):
         ]
         self.idx.replace_root(r, files, dir_stats={f"{r}/Plex": (3, 0), f"{r}/Apps": (7, 0), r: (2, 0)})
 
-    def rows(self):
+    def rows(self, cats=None):
         path = os.path.join(self.tmp, "folders.csv")
-        n = write_folders_csv(self.idx, [self.root], path, lambda root: "A")
+        n = write_folders_csv(self.idx, [self.root], path, lambda root: "A", cats)
         with open(path, encoding="utf-8-sig", newline="") as fh:
             rows = list(csv.reader(fh))
         self.assertEqual(rows[0], list(FIELDS))
         self.assertEqual(n, len(rows) - 1)
         return [dict(zip(FIELDS, row)) for row in rows[1:]]
+
+    def test_other_media_comes_marked_no(self):
+        from dpf.categories import Categories
+
+        rows = self.rows(Categories([self.root + "/Plex"]))
+        self.assertEqual({r["Folder"]: r["Personal?"] for r in rows if not r["Subfolder"]},
+                         {HERE: "", "Photos": "", "Plex": "no"})  # fmt: skip
+        self.assertTrue(all(r["Personal?"] == "" for r in self.rows()))
 
     def test_two_levels_with_subtree_totals(self):
         rows = self.rows()

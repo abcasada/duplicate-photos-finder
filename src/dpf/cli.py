@@ -1655,8 +1655,11 @@ def _folders(idx: Index, args: argparse.Namespace) -> int:
         offline=set(roots),
     )  # fmt: skip
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    cats = _load_categories(args)
+    if cats is None:
+        return 1
     roots = sort_roots(roots, pool_of)
-    rows = write_folders_csv(idx, roots, out, pool_of)
+    rows = write_folders_csv(idx, roots, out, pool_of, cats)
     print(f"{rows:,} folders from {plural(len(roots), 'drive')} written to {out}")
     return 0
 
