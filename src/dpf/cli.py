@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import glob
 import os
 import sys
@@ -32,6 +33,7 @@ from dpf.coverage import (
     same_drive_warnings,
     stale_warnings,
 )
+from dpf.backed_dupes import BackedDupes, backed_json, find_backed_dupes, format_backed
 from dpf.dumps import DumpCheck, check_dumps, dumps_json, format_dumps, load_dumps
 from dpf.months import PoolMonths, format_months, month_totals
 from dpf.overview import Overview, PoolInput, build_overview, format_overview
@@ -619,6 +621,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
                   for r in runs]  # fmt: skip
 
     dumps = _check_dumps(idx, targets, args)
+    backed = _backed_dupes(idx, plans, args, match_opts, shots, cats)
 
     os.makedirs(out, exist_ok=True)
     paths = {
@@ -653,7 +656,7 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             summary["months"] = [m.to_json() for m in months]
         if not args.no_xlsx and _write_xlsx(
             xlsx_path, run.result, run.groups, summary, coverages=coverages, overview=overview,
-            dumps=dumps, months=months,
+            dumps=dumps, months=months, backed=backed,
         ):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
@@ -675,11 +678,13 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             **({"overview": overview.to_json()} if overview is not None else {}),
             **({"dumps": dumps_json(dumps)} if dumps is not None else {}),
             **({"months": [m.to_json() for m in months]} if months else {}),
+            **({"backed_duplicates": backed_json(backed)} if backed else {}),
             **paths,
         }
         if not args.no_xlsx and _write_xlsx(xlsx_path, runs=runs, summary=summary,
                                             coverages=coverages, overview=overview,
-                                            dumps=dumps, months=months):  # fmt: skip
+                                            dumps=dumps, months=months,
+                                            backed=backed):  # fmt: skip
             summary["xlsx_path"] = xlsx_path
         elif os.path.exists(xlsx_path):
             os.remove(xlsx_path)
@@ -700,6 +705,9 @@ def _find(idx: Index, targets: list[_Target], pools: Pools, args: argparse.Names
             parts.append(_banner("Backup coverage"))
     for cov in coverages:
         parts.append(format_coverage(cov, top=args.coverage_top, max_runs=args.max_runs))
+    if backed is not None:
+        parts.append(_banner(backed.title))
+        parts.append(format_backed(backed, top=args.coverage_top))
     if dumps is not None:
         parts.append(_banner(dumps.label))
         parts.append(format_dumps(dumps, top=args.coverage_top, max_runs=args.max_runs))
@@ -830,6 +838,36 @@ def _smart_links(path: str | None) -> dict[str, str]:
     except PoolError as e:
         print(f"dpf: warning: {e}", file=sys.stderr)
         return {}
+
+
+def _backed_dupes(
+    idx: Index, plans: list[_CoveragePlan], args: argparse.Namespace, match_opts: dict,
+    shots: bool, cats: Categories,
+) -> BackedDupes | None:  # fmt: skip
+    """Backed-up sequences with extra copies, when a pool and its backup are both in the
+    run: the files of both are matched together for this one check."""
+    from dpf.match_name import find_name_duplicates
+    from dpf.match_shot import find_shot_duplicates
+
+    plan = next((p for p in plans if p.in_run is not None and p.direction == NOT_BACKED_UP),
+                None)  # fmt: skip
+    if plan is None:
+        return None
+    primary, backup = plan.target, plan.in_run
+    roots = primary.roots + backup.roots
+    if shots:
+        groups, _ = find_shot_duplicates(idx, roots, **match_opts)
+    else:
+        groups = list(find_name_duplicates(idx, roots, **match_opts))
+    if args.category != ALL:
+        groups = [g for g in groups if _group_category(cats, g) == args.category]
+    owner = {r: primary.name for r in primary.roots} | {r: backup.name for r in backup.roots}
+
+    def pool_of(dir: str) -> str:
+        return next((p for r, p in owner.items() if dir == r or dir.startswith(r + "/")), "")
+
+    return find_backed_dupes(idx, groups, functools.cache(pool_of), primary.name or "",
+                             backup.name or "", _basis(args))  # fmt: skip
 
 
 def _check_dumps(idx: Index, targets: list[_Target], args: argparse.Namespace) -> DumpCheck | None:
@@ -1608,6 +1646,7 @@ def _write_xlsx(
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
     months: list[PoolMonths] | None = None,
+    backed: BackedDupes | None = None,
 ) -> bool:
     """Write report.xlsx (one pool, or `runs` combined); False with a hint without XlsxWriter."""
     from dpf.xlsx_report import PoolSheets, write_combined_xlsx, write_xlsx
@@ -1615,11 +1654,12 @@ def _write_xlsx(
     try:
         if runs is None:
             write_xlsx(result, groups or [], summary or {}, path, coverages or [], overview, dumps,
-                       months or [])
+                       months or [], backed)
         else:
             sheets = [PoolSheets(r.target.name or "", r.result, r.groups, r.summary) for r in runs]
             write_combined_xlsx(
-                sheets, coverages or [], summary or {}, path, overview, dumps, months or []
+                sheets, coverages or [], summary or {}, path, overview, dumps, months or [],
+                backed,
             )
     except ModuleNotFoundError as e:
         if e.name != "xlsxwriter":

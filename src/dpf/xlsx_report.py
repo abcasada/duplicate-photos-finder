@@ -33,6 +33,7 @@ from dpf.grouping import (
     TreePair,
     natural_key,
 )
+from dpf.backed_dupes import BOTH, BackedDupes, spots_by_pool
 from dpf.dumps import DumpCheck
 from dpf.models import DuplicateGroup
 from dpf.months import PoolMonths
@@ -107,6 +108,7 @@ def write_xlsx(
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
     months: Sequence[PoolMonths] = (),
+    backed: BackedDupes | None = None,
 ) -> None:
     """Write report.xlsx. Raises ModuleNotFoundError if XlsxWriter is not installed.
 
@@ -124,6 +126,7 @@ def write_xlsx(
         tables = drives + _pool_tables(wb, fmt, result, groups, "", used)
         tables += _coverage_tables(wb, fmt, coverage, used)
         tables += _dump_tables(wb, fmt, dumps, used)
+        tables += _backed_tables(wb, fmt, backed, used)
         for t in tables:
             t.finish()
         w = _SummaryWriter(summary_ws, fmt)
@@ -144,6 +147,7 @@ def write_combined_xlsx(
     overview: Overview | None = None,
     dumps: DumpCheck | None = None,
     months: Sequence[PoolMonths] = (),
+    backed: BackedDupes | None = None,
 ) -> None:
     """One workbook for several pools: each pool's sheets prefixed with its name.
 
@@ -162,6 +166,7 @@ def write_combined_xlsx(
         per_pool = [_pool_tables(wb, fmt, p.result, p.groups, p.name, used) for p in pools]
         cov_tables = _coverage_tables(wb, fmt, coverage, used)
         cov_tables += _dump_tables(wb, fmt, dumps, used)
+        cov_tables += _backed_tables(wb, fmt, backed, used)
         tables = drives + [t for ts in per_pool for t in ts] + cov_tables
         for t in tables:
             t.finish()
@@ -785,6 +790,53 @@ def _dump_tables(wb, fmt: _Formats, check: DumpCheck | None, used: set[str]) -> 
             first = run_lines(f.runs[:1], 1, indent="", align=False, skipped_label=label)[0]
             more = len(f.runs) - 1
             t.text(10, f"{first}  (+{more:,} more runs)" if more else first)
+    t.data_bar(1)
+    return [t]
+
+
+BACKED_FOLDERS = 4  # folder columns per pool; more go into a last "more" column
+
+
+def _backed_tables(wb, fmt: _Formats, found: BackedDupes | None, used: set[str]) -> list[_Table]:
+    """One row per backed-up sequence with extra copies, every folder holding it."""
+    if found is None:
+        return []
+    a, b = found.pool, found.backup
+    columns = [
+        ("#", 6), ("Space saved", 12), ("Duplicated in", 10), ("Files", 8),
+        ("Size of one copy", 12), (f"Copies in {a}", 9), (f"Copies in {b}", 9),
+        ("First file", None), ("Last file", None),
+        *((f"{a} folder {i}", None) for i in range(1, BACKED_FOLDERS + 1)),
+        *((f"{b} folder {i}", None) for i in range(1, BACKED_FOLDERS + 1)),
+        ("More folders", 40),
+    ]  # fmt: skip
+    note = (f"sequences in pool {a} and its backup {b} with extra copies in either; "
+            "space saved keeps one copy per pool")  # fmt: skip
+    t = _Table(wb, fmt, sheet_name(found.title, used), columns, freeze_cols=2, note=note)
+    for n, r in enumerate(found.runs, 1):
+        if not t.next_row():
+            continue
+        t.num(0, n)
+        t.num(1, r.saved, fmt.size)
+        where = found.label_of(r.duplicated_in)
+        t.text(2, where, fmt.warning_text if r.duplicated_in == BOTH else None)
+        t.num(3, r.files)
+        t.num(4, r.bytes, fmt.size)
+        t.num(5, r.copies_a, fmt.amber if r.copies_a > 1 else None)
+        t.num(6, r.copies_b, fmt.amber if r.copies_b > 1 else None)
+        t.text(7, r.first)
+        t.text(8, r.last)
+        more = []
+        for c0, pool in ((9, a), (9 + BACKED_FOLDERS, b)):
+            spots = spots_by_pool(r, pool)
+            for i, s in enumerate(spots[:BACKED_FOLDERS]):
+                if s.copies > 1:
+                    t.text(c0 + i, f"{s.dir}  ({s.copies} copies)")
+                else:
+                    t.folder(c0 + i, s.dir)
+            more += [f"{pool}: {s.dir}" for s in spots[BACKED_FOLDERS:]]
+        if more:
+            t.text(9 + 2 * BACKED_FOLDERS, "; ".join(more))
     t.data_bar(1)
     return [t]
 

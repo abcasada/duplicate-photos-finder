@@ -500,6 +500,20 @@ of the same name within 64 kB in size in a sorted folder). Camera numbers repeat
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 
+### Duplicated in A and B
+
+When a pool and its backup pool are in one run (`--pool A --pool B`), the report adds
+"Duplicated in A and B": sequences that are backed up (at least one copy in each pool)
+but have extra copies in A, in B, or in both. Each row is one run of consecutive files,
+with every folder that holds it (in report.xlsx: up to four folder columns per pool, then
+"More folders"); the "Duplicated in" column says where the extra copies are, so filter it
+to "both" for sequences duplicated on both sides. Rows are sorted by space saved, which
+keeps one copy in each pool: (copies in A − 1 + copies in B − 1) × the size of one copy.
+
+For this check only, the files of both pools are matched together (same rules as the
+run: mode 1, or the camera shot with `--mode 1b`). A run whose copies only partly overlap
+is split, so every row is exact. It is computed from the index; nothing is rescanned.
+
 ### Photos and videos by month
 
 Every `find` run with the default `--category all` adds "Photos and videos by month": per

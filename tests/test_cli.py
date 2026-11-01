@@ -840,7 +840,7 @@ class CoverageCliTest(PoolsFixture):
                 "Summary", "Drives", "A Months", "B Months",
                 "A Trees", "A Folder pairs", "A Sequences", "A Same folder", "A Files",
                 "B Trees", "B Folder pairs", "B Sequences", "B Same folder", "B Files",
-                "A not in B", "B not in A",
+                "A not in B", "B not in A", "Duplicated in A and B",
             ])  # fmt: skip
             self.assertEqual(wb.cells("A Folder pairs")["F2"], f"{self.a1}/DCIM/DCIM")
             self.assertNotIn("A2", wb.cells("B Folder pairs"))
