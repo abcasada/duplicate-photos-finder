@@ -39,6 +39,7 @@ the drives it scans. Its index and reports live on the local disk under `~/.cach
 | Personal vs other media (`[categories]`, `--category`) | ✅ Done |
 | Mode 1b: EXIF (camera serial + shutter count): `dpf exif`, `find --mode 1b` | ✅ Built (2026-10-31); first real-data run pending |
 | Drive health (SMART) with history: `dpf smart`, Drives section/sheet, `dpf drives` | ✅ Built (2026-10-31) |
+| Photo and video database (`dpf exif` metadata, `media` view in the index) | ✅ Built (2026-11-01); real-data run pending |
 | Mode 2: content (exact / visual) | 📋 Planned |
 | Mode 3: mode 1 then mode 2 | 📋 Planned |
 
@@ -639,8 +640,9 @@ view, so the frames of such a burst share serial, count and second:
   shutter count (Sony numbers wrap every 10,000 shots, and there are two A7R IV bodies)
   is not a match.
 - **Files without an identity** (phones, GoPro, most edits, silent-shutter frames, or no
-  EXIF read yet) match by mode 1 rules, and so do **videos**: `dpf exif` does not read
-  them at all. The report says how many photos have no EXIF cached yet.
+  EXIF read yet) match by mode 1 rules, and so do **videos**: `dpf exif` reads their
+  metadata for the database (below), but a video never gets a shot identity. The report
+  says how many photos have no EXIF cached yet.
 
 Backup coverage, the Drives summary (only copy, name match) and the dumps check all use
 the same rule in mode 1b.
@@ -662,19 +664,102 @@ remount it read-only (see README, "Reading a drive from a read-only mount")
 The other drives are still read; the summary counts the skipped ones, and the exit
 status is 1 only when every drive asked for was skipped. A single file refused later
 is skipped and counted, never opened without `O_NOATIME`. There is no override. It
-copies the first 512 kB to
-`/dev/shm` and exiftool parses only that copy, never the original. A TIFF-based file
-(DNG, ARW, PEF, NEF, CR2, TIF, …) whose directories lie further on (Lightroom writes a
-re-saved DNG's IFD0 at the end) gets a sparse copy instead: the head plus each
-directory and the tag data dpf needs, read where they lie (the last 1 MB in one go when
-IFD0 is there), at their own offsets in a file of the original's size. When a tag is
-still missing, it copies the first 16 MB, then (for missing camera tags, not just a
-missing pixel size) the whole file up to 256 MB; a larger file is cached without
-identity ("too large"). The summary counts the files that needed each step. Read errors from a failing or unplugged drive (I/O
-error, device gone) and exiftool runs that hang (60 s watchdog) or crash are counted
+copies the first 512 kB to `/dev/shm` and exiftool parses only that copy, never the
+original. A larger file gets a sparse copy instead, of the original's size, with what
+lies further on read where it lies:
+- a TIFF-based photo (DNG, ARW, PEF, NEF, CR2, TIF, …) whose directories lie further on
+  (Lightroom writes a re-saved DNG's IFD0 at the end): each directory and the tag data
+  dpf needs (the XMP and IPTC blocks too), the last 1 MB in one go when IFD0 is there;
+- an MP4/MOV/3GP (and HEIC, CR3): every top-level box except the media data, wherever
+  it lies; camera clips usually keep their `moov` box at the end. A box over 64 MB is
+  left out;
+- any other video (MTS, AVI, MKV, …): its last 1 MB.
+
+When a photo's camera tag is still missing, dpf copies the first 16 MB, then (for
+missing camera tags, not just a missing pixel size) the whole file up to 256 MB; a
+larger file is cached without identity ("too large"). Videos never take those steps.
+The summary counts the files that needed each step. Read errors from a failing or
+unplugged drive (I/O error, device gone) and exiftool runs that hang (60 s watchdog) or crash are counted
 and not cached, so a rerun tries those files again. Leftover temp folders of a run that
 died are removed at the next start. exiftool must be installed (`apt install
 libimage-exiftool-perl`).
+
+### Photo and video database
+
+Besides the camera shot identity, `dpf exif` keeps the generally useful metadata of
+**every photo and video** in the index (`~/.cache/dpf/index.db`), so the archive can be
+queried with SQL:
+
+```sh
+dpf exif --pool A                 # photos and videos of the connected drives of pool A
+dpf exif --photos-only --pool B   # skip videos
+python3 -m sqlite3 ~/.cache/dpf/index.db     # or any SQLite browser; works while unplugged
+```
+
+Each run reads only files without an up-to-date reading, so after the first pass it
+handles new and changed files only. Photos read by an earlier dpf (before 2026-11-01,
+which kept only the shot identity) are read once more for the new fields; their cached
+shot identity is kept as it is, and the summary says how many would now get another
+key.
+
+**The `media` view** has one row per indexed photo/video (NULL columns where nothing
+valid is cached yet, or the file changed since it was read):
+
+| Column | What |
+|---|---|
+| `path`, `dir`, `name`, `root` (the scanned drive), `size`, `mtime` (local time), `kind` (image/video) | From the scan |
+| `exif_status` | ok (has a shot identity), none, error, or NULL (not read) |
+| `taken`, `taken_offset` | DateTimeOriginal as `YYYY-MM-DD HH:MM:SS` (camera clock) and its UTC offset when the camera wrote one; else CreateDate. Videos: their creation time in this computer's time zone, with the offset (`2023-08-26 10:16:18-05:00`) |
+| `make`, `model`, `serial`, `shutter_count` | The camera (videos: also Android and Sony XML tags) |
+| `lens`, `focal_length`, `focal_length_35mm`, `aperture`, `exposure` (seconds), `iso` | Lens and exposure |
+| `width`, `height`, `orientation`, `duration` (seconds), `fps`, `codec` | Image and video |
+| `gps_lat`, `gps_lon`, `gps_alt` | Signed decimal degrees and metres (0,0 counts as none) |
+| `rating`, `label`, `keywords` (JSON list), `software`, `title`, `description`, `artist`, `copyright` | Editing (XMP rating before EXIF rating; keywords from XMP, IPTC and Windows tags) |
+| `preserved_name`, `document_id`, `original_document_id` | Lineage: Lightroom keeps the original file name in `preserved_name` |
+| `modified`, `shot` | ModifyDate; the mode 1b shot key |
+| `meta` | JSON of every tag read (exiftool names, `-n` values), e.g. `meta ->> '$.WhiteBalance'` |
+
+Copies on several drives are separate rows: count `DISTINCT coalesce(shot, name || size)`
+for a rough "unique photos" figure. Some examples:
+
+```sql
+-- Photos per camera per year
+SELECT substr(taken, 1, 4) AS year, make, model, count(*) AS photos
+FROM media WHERE kind = 'image' AND taken IS NOT NULL
+GROUP BY year, make, model ORDER BY year, photos DESC;
+
+-- Photos with GPS, oldest first
+SELECT path, taken, gps_lat, gps_lon FROM media
+WHERE kind = 'image' AND gps_lat IS NOT NULL ORDER BY taken;
+
+-- Edited in Lightroom, with the original file name where Lightroom kept it
+SELECT path, software, preserved_name FROM media
+WHERE software LIKE '%Lightroom%' OR meta ->> '$.CreatorTool' LIKE '%Lightroom%';
+
+-- Photos by lens
+SELECT lens, count(*) AS photos FROM media
+WHERE kind = 'image' AND lens IS NOT NULL GROUP BY lens ORDER BY photos DESC;
+
+-- Most used keywords
+SELECT k.value AS keyword, count(*) AS files FROM media, json_each(media.keywords) AS k
+GROUP BY keyword ORDER BY files DESC LIMIT 50;
+
+-- The longest videos
+SELECT path, round(duration / 60, 1) AS minutes, codec, width, height FROM media
+WHERE kind = 'video' ORDER BY duration DESC LIMIT 20;
+```
+
+What is read (exiftool tag names): dates (CreateDate, ModifyDate, OffsetTime*,
+SubSecTime*, GPSDateTime; videos also CreationDate, MediaCreateDate), GPS, lens
+(LensModel, LensID, LensInfo, LensMake), exposure (FocalLength, FNumber, ExposureTime,
+ISO, ExposureProgram, ExposureCompensation, MeteringMode, Flash, WhiteBalance), image
+(Orientation, ColorSpace, BitsPerSample, Compression), editing (Software, CreatorTool,
+Rating, Label, Subject, Keywords, HierarchicalSubject, Title, Description, Artist,
+Creator, Copyright, …), lineage (ImageUniqueID, DocumentID, OriginalDocumentID,
+InstanceID, PreservedFileName, Apple ContentIdentifier) and, for videos, Duration, frame
+rate, codecs, audio, bitrate, Rotation and Android/Sony camera tags. The exact list is
+`META_TAGS` and `VIDEO_TAGS` in `src/dpf/exif.py`. GoPro and Sony timed GPS tracks (in
+the video data) are not read.
 
 ### Reading a drive from a read-only mount
 

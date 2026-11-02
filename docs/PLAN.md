@@ -237,3 +237,13 @@ only verify the mode 1 candidates (fast), or do a full content scan?
   zeros and tmpfs stores only what was written. Pointers inside MakerNotes are not
   followed; such files fall back to the 16 MB / whole-file steps, which `dpf exif`
   counts.
+- **2026-11-01: photo and video database.** `dpf exif` also caches ~70 general tags
+  (photos) and ~25 more for videos in `exif_meta` (schema v9) with a `media` view; see
+  CLAUDE.md "Current status". Design choices: a separate table (wide rows in `exif` made
+  the 1b queries 8-10x slower); identity tags and photo exiftool args unchanged, and old
+  rows refreshed without touching their shot key; explicit tag names (requesting all
+  tags would be cheaper per file in exiftool but returns hundreds of MakerNote tags), with
+  video-only tags left out for photos (each requested tag costs ~0.04 ms per file); a
+  small `-config` adds LensID as text and XMP/EXIF Rating apart; videos get a sparse copy
+  of every ISO BMFF box but media data (moov usually at the end), other videos head +
+  last 1 MB, and never a whole-file read.
