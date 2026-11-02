@@ -1,6 +1,11 @@
-"""EXIF for mode 1b: read camera identity tags with exiftool and cache them in the index.
+"""Photo and video metadata (`dpf exif`): read with exiftool and cached in the index.
 
-What is read, per photo (exiftool tag names, `-n` values):
+Two things are kept per photo/video: the camera shot identity of mode 1b (the `exif`
+table, below) and the wider metadata of the photo database (the `exif_meta` table: dates,
+GPS, lens and exposure, ratings and keywords, editing software, lineage ids, video
+duration and codecs; META_TAGS, meta_values; README "Photo and video database").
+
+What the identity is read from, per photo (exiftool tag names, `-n` values):
 - Make, Model; the body serial: Sony `InternalSerialNumber` (MakerNotes; with -n six
   decimal bytes, kept as hex), any other make `SerialNumber` (Pentax MakerNotes or EXIF
   BodySerialNumber). Sony's own `SerialNumber` is never used, so the two cannot mix.
@@ -10,7 +15,8 @@ What is read, per photo (exiftool tag names, `-n` values):
   (1 = electronic) and `LiveView` (1 = on). The shutter count does not advance for those
   (Sony: silent shooting; Pentax: live view), so a burst shares one count: such files
   get no identity.
-Videos are not read: they have no shot identity and follow the mode 1 rules.
+Videos are read for the database only: they never get a shot identity and follow the
+mode 1 rules.
 
 A file's shot identity (`ident`) is (make, model, serial, shutter count, capture time),
 and its `shot` key adds the format family (ARW, DNG, JPG, …) and the pixel size, so RAW+
@@ -23,9 +29,12 @@ disk (/dev/shm when available); a pool of `exiftool -stay_open` processes parses
 copies. A TIFF-based file (DNG, ARW, PEF, NEF, CR2, TIF, …) may keep its directories
 past the head (Lightroom re-saved DNGs put IFD0 at the end): its IFDs and the tag data
 dpf needs are found by following the TIFF offsets (walk_tiff) and read into a sparse copy
-of the file's true size, so the offsets stay right and the holes read as zeros. When a
-copy still lacks tags its format should carry, a BIG_HEAD copy is parsed, then (for
-missing tags, not just a missing pixel size) the whole file up to MAX_WHOLE bytes.
+of the file's true size, so the offsets stay right and the holes read as zeros. An ISO
+BMFF / QuickTime file (MP4, MOV, HEIC, CR3, …) gets every top-level box except the media
+data (moov, meta, uuid, …; walk_bmff) wherever it lies, usually moov at the end; any
+other video gets its head and its last TAIL bytes. When a photo's copy still lacks tags
+its format should carry, a BIG_HEAD copy is parsed, then (for missing tags, not just a
+missing pixel size) the whole file up to MAX_WHOLE bytes. Videos never take those steps.
 
 The drives are only read, and their access times never change (hard rule 7, dpf.safety):
 a drive whose files cannot be opened with O_NOATIME (and is not mounted `ro` or `noatime`)
@@ -38,6 +47,7 @@ from __future__ import annotations
 import errno
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -51,7 +61,8 @@ import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 
-from dpf.index import Index
+from dpf.index import META_VERSION, Index
+from dpf.media import VIDEO, classify
 from dpf.safety import NoAtimeDenied, ReadCheck, check_root, open_read
 
 HEAD_BYTES = 512 * 1024
@@ -81,7 +92,47 @@ TAGS = (
     "DateTimeOriginal", "OffsetTimeOriginal", "SubSecTimeOriginal", "ImageWidth",
     "ImageHeight", "Shutter", "ShutterType", "LiveView", "Error", "Warning",
 )  # fmt: skip
-ARGS = ("-json", "-n", "-fast", "-charset", "filename=utf8", *(f"-{t}" for t in TAGS))
+# The database fields, by exiftool tag name (group-insensitive: exiftool's own pick among
+# same-named tags). Dpf* are composites of exiftool.config: LensID as text, and the XMP
+# and EXIF Rating apart. Device* are the tags exiftool makes of Sony's XML (NRT) metadata.
+# Each requested tag costs exiftool about 0.04 ms per file, so photos skip VIDEO_TAGS.
+META_TAGS = (
+    # time
+    "CreateDate", "ModifyDate", "OffsetTime", "OffsetTimeDigitized", "SubSecTime",
+    "SubSecTimeDigitized", "DateCreated", "GPSDateTime",
+    # place
+    "GPSLatitude", "GPSLongitude", "GPSAltitude", "GPSAltitudeRef",
+    # camera and lens
+    "LensModel", "DpfLens", "Lens", "LensInfo", "LensMake", "LensSerialNumber",
+    "FocalLength", "FocalLengthIn35mmFormat", "FNumber", "ExposureTime", "ISO",
+    "ExposureProgram", "ExposureCompensation", "MeteringMode", "Flash", "WhiteBalance",
+    # image
+    "Orientation", "ColorSpace", "BitsPerSample", "Compression",
+    # editing
+    "Software", "CreatorTool", "Rating", "DpfXMPRating", "DpfEXIFRating", "Label",
+    "Subject", "Keywords", "XPKeywords", "HierarchicalSubject", "Title", "ObjectName",
+    "XPTitle", "Description", "ImageDescription", "Caption-Abstract", "XPComment",
+    "Artist", "Creator", "By-line", "Copyright", "Rights", "CopyrightNotice",
+    # identity and lineage
+    "ImageUniqueID", "DocumentID", "OriginalDocumentID", "InstanceID",
+    "DerivedFromDocumentID", "PreservedFileName", "ContentIdentifier",
+)  # fmt: skip
+VIDEO_TAGS = (
+    "CreationDate", "MediaCreateDate", "TrackCreateDate", "GPSCoordinates", "Duration",
+    "VideoFrameRate", "FrameRate", "CompressorID", "CompressorName", "VideoCodec",
+    "VideoStreamType", "AudioFormat", "AudioCodec", "AudioChannels", "AudioSampleRate",
+    "AvgBitrate", "Rotation", "MajorBrand", "AndroidMake", "AndroidModel", "AndroidVersion",
+    "AndroidCaptureFPS", "DeviceManufacturer", "DeviceModelName", "DeviceSerialNo",
+)  # fmt: skip
+_COMMON = ("-json", "-n", "-charset", "filename=utf8")
+# Photos: -fast, as for the identity since mode 1b began (no scan for JPEG trailers).
+ARGS = ("-fast", *_COMMON, *(f"-{t}" for t in TAGS + META_TAGS))
+# Videos: QuickTime times are UTC (shown in local time with its offset); no -fast, so
+# exiftool reads an M2TS file's end for the duration (the copy holds it).
+VIDEO_ARGS = (
+    "-api", "QuickTimeUTC=1", *_COMMON, *(f"-{t}" for t in TAGS + META_TAGS + VIDEO_TAGS)
+)  # fmt: skip
+CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "exiftool.config")
 
 RAW_FORMATS = frozenset(
     {
@@ -102,19 +153,31 @@ TRANSIENT_ERRNOS = frozenset(
 )
 
 # TIFF: bytes per value of each field type; IFD pointer tags (SubIFDs, ExifIFD, GPS,
-# Interop); tags whose out-of-line data dpf needs (Make, Model, Software, dates and
-# their offsets/sub-seconds, BodySerialNumber, MakerNote, DNGPrivateData, UniqueCameraModel).
+# Interop); tags whose out-of-line data dpf needs whatever its size (Make, Model, Software,
+# dates and their offsets/sub-seconds, BodySerialNumber, MakerNote, DNGPrivateData,
+# UniqueCameraModel, ImageDescription, Artist, Copyright, XMP, IPTC, Photoshop, ImageUniqueID,
+# the Lens tags, Windows XP tags); smaller data (rationals, GPS) is read up to SMALL_DATA.
 _TIFF_TYPES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
 _TIFF_MAGIC = frozenset({42, 0x55, 0x4F52, 0x5352})  # TIFF, Panasonic RW2, Olympus ORF
 _IFD_POINTERS = frozenset({0x014A, 0x8769, 0x8825, 0xA005})
 _DATA_TAGS = frozenset(
     {0x010F, 0x0110, 0x0131, 0x0132, 0x9003, 0x9004, 0x9010, 0x9011, 0x9012, 0x9290, 0x9291,
-     0x9292, 0xA431, 0x927C, 0xC634, 0xC614}
+     0x9292, 0xA431, 0x927C, 0xC634, 0xC614, 0x010E, 0x013B, 0x8298, 0x02BC, 0x83BB, 0x8649,
+     0xA420, 0xA432, 0xA433, 0xA434, 0xA435, 0x9C9B, 0x9C9C, 0x9C9D, 0x9C9E, 0x9C9F}
 )  # fmt: skip
+SMALL_DATA = 256
+
+# ISO BMFF / QuickTime: box types that may start a file, and the top-level boxes never
+# copied (media data, padding). MAX_BOX caps one box (and all boxes of one file together).
+_BOX_START = frozenset({b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip", b"pnot"})
+_BOX_SKIP = frozenset({b"mdat", b"free", b"skip", b"wide"})
+MAX_BOX = 64 * 1024 * 1024
+MAX_BOXES = 64
 
 # Copy steps a file may need (counted per run): a sparse copy with TIFF structures past the
-# head, a BIG_HEAD copy, the whole file.
-SPARSE, BIG, WHOLE = "sparse", "big", "whole"
+# head, one with boxes past the head (moov at the end), one with the file's tail (other
+# videos), a BIG_HEAD copy, the whole file.
+SPARSE, BOXES, TAIL_STEP, BIG, WHOLE = "sparse", "boxes", "tail", "big", "whole"
 
 # What a read of a head copy still lacks (needs_more).
 MORE_TAGS = "tags"  # identity tags: worth a bigger head, then the whole file
@@ -155,8 +218,41 @@ def _int(value: object) -> int | None:
 
 
 def _date(value: object) -> str | None:
-    text = _text(value)
+    text = _str(value)
     return None if text is None or text.startswith(_NO_DATE) else text
+
+
+def _str(value: object) -> str | None:
+    """Text of a tag value; a list (XMP bag, repeated IPTC) joined with "; "."""
+    if isinstance(value, list):
+        return "; ".join(t for v in value if (t := _text(v))) or None
+    return _text(value)
+
+
+def _float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value.strip())
+        except ValueError:
+            return None
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return float(value)
+    return None
+
+
+def _positive(value: object) -> float | None:
+    number = _float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _first(meta: dict, tags: Sequence[str], conv: Callable[[object], object] = _str):
+    for tag in tags:
+        value = conv(meta.get(tag))
+        if value is not None:
+            return value
+    return None
 
 
 def _norm(text: str) -> str:
@@ -216,15 +312,17 @@ class ExifData:
     shutter_mode: str | None = None  # MECHANICAL, ELECTRONIC or None (not recorded)
     note: str | None = None  # exiftool's error or warning, or TOO_LARGE
     error: bool = False
+    video: bool = False  # videos never have a shot identity
+    meta: dict | None = field(default=None, compare=False, repr=False)  # every tag found
 
     @property
     def ident(self) -> str | None:
         """make|model|serial|shutter count|capture time, normalised; None without one.
 
-        None also when the shutter count is unreliable (ELECTRONIC) or the file was too
-        large to read in full.
+        None also when the shutter count is unreliable (ELECTRONIC), the file was too
+        large to read in full, or it is a video.
         """
-        if self.error or self.shutter_mode == ELECTRONIC or self.note == TOO_LARGE:
+        if self.error or self.video or self.shutter_mode == ELECTRONIC or self.note == TOO_LARGE:
             return None
         if not (self.make and self.model and self.serial and self.shutter):
             return None
@@ -254,18 +352,27 @@ class ExifData:
 
 
 def parse_entry(entry: dict, name: str) -> ExifData:
-    """ExifData from one object of `exiftool -json -n` output for the file `name`."""
-    make = _text(entry.get("Make"))
+    """ExifData from one object of `exiftool -json -n` output for the file `name`.
+
+    A video's make, model and serial fall back to Android's and Sony's (XML) tags.
+    """
+    video = classify(name) == VIDEO
+    make, model = _text(entry.get("Make")), _text(entry.get("Model"))
+    if video:
+        make = make or _first(entry, ("AndroidMake", "DeviceManufacturer"))
+        model = model or _first(entry, ("AndroidModel", "DeviceModelName"))
     is_sony = bool(make) and make.casefold().startswith("sony")
-    serial = entry.get("InternalSerialNumber" if is_sony else "SerialNumber")
+    serial = _text(entry.get("InternalSerialNumber" if is_sony else "SerialNumber"))
+    if video:
+        serial = serial or _text(entry.get("DeviceSerialNo"))
     shutter = _int(entry.get("ShutterCount"))
     error = _text(entry.get("Error"))
     note = error or _text(entry.get("Warning"))
     return ExifData(
         fmt=fmt_of(name),
         make=make,
-        model=_text(entry.get("Model")),
-        serial=_text(serial),
+        model=model,
+        serial=serial,
         shutter=shutter if shutter and shutter > 0 else None,
         taken=_date(entry.get("DateTimeOriginal")),
         taken_offset=_text(entry.get("OffsetTimeOriginal")),
@@ -275,6 +382,8 @@ def parse_entry(entry: dict, name: str) -> ExifData:
         shutter_mode=_shutter_mode(entry, make),
         note=note[:200] if note else None,
         error=error is not None,
+        video=video,
+        meta={k: v for k, v in entry.items() if k != "SourceFile"},
     )
 
 
@@ -284,7 +393,10 @@ def needs_more(data: ExifData) -> str | None:
     MORE_SIZE: an identity without a pixel size. MORE_TAGS: no Make or a parse error
     (unless JPEG/PNG/GIF/BMP, whose metadata always comes first), or no identity from a
     make that records serial and shutter count (unless its shutter mode explains it).
+    Never for a video: its copy already holds every box but the media data.
     """
+    if data.video:
+        return None
     if data.ident and not (data.width and data.height):
         return MORE_SIZE
     if data.fmt in _HEAD_ENOUGH:
@@ -308,7 +420,92 @@ def row_values(
 
 
 def error_data(name: str, message: str) -> ExifData:
-    return ExifData(fmt=fmt_of(name), note=message[:200], error=True)
+    return ExifData(fmt=fmt_of(name), note=message[:200], error=True,
+                    video=classify(name) == VIDEO)  # fmt: skip
+
+
+def _keywords(meta: dict) -> list[str]:
+    """XMP Subject, IPTC Keywords and Windows XPKeywords (";"-separated), each once."""
+    found: dict[str, None] = {}
+    for tag in ("Subject", "Keywords", "XPKeywords"):
+        value = meta.get(tag)
+        for item in value if isinstance(value, list) else [value]:
+            text = _text(item)
+            parts = text.split(";") if text and tag == "XPKeywords" else [text]
+            for part in parts:
+                if part and part.strip():
+                    found.setdefault(part.strip(), None)
+    return list(found)
+
+
+def _gps(meta: dict) -> tuple[float | None, float | None, float | None]:
+    """(latitude, longitude, altitude) as signed decimals; (0, 0) counts as no position."""
+    lat, lon = _float(meta.get("GPSLatitude")), _float(meta.get("GPSLongitude"))
+    alt = _float(meta.get("GPSAltitude"))
+    coords = _text(meta.get("GPSCoordinates"))  # QuickTime: "lat lon [alt]"
+    if (lat is None or lon is None) and coords:
+        values = [v for p in coords.replace(",", " ").split()[:3] if (v := _float(p)) is not None]
+        if len(values) >= 2:
+            lat, lon = values[0], values[1]
+            alt = values[2] if alt is None and len(values) == 3 else alt
+    if alt is not None and alt > 0 and _int(meta.get("GPSAltitudeRef")) == 1:
+        alt = -alt  # below sea level
+    if lat is None or lon is None or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        lat = lon = None
+    elif lat == 0 and lon == 0:
+        lat = lon = None
+    return lat, lon, alt
+
+
+def meta_values(data: ExifData) -> dict[str, object]:
+    """The typed exif_meta columns of `data` (index.META_COLUMNS from "created" to
+    "original_document_id"), taken from its tags."""
+    m = data.meta or {}
+    lat, lon, alt = _gps(m)
+    keywords = _keywords(m)
+    created = ("CreationDate", "CreateDate", "MediaCreateDate") if data.video else (
+        "CreateDate", "DateCreated")  # fmt: skip
+    iso = _positive(m.get("ISO"))
+    return {
+        "created": _first(m, created, _date),
+        "modified": _first(m, ("ModifyDate",), _date),
+        "gps_lat": lat,
+        "gps_lon": lon,
+        "gps_alt": alt,
+        "lens": _first(m, ("LensModel", "DpfLens", "Lens")),
+        "focal": _positive(m.get("FocalLength")),
+        "focal35": _positive(m.get("FocalLengthIn35mmFormat")),
+        "fnumber": _positive(m.get("FNumber")),
+        "exposure": _positive(m.get("ExposureTime")),
+        "iso": round(iso) if iso is not None else None,
+        "orientation": _int(m.get("Orientation")),
+        "duration": _positive(m.get("Duration")),
+        "fps": _first(m, ("VideoFrameRate", "FrameRate"), _positive),
+        "codec": _first(m, ("CompressorID", "VideoCodec", "CompressorName")),
+        "rating": _first(m, ("DpfXMPRating", "Rating"), _float),
+        "label": _str(m.get("Label")),
+        "keywords": json.dumps(keywords, ensure_ascii=False) if keywords else None,
+        "software": _first(m, ("Software", "CreatorTool")),
+        "title": _first(m, ("Title", "ObjectName", "XPTitle")),
+        "description": _first(
+            m, ("Description", "ImageDescription", "Caption-Abstract", "XPComment")
+        ),
+        "artist": _first(m, ("Artist", "Creator", "By-line")),
+        "copyright": _first(m, ("Copyright", "Rights", "CopyrightNotice")),
+        "preserved_name": _str(m.get("PreservedFileName")),
+        "document_id": _str(m.get("DocumentID")),
+        "original_document_id": _str(m.get("OriginalDocumentID")),
+    }
+
+
+def meta_row(
+    dir: str, name: str, size: int, mtime: float, data: ExifData, read_at: float
+) -> tuple:
+    """Values for Index.put_exif's `metas`, in index.META_COLUMNS order."""
+    meta = data.meta if data.meta is not None else (
+        {"Error": data.note} if data.error and data.note else {})  # fmt: skip
+    blob = json.dumps(meta, ensure_ascii=False, separators=(",", ":"))
+    return (dir, name, size, mtime, META_VERSION, *meta_values(data).values(), blob, read_at)
 
 
 class ExifTool:
@@ -317,7 +514,7 @@ class ExifTool:
     def __init__(self, exe: str = "exiftool", timeout: float = TIMEOUT) -> None:
         try:
             self.proc = subprocess.Popen(
-                [exe, "-stay_open", "True", "-@", "-"],
+                [exe, "-config", CONFIG, "-stay_open", "True", "-@", "-"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )  # fmt: skip
         except FileNotFoundError:
@@ -325,14 +522,15 @@ class ExifTool:
         self.timeout = timeout
         self.count = itertools.count(1)
 
-    def read(self, paths: Sequence[str]) -> dict[str, dict]:
-        """exiftool's JSON object per path read (paths it could not open are absent).
+    def read(self, paths: Sequence[str], args: Sequence[str] = ARGS) -> dict[str, dict]:
+        """exiftool's JSON object per path read (paths it could not open are absent), with
+        the options and tags `args` (ARGS for photos, VIDEO_ARGS for videos).
 
         Raises ExifToolTimeout (after killing the process) when exiftool takes longer
         than `timeout`, and OSError when it stops.
         """
         n = next(self.count)
-        lines = [*ARGS, *paths, f"-execute{n}"]
+        lines = [*args, *paths, f"-execute{n}"]
         data = b"".join(os.fsencode(line) + b"\n" for line in lines)
         assert self.proc.stdin is not None and self.proc.stdout is not None
         self.proc.stdin.write(data)
@@ -390,11 +588,15 @@ class _Job:
     size: int  # as found when the file was opened (fstat)
     mtime: float
     plain_ok: bool = False  # on a ro/noatime mount: a plain open is fine (safety.open_read)
+    video: bool = False
+    refresh: bool = False  # only exif_meta is out of date: the exif row (identity) is kept
+    cached_shot: str | None = None  # the kept row's shot key (refresh)
+    indexed: tuple[int, float] = (0, 0.0)  # size and mtime in the index
     head: str | None = None  # temp copy of the first bytes
     whole: bool = False  # the copy holds the whole file
     error: str | None = None  # why it could not be read
     outcome: str = "row"  # "row" (cache it), "gone", "transient" or "noatime"
-    steps: list[str] = field(default_factory=list)  # SPARSE, BIG, WHOLE: the copies it took
+    steps: list[str] = field(default_factory=list)  # SPARSE, BOXES, …: the copies it took
 
     @property
     def path(self) -> str:
@@ -405,12 +607,20 @@ class _Job:
 class ExifRun:
     """What one `dpf exif` run did."""
 
-    todo: int = 0  # photos that needed reading
-    read: int = 0  # rows written
-    ok: int = 0  # with a shot key
-    none: int = 0
-    errors: int = 0  # cached as unparseable
+    todo: int = 0  # photos and videos that needed reading
+    todo_videos: int = 0
+    read: int = 0  # files whose metadata was cached (photos and videos)
+    videos: int = 0  # of those, videos
+    done_videos: int = 0  # videos handled (read, gone, not read)
+    refreshed: int = 0  # cached photos read again for the new metadata only (identity kept)
+    changed: int = 0  # of those, whose fresh read gives a shot key other than the kept one
+    ok: int = 0  # photos read in full with a shot key
+    none: int = 0  # photos read in full without one
+    errors: int = 0  # photos cached as unparseable
+    video_errors: int = 0  # videos cached as unparseable
     sparse: int = 0  # copies with TIFF structures read from past the head (walk_tiff)
+    boxes: int = 0  # copies with ISO BMFF boxes read from past the head (moov at the end)
+    tail: int = 0  # video copies with the file's tail (MTS, AVI, …)
     big: int = 0  # files read again with a BIG_HEAD copy
     whole: int = 0  # files read again in full
     too_large: int = 0  # needed in full but over MAX_WHOLE: cached without identity
@@ -426,6 +636,10 @@ class ExifRun:
     @property
     def done(self) -> int:
         return self.read + self.gone + self.transient + self.noatime
+
+    @property
+    def photos(self) -> int:
+        return self.read - self.videos
 
 
 Progress = Callable[[ExifRun], None]
@@ -454,7 +668,8 @@ def tiff_ifd0(head: bytes) -> tuple[str, int] | None:
 def walk_tiff(read: Callable[[int, int], bytes], size: int) -> int:
     """Follow the IFDs of a TIFF-based file of `size` bytes, reading through `read(offset,
     n)` every IFD (IFD0 and the next ones, SubIFDs, ExifIFD, GPS, Interop) and the
-    out-of-line data of the tags dpf needs (_DATA_TAGS: MakerNote, DNGPrivateData, …).
+    out-of-line data of the tags dpf needs (_DATA_TAGS: MakerNote, DNGPrivateData, XMP,
+    IPTC, …) and any other data of at most SMALL_DATA bytes (rationals, GPS, short text).
 
     Image data is never read. Returns the number of IFDs found (0: not TIFF).
     """
@@ -491,7 +706,7 @@ def walk_tiff(read: Callable[[int, int], bytes], size: int) -> int:
                     block = read(pointer, nbytes)
                     whole = len(block) // 4
                     todo += struct.unpack(f"{order}{whole}I", block[: whole * 4])
-            elif tag in _DATA_TAGS and 4 < nbytes <= SPARSE_BUDGET:
+            elif 4 < nbytes <= (SPARSE_BUDGET if tag in _DATA_TAGS else SMALL_DATA):
                 read(pointer, nbytes)
         (nxt,) = struct.unpack(order + "I", table[12 * n:12 * n + 4])
         if nxt:
@@ -499,12 +714,50 @@ def walk_tiff(read: Callable[[int, int], bytes], size: int) -> int:
     return len(seen)
 
 
+def is_bmff(head: bytes) -> bool:
+    """True for an ISO BMFF / QuickTime file (MP4, MOV, 3GP, HEIC, CR3, …) by its first box."""
+    return len(head) >= 8 and head[4:8] in _BOX_START
+
+
+def walk_bmff(read: Callable[[int, int], bytes], size: int) -> int:
+    """Follow the top-level boxes of an ISO BMFF / QuickTime file of `size` bytes, reading
+    through `read(offset, n)` each box header and the whole of every box except media data
+    and padding (moov, meta, uuid, udta, …, each up to MAX_BOX bytes; at most MAX_BOXES).
+
+    When the walk stops short of the end (a trailer, a truncated file, too many boxes),
+    the last WINDOW bytes are read too. Returns the number of boxes found.
+    """
+    off = boxes = 0
+    while off + 8 <= size and boxes < MAX_BOXES:
+        header = read(off, 16)
+        if len(header) < 8:
+            break
+        box, kind = struct.unpack(">I4s", header[:8])
+        start = 8
+        if box == 1:
+            if len(header) < 16:
+                break
+            (box,) = struct.unpack(">Q", header[8:16])
+            start = 16
+        elif box == 0:  # to the end of the file
+            box = size - off
+        if box < start or off + box > size:
+            break
+        boxes += 1
+        if kind not in _BOX_SKIP and box <= MAX_BOX:
+            read(off, box)
+        off += box
+    if off < size:
+        read(max(0, size - WINDOW), WINDOW)
+    return boxes
+
+
 class _Reader:
     """Serves reads from the head, or with pread in WINDOW-sized chunks it keeps (up to
-    SPARSE_BUDGET bytes past the head in all)."""
+    `budget` bytes past the head in all)."""
 
-    def __init__(self, fd: int, head: bytes, size: int) -> None:
-        self.fd, self.head, self.size = fd, head, size
+    def __init__(self, fd: int, head: bytes, size: int, budget: int = SPARSE_BUDGET) -> None:
+        self.fd, self.head, self.size, self.budget = fd, head, size, budget
         self.chunks: dict[int, bytes] = {}
         self.extra = 0
 
@@ -518,9 +771,9 @@ class _Reader:
             if start <= offset and offset + n <= start + len(data):
                 return data[offset - start:offset - start + n]
         want = min(max(n, WINDOW), self.size - offset)
-        if self.extra + want > SPARSE_BUDGET:
+        if self.extra + want > self.budget:
             want = n
-            if self.extra + want > SPARSE_BUDGET:
+            if self.extra + want > self.budget:
                 return b""
         data = _pread(self.fd, want, offset)
         self.chunks[offset] = data
@@ -529,27 +782,41 @@ class _Reader:
 
 
 def copy_head(
-    path: str, dest: str, limit: int, plain_ok: bool = False
-) -> tuple[os.stat_result, int, int]:
+    path: str, dest: str, limit: int, plain_ok: bool = False, video: bool = False
+) -> tuple[os.stat_result, int, int, str | None]:
     """Copy `path` to `dest` for exiftool: (stat of the open file, bytes read, of which
-    past the first `limit`).
+    past the first `limit`, how those were found: SPARSE, BOXES, TAIL_STEP or None).
 
-    `dest` gets the first `limit` bytes. For a larger TIFF-based file it also gets the
-    TIFF structures that lie further on (walk_tiff; when IFD0 sits in the last TAIL bytes,
-    those are read in one go): then `dest` is a sparse file of the original's size, so
-    exiftool finds everything at its offset and reads zeros in the holes.
+    `dest` gets the first `limit` bytes. For a larger file it also gets, where they lie:
+    the TIFF structures of a TIFF-based file (walk_tiff; when IFD0 sits in the last TAIL
+    bytes, those are read in one go), the boxes of an ISO BMFF file but its media data
+    (walk_bmff), or the last TAIL bytes of any other video. Then `dest` is a sparse file
+    of the original's size, so exiftool finds everything at its offset and reads zeros in
+    the holes.
     """
+    how = None
     fd = open_read(path, plain_ok)
     try:
         st = os.fstat(fd)
+        size = st.st_size
         head = _pread(fd, limit, 0)
-        reader = _Reader(fd, head, st.st_size)
+        reader = _Reader(fd, head, size)
         header = tiff_ifd0(head)
-        if header is not None and len(head) < st.st_size:
+        if len(head) >= size:
+            pass
+        elif header is not None:
+            how = SPARSE
             ifd0 = header[1]
-            if ifd0 >= len(head) and ifd0 >= st.st_size - TAIL:
-                reader.read(max(len(head), st.st_size - TAIL), TAIL)
-            walk_tiff(reader.read, st.st_size)
+            if ifd0 >= len(head) and ifd0 >= size - TAIL:
+                reader.read(max(len(head), size - TAIL), TAIL)
+            walk_tiff(reader.read, size)
+        elif is_bmff(head):
+            how = BOXES
+            reader.budget = MAX_BOX
+            walk_bmff(reader.read, size)
+        elif video:
+            how = TAIL_STEP
+            reader.read(max(len(head), size - TAIL), TAIL)
     finally:
         os.close(fd)
     with open(dest, "wb") as out:
@@ -559,7 +826,7 @@ def copy_head(
             out.write(data)
         if reader.chunks:
             out.truncate(st.st_size)
-    return st, len(head) + reader.extra, reader.extra
+    return st, len(head) + reader.extra, reader.extra, how if reader.extra else None
 
 
 def _temp_base(db_path: str) -> str:
@@ -624,6 +891,7 @@ def read_exif(
     jobs: int | None = None,
     readers: int = READERS,
     retry_errors: bool = False,
+    photos_only: bool = False,
     progress: Progress | None = None,
     exe: str = "exiftool",
     head_bytes: int = HEAD_BYTES,
@@ -631,7 +899,8 @@ def read_exif(
     max_whole: int = MAX_WHOLE,
     timeout: float = TIMEOUT,
 ) -> ExifRun:
-    """Read EXIF for the indexed photos under `roots` lacking a valid cached row.
+    """Read the metadata of the indexed photos and videos (photos only with
+    `photos_only`) under `roots` lacking valid cached rows (Index.exif_todo).
 
     `roots` (drives or folders inside them) must be connected; the file list comes from
     the index, so only files of a previous scan are read. A root whose files cannot be
@@ -651,7 +920,7 @@ def read_exif(
         if _is_unusable_root(root):
             run.skipped_roots.append(root)
             continue
-        todo = index.exif_todo([root], retry_errors=retry_errors)
+        todo = index.exif_todo([root], retry_errors=retry_errors, photos_only=photos_only)
         if not todo:
             continue
         check = check_root(root, (os.path.join(t[0], t[1]) for t in todo))
@@ -660,6 +929,7 @@ def read_exif(
             continue
         by_dev.setdefault(os.stat(root).st_dev, []).extend((*t, check.plain_ok) for t in todo)
     run.todo = sum(len(t) for t in by_dev.values())
+    run.todo_videos = sum(t[4] == "video" for files in by_dev.values() for t in files)
     if not run.todo:
         run.elapsed = time.monotonic() - started
         return run
@@ -688,9 +958,11 @@ def read_exif(
             with lock:
                 if cursor[0] >= len(files):
                     return
-                dir, name, size, mtime, _, plain_ok = files[cursor[0]]
+                dir, name, size, mtime, kind, refresh, shot, plain_ok = files[cursor[0]]
                 cursor[0] += 1
-            job = _Job(dir, name, size, mtime, plain_ok)
+            job = _Job(
+                dir, name, size, mtime, plain_ok, kind == "video", refresh, shot, (size, mtime)
+            )
             reader_opts.copy(job, head_bytes)
             if not put(heads, job):
                 return
@@ -735,13 +1007,15 @@ def read_exif(
         for i in range(jobs)
     ]
     pending: list[tuple] = []
+    metas: list[tuple] = []
     last_commit = last_progress = time.monotonic()
 
     def commit() -> None:
         nonlocal last_commit
-        if pending:
-            index.put_exif(pending)
+        if pending or metas:
+            index.put_exif(pending, metas)
             pending.clear()
+            metas.clear()
         last_commit = time.monotonic()
 
     try:
@@ -763,9 +1037,9 @@ def read_exif(
             elif kind == "fail":
                 raise payload
             elif kind == "row":
-                _tally(run, pending, *payload)
+                _tally(run, pending, metas, *payload)
             now = time.monotonic()
-            if len(pending) >= COMMIT_ROWS or now - last_commit >= COMMIT_SECONDS:
+            if len(metas) >= COMMIT_ROWS or now - last_commit >= COMMIT_SECONDS:
                 commit()
             if progress and now - last_progress >= PROGRESS_SECONDS:
                 last_progress = now
@@ -794,24 +1068,34 @@ def read_exif(
     return run
 
 
-def _tally(run: ExifRun, pending: list[tuple], job: _Job, data: ExifData) -> None:
-    """Count one result, and queue its row when it is to be cached."""
-    run.sparse += SPARSE in job.steps
-    run.big += BIG in job.steps
-    run.whole += WHOLE in job.steps
-    if job.outcome == "gone":
-        run.gone += 1
+def _tally(
+    run: ExifRun, pending: list[tuple], metas: list[tuple], job: _Job, data: ExifData
+) -> None:
+    """Count one result, and queue its rows when they are to be cached.
+
+    A refresh writes the exif_meta row only, unless the file changed since its exif row
+    was read: then both rows are written anew.
+    """
+    for step in job.steps:
+        setattr(run, step, getattr(run, step) + 1)
+    if job.outcome in ("gone", "transient", "noatime"):
+        setattr(run, job.outcome, getattr(run, job.outcome) + 1)
+        run.done_videos += job.video
         return
-    if job.outcome == "transient":
-        run.transient += 1
-        return
-    if job.outcome == "noatime":
-        run.noatime += 1
-        return
-    pending.append(row_values(job.dir, job.name, job.size, job.mtime, data, time.time()))
+    now = time.time()
+    metas.append(meta_row(job.dir, job.name, job.size, job.mtime, data, now))
     run.read += 1
+    run.videos += job.video
+    run.done_videos += job.video
+    if job.refresh and (job.size, job.mtime) == job.indexed:
+        run.refreshed += 1
+        run.changed += data.shot is not None and data.shot != job.cached_shot
+        return
+    pending.append(row_values(job.dir, job.name, job.size, job.mtime, data, now))
     run.too_large += data.note == TOO_LARGE
-    if data.status == OK:
+    if job.video:
+        run.video_errors += data.error
+    elif data.status == OK:
         run.ok += 1
     elif data.status == NONE:
         run.none += 1
@@ -836,7 +1120,7 @@ class _Reading:
         ext = "".join(c for c in fmt_of(job.name) if c.isalnum())
         dest = os.path.join(self.tmp, f"{next(self.seq)}.{ext or 'bin'}")
         try:
-            st, got, extra = copy_head(job.path, dest, limit, job.plain_ok)
+            st, got, extra, how = copy_head(job.path, dest, limit, job.plain_ok, job.video)
         except NoAtimeDenied:
             job.outcome, job.error = "noatime", "O_NOATIME refused"
             return
@@ -852,8 +1136,8 @@ class _Reading:
         job.size, job.mtime = st.st_size, st.st_mtime
         job.whole = not extra and got >= st.st_size  # a sparse copy is never the whole file
         job.head = dest
-        if extra and not job.steps:
-            job.steps.append(SPARSE)
+        if how and not job.steps:
+            job.steps.append(how)
 
     def parse_batch(self, tool: ExifTool, batch: list[_Job], results: queue.Queue) -> ExifTool:
         """Parse one batch of head copies, reading bigger copies where needed; returns the
@@ -862,7 +1146,13 @@ class _Reading:
         for j in batch:
             if j.error is not None:
                 results.put(("row", (j, error_data(j.name, j.error))))
-        found, tool, lost = self._run(tool, [j.head for j in readable])
+        found: dict[str, dict] = {}
+        lost: set[str] = set()
+        for video, args in ((False, ARGS), (True, VIDEO_ARGS)):
+            heads = [j.head for j in readable if j.video == video]
+            more, tool, gone = self._run(tool, heads, args)
+            found.update(more)
+            lost |= gone
         for j in readable:
             head = j.head
             if head in lost:
@@ -878,7 +1168,12 @@ class _Reading:
         return tool
 
     def _more(self, tool: ExifTool, job: _Job, data: ExifData) -> tuple[ExifData, ExifTool]:
-        """Read a bigger head, then the whole file, while needs_more asks for it."""
+        """Read a bigger head, then the whole file, while needs_more asks for it.
+
+        A refresh (its identity is kept) only does so when the copy said nothing at all.
+        """
+        if job.refresh and data.make is not None and not data.error:
+            return data, tool
         steps = ((BIG, self.big_head, (MORE_TAGS, MORE_SIZE)), (WHOLE, None, (MORE_TAGS,)))
         for step, limit, wanted in steps:
             want = needs_more(data)
@@ -904,7 +1199,7 @@ class _Reading:
         return data, tool
 
     def _run(
-        self, tool: ExifTool, paths: list[str]
+        self, tool: ExifTool, paths: list[str], args: Sequence[str] = ARGS
     ) -> tuple[dict[str, dict], ExifTool, set[str]]:
         """(entries, tool, paths lost). When exiftool times out, stops or prints garbage,
         it is restarted and the batch retried one file at a time, so only a file that
@@ -912,7 +1207,7 @@ class _Reading:
         if not paths:
             return {}, tool, set()
         try:
-            return tool.read(paths), tool, set()
+            return tool.read(paths, args), tool, set()
         except (OSError, ValueError):
             tool.close()
             tool = ExifTool(self.exe, self.timeout)
@@ -921,7 +1216,7 @@ class _Reading:
         found: dict[str, dict] = {}
         lost: set[str] = set()
         for p in paths:
-            more, tool, gone = self._run(tool, [p])
+            more, tool, gone = self._run(tool, [p], args)
             found.update(more)
             lost |= gone
         return found, tool, lost

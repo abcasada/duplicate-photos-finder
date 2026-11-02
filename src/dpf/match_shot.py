@@ -69,7 +69,7 @@ class ShotStats:
     no_identity: int = 0  # cached, read without an identity
     errors: int = 0  # cached as unreadable
     no_exif: int = 0  # photos with no valid cached row: run `dpf exif`
-    videos: int = 0  # never read: mode 1 rules
+    videos: int = 0  # never a shot identity: mode 1 rules
     shot_groups: int = 0  # groups that rely on a shot match
     resaved_groups: int = 0  # of those, holding files of different sizes
     vetoed: int = 0  # name/size/date groups split because their shots differ

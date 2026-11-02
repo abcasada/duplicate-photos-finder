@@ -32,6 +32,7 @@ from dpf.exif import (
     needs_more,
     norm_serial,
     parse_entry,
+    meta_row,
     read_exif,
     row_values,
     walk_tiff,
@@ -172,18 +173,26 @@ def exif_row(f: FileRecord, entry: dict = SONY, size=None, mtime=None):
     return row_values(f.dir, f.name, size or f.size, mtime or f.mtime, data, 5.0)
 
 
+def meta_of(f: FileRecord, entry: dict = SONY, size=None, mtime=None):
+    data = parse_entry(entry, f.name)
+    return meta_row(f.dir, f.name, size or f.size, mtime or f.mtime, data, 5.0)
+
+
 class IndexCacheTest(unittest.TestCase):
     def setUp(self):
         self.idx = Index(":memory:")
         self.addCleanup(self.idx.close)
 
-    def test_todo_skips_valid_rows_and_videos(self):
+    def test_todo_skips_valid_rows(self):
         a, b, c = rec("/r", "a.ARW"), rec("/r", "b.ARW"), rec("/r", "c.ARW")
         video = rec("/r", "C0001.MP4", kind="video")
         self.idx.replace_root("/r", [a, b, c, video, rec("/r", "empty.jpg", 0)])
-        self.idx.put_exif([exif_row(a), exif_row(b, mtime=2.0)])  # b changed since
+        self.idx.put_exif([exif_row(a), exif_row(b, mtime=2.0)],  # b changed since
+                          [meta_of(a), meta_of(b, mtime=2.0)])  # fmt: skip
         todo = [r[1] for r in self.idx.exif_todo(["/r"])]
-        self.assertEqual(todo, ["b.ARW", "c.ARW"])  # never 0-byte files or videos
+        self.assertEqual(todo, ["C0001.MP4", "b.ARW", "c.ARW"])  # never 0-byte files
+        todo = [r[1] for r in self.idx.exif_todo(["/r"], photos_only=True)]
+        self.assertEqual(todo, ["b.ARW", "c.ARW"])
         status = self.idx.exif_status(["/r"])
         self.assertEqual(status, {"ok": 1, "unreliable": 0, "none": 0, "error": 0,
                                   "missing": 2, "video": 1})  # fmt: skip
@@ -191,7 +200,7 @@ class IndexCacheTest(unittest.TestCase):
     def test_retry_errors(self):
         a = rec("/r", "a.ARW")
         self.idx.replace_root("/r", [a])
-        self.idx.put_exif([exif_row(a, {"Error": "bad"})])
+        self.idx.put_exif([exif_row(a, {"Error": "bad"})], [meta_of(a, {"Error": "bad"})])
         self.assertEqual(self.idx.exif_todo(["/r"]), [])
         self.assertEqual(len(self.idx.exif_todo(["/r"], retry_errors=True)), 1)
 
@@ -303,9 +312,9 @@ class ExifToolTest(unittest.TestCase):
         seen: list[str] = []
         real = ExifTool.read
 
-        def read(tool, paths):
+        def read(tool, paths, args=exif.ARGS):
             seen.extend(paths)
-            return real(tool, paths)
+            return real(tool, paths, args)
 
         patcher = mock.patch.object(ExifTool, "read", read)
         patcher.start()
@@ -324,7 +333,8 @@ class ExifToolTest(unittest.TestCase):
             fh.write(b"\0" * 64)
         scan_roots(self.idx, [self.root])
         run = read_exif(self.idx, [self.root], jobs=2, readers=2, head_bytes=4096)
-        self.assertEqual((run.todo, run.read, run.errors, run.gone), (3, 3, 1, 0))  # no video
+        self.assertEqual((run.todo, run.read, run.errors, run.gone), (4, 4, 1, 0))
+        self.assertEqual((run.videos, run.video_errors), (1, 1))  # 64 zero bytes
         row = self.idx.exif_row(self.dir, "IMGQ0001.JPG")
         self.assertEqual(
             (row["make"], row["model"], row["serial"], row["taken"], row["width"], row["fmt"]),
@@ -332,7 +342,7 @@ class ExifToolTest(unittest.TestCase):
         )
         self.assertEqual(row["status"], NONE)  # no ShutterCount: no shot identity
         self.assertEqual(self.idx.exif_row(self.dir, "broken.jpg")["status"], ERROR)
-        self.assertIsNone(self.idx.exif_row(self.dir, "clip.mp4"))
+        self.assertEqual(self.idx.exif_row(self.dir, "clip.mp4")["status"], ERROR)
         self.assertEqual(read_exif(self.idx, [self.root]).todo, 0)  # cached: nothing to do
         self.assertEqual(sorted(os.listdir(self.dir)),
                          ["IMGQ0001.JPG", "broken.jpg", "clip.mp4", "plain.jpg"])  # fmt: skip
@@ -418,12 +428,13 @@ class ExifToolTest(unittest.TestCase):
 
 
 def tiff_at_end(pad: int, order: str = "<", make: str = "PENTAX",
-                taken: str = "2023:08:26 17:16:18") -> bytes:  # fmt: skip
+                taken: str = "2023:08:26 17:16:18", xmp: bytes = b"") -> bytes:  # fmt: skip
     """A TIFF whose IFD0, ExifIFD and tag data all follow `pad` zero bytes, as in a DNG
-    re-saved by Lightroom (IFD0 at the end of the file)."""
+    re-saved by Lightroom (IFD0 at the end of the file); `xmp`: an XMP packet (tag 700)."""
     model = "PENTAX K-1 Mark II"
     ifd0 = 8 + pad
-    exif_ifd = ifd0 + 2 + 12 * 5 + 4
+    entries = 6 if xmp else 5
+    exif_ifd = ifd0 + 2 + 12 * entries + 4
     data = exif_ifd + 2 + 12 * 1 + 4
     blob = b""
 
@@ -437,8 +448,11 @@ def tiff_at_end(pad: int, order: str = "<", make: str = "PENTAX",
     def short(tag: int, value: int) -> bytes:
         return struct.pack(order + "HHIHH", tag, 3, 1, value, 0)
 
-    first = struct.pack(order + "H", 5) + short(0x0100, 8) + short(0x0101, 8)
+    first = struct.pack(order + "H", entries) + short(0x0100, 8) + short(0x0101, 8)
     first += text(0x010F, make) + text(0x0110, model)
+    if xmp:
+        first += struct.pack(order + "HHII", 0x02BC, 1, len(xmp), data + len(blob))
+        blob += xmp
     first += struct.pack(order + "HHII", 0x8769, 4, 1, exif_ifd) + struct.pack(order + "I", 0)
     second = struct.pack(order + "H", 1) + text(0x9003, taken) + struct.pack(order + "I", 0)
     head = (b"II" if order == "<" else b"MM") + struct.pack(order + "HI", 42, ifd0)
@@ -476,7 +490,8 @@ class TiffWalkTest(unittest.TestCase):
             with open(src, "wb") as fh:
                 fh.write(data)
             dest = os.path.join(tmp, "copy.tif")
-            st, got, extra = copy_head(src, dest, 1024)
+            st, got, extra, how = copy_head(src, dest, 1024)
+            self.assertEqual(how, exif.SPARSE)
             self.assertEqual(st.st_size, len(data))
             self.assertEqual(os.path.getsize(dest), len(data))  # true size, holes inside
             self.assertLess(got, 2 * 1024 * 1024)  # not the whole file

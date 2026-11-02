@@ -21,6 +21,9 @@ dpf = "dpf.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+dpf = ["exiftool.config"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

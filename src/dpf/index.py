@@ -91,6 +91,50 @@ CREATE TABLE IF NOT EXISTS exif (
 ) WITHOUT ROWID;
 """
 
+# The wider metadata `dpf exif` keeps per photo/video (schema v9), apart from `exif` so the
+# narrow rows the mode 1b queries join stay small. Valid while read_size/read_mtime equal
+# the files row's; `version` is exif.META_VERSION of the build that wrote it (an older or
+# missing row is read again). `meta` is a JSON object of every requested tag found
+# (exiftool -n values); the typed columns are taken from it (exif.meta_values).
+_META_TABLE = """
+CREATE TABLE IF NOT EXISTS exif_meta (
+    dir            TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    read_size      INTEGER NOT NULL,
+    read_mtime     REAL NOT NULL,
+    version        INTEGER NOT NULL,
+    created        TEXT,
+    modified       TEXT,
+    gps_lat        REAL,
+    gps_lon        REAL,
+    gps_alt        REAL,
+    lens           TEXT,
+    focal          REAL,
+    focal35        REAL,
+    fnumber        REAL,
+    exposure       REAL,
+    iso            INTEGER,
+    orientation    INTEGER,
+    duration       REAL,
+    fps            REAL,
+    codec          TEXT,
+    rating         REAL,
+    label          TEXT,
+    keywords       TEXT,
+    software       TEXT,
+    title          TEXT,
+    description    TEXT,
+    artist         TEXT,
+    copyright      TEXT,
+    preserved_name TEXT,
+    document_id    TEXT,
+    original_document_id TEXT,
+    meta           TEXT NOT NULL,
+    read_at        REAL NOT NULL,
+    PRIMARY KEY (dir, name)
+);
+"""
+
 # One row per SMART reading of a physical drive (dpf smart, or imported); every reading is
 # kept, so reports can show a trend. JSON columns hold the smart-summary record parts.
 _SMART_TABLE = """
@@ -119,11 +163,83 @@ CREATE INDEX IF NOT EXISTS files_match_size ON files (match_key, size);
 CREATE INDEX IF NOT EXISTS exif_shot ON exif (shot);
 """
 
+# Exif dates "YYYY:MM:DD HH:MM:SS[.sss][+HH:MM]" as ISO text "YYYY-MM-DD HH:MM:SS…".
+_ISO_DATE = "CASE WHEN {0} GLOB '[0-9][0-9][0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' " \
+    "THEN replace(substr({0}, 1, 10), ':', '-') || substr({0}, 11) ELSE {0} END"
+
+# One row per indexed photo/video with its metadata where a valid cached row exists (NULL
+# columns otherwise). See README "Photo and video database".
+_VIEWS = f"""
+CREATE VIEW IF NOT EXISTS media AS
+SELECT
+    CASE WHEN f.dir = '/' THEN '/' || f.name ELSE f.dir || '/' || f.name END AS path,
+    f.dir AS dir,
+    f.name AS name,
+    (SELECT r.path FROM roots r
+      WHERE r.path = '/' OR f.dir = r.path OR (f.dir >= r.path || '/' AND f.dir < r.path || '0')
+      ORDER BY length(r.path) DESC LIMIT 1) AS root,
+    f.size AS size,
+    datetime(f.mtime, 'unixepoch', 'localtime') AS mtime,
+    f.kind AS kind,
+    e.status AS exif_status,
+    {_ISO_DATE.format("coalesce(e.taken, m.created)")} AS taken,
+    e.taken_offset AS taken_offset,
+    e.make AS make,
+    e.model AS model,
+    e.serial AS serial,
+    e.shutter AS shutter_count,
+    m.lens AS lens,
+    m.focal AS focal_length,
+    m.focal35 AS focal_length_35mm,
+    m.fnumber AS aperture,
+    m.exposure AS exposure,
+    m.iso AS iso,
+    e.width AS width,
+    e.height AS height,
+    m.orientation AS orientation,
+    m.duration AS duration,
+    m.fps AS fps,
+    m.codec AS codec,
+    m.gps_lat AS gps_lat,
+    m.gps_lon AS gps_lon,
+    m.gps_alt AS gps_alt,
+    m.rating AS rating,
+    m.label AS label,
+    m.keywords AS keywords,
+    m.software AS software,
+    m.title AS title,
+    m.description AS description,
+    m.artist AS artist,
+    m.copyright AS copyright,
+    m.preserved_name AS preserved_name,
+    m.document_id AS document_id,
+    m.original_document_id AS original_document_id,
+    {_ISO_DATE.format("m.modified")} AS modified,
+    e.shot AS shot,
+    m.meta AS meta
+FROM files f
+LEFT JOIN exif e
+    ON e.dir = f.dir AND e.name = f.name AND e.read_size = f.size AND e.read_mtime = f.mtime
+LEFT JOIN exif_meta m
+    ON m.dir = f.dir AND m.name = f.name AND m.read_size = f.size AND m.read_mtime = f.mtime
+WHERE f.kind IN ('image', 'video');
+"""
+
 EXIF_COLUMNS = (
     "dir", "name", "read_size", "read_mtime", "status", "make", "model", "serial", "shutter",
     "taken", "taken_offset", "taken_subsec", "width", "height", "shutter_mode", "fmt",
     "ident", "shot", "note", "read_at",
 )  # fmt: skip
+META_COLUMNS = (
+    "dir", "name", "read_size", "read_mtime", "version", "created", "modified", "gps_lat",
+    "gps_lon", "gps_alt", "lens", "focal", "focal35", "fnumber", "exposure", "iso",
+    "orientation", "duration", "fps", "codec", "rating", "label", "keywords", "software",
+    "title", "description", "artist", "copyright", "preserved_name", "document_id",
+    "original_document_id", "meta", "read_at",
+)  # fmt: skip
+# Bumped when `dpf exif` starts keeping more metadata: rows of older builds are read again
+# (identity columns kept; Index.exif_todo "refresh").
+META_VERSION = 1
 
 _VALID_EXIF = "e.read_size = files.size AND e.read_mtime = files.mtime"
 # A shot key the guard found unreliable (Index._shot_guard), for the exif row `e`.
@@ -157,11 +273,14 @@ _SPACE_COLUMNS = {
 #      (a cache of connected drives only; nothing else changes)
 #   8  smart table (dpf smart): every SMART reading per drive serial, created empty;
 #      nothing else changes. forget_root leaves it alone (readings are per physical drive)
+#   9  exif_meta table (the wider photo/video metadata of dpf exif) and the `media` view,
+#      created empty; existing exif rows are kept as they are and their files read again
+#      once for the new fields (META_VERSION), keeping their shot identity
 # Rule: schema changes migrate in place (ALTER TABLE, recompute derived columns) and
 # bump _VERSION. Never drop an inventory unless its data cannot be trusted: drives that
 # are not connected cannot be rescanned, so the index may be their only record.
 # Changing names.match_key also needs a version bump and a _refill_match_keys step.
-_VERSION = 8
+_VERSION = 9
 
 _BATCH = 10_000
 _KEY_CHUNK = 500  # keys per IN (...) query, well under SQLite's variable limit
@@ -266,9 +385,9 @@ class Index:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self._guarded = False  # temp.bad_shots is up to date (_shot_guard)
         try:
-            self.conn.executescript(_TABLES + _EXIF_TABLE + _SMART_TABLE)
+            self.conn.executescript(_TABLES + _EXIF_TABLE + _META_TABLE + _SMART_TABLE)
             self._migrate()
-            self.conn.executescript(_INDEXES)
+            self.conn.executescript(_INDEXES + _VIEWS)
         except BaseException:
             self.conn.close()
             raise
@@ -304,6 +423,7 @@ class Index:
                     self.conn.execute("DROP TABLE exif")
                     self.conn.execute(_EXIF_TABLE)
             # 8: the smart table is created by _SMART_TABLE (IF NOT EXISTS); nothing to convert.
+            # 9: exif_meta and the media view are created (IF NOT EXISTS); exif rows stay.
             if version < _VERSION:
                 self.conn.execute(f"PRAGMA user_version = {_VERSION}")
             self.conn.commit()
@@ -463,7 +583,8 @@ class Index:
         return self.root_stats(root) if updated else None
 
     def forget_root(self, root: str) -> int:
-        """Remove everything indexed at or under `root` (files, dirs, staging, exif, roots).
+        """Remove everything indexed at or under `root` (files, dirs, staging, exif and
+        exif_meta, roots).
 
         SMART readings stay: they belong to a physical drive, not a path. Only the index
         is touched. Returns the number of files removed.
@@ -473,7 +594,7 @@ class Index:
         self._guarded = False
         with self.conn:
             removed = self.conn.execute(f"DELETE FROM files WHERE {where}", params).rowcount
-            for table in ("dirs", "staging", "exif"):
+            for table in ("dirs", "staging", "exif", "exif_meta"):
                 self.conn.execute(f"DELETE FROM {table} WHERE {where}", params)
             self.conn.execute(
                 "DELETE FROM roots WHERE path = ? OR (path >= ? AND path < ?)",
@@ -732,30 +853,49 @@ class Index:
     # -- EXIF cache (dpf exif, mode 1b) ----------------------------------------------
 
     def exif_todo(
-        self, roots: Sequence[str], *, retry_errors: bool = False
-    ) -> list[tuple[str, str, int, float, str]]:
-        """(dir, name, size, mtime, kind) of the non-empty photos under `roots` that lack a
-        valid EXIF row (or whose row is an error, with `retry_errors`), in folder order.
+        self, roots: Sequence[str], *, retry_errors: bool = False, photos_only: bool = False
+    ) -> list[tuple[str, str, int, float, str, bool, str | None]]:
+        """(dir, name, size, mtime, kind, refresh, cached shot) of the non-empty photos and
+        videos (photos only with `photos_only`) under `roots` to read, in folder order.
 
-        Videos are never read: they have no shot identity and match by mode 1 rules.
+        A file is read when it lacks a valid exif row (or its row is an error, with
+        `retry_errors`), or a valid exif_meta row of META_VERSION. `refresh` is True when
+        only the latter: its exif row (identity, cached shot key) stays as it is.
         """
         where, params = _prefix_clause(roots)
-        stale = "e.status IS NULL OR NOT (" + _VALID_EXIF + ")"
+        full = "e.status IS NULL OR NOT (" + _VALID_EXIF + ")"
         if retry_errors:
-            stale += " OR e.status = 'error'"
-        return self.conn.execute(
-            f"SELECT dir, name, size, mtime, kind FROM files LEFT JOIN exif e USING (dir, name) "
-            f"WHERE {where} AND size > 0 AND kind = 'image' AND ({stale}) ORDER BY dir, name",
-            params,
-        ).fetchall()
+            full += " OR e.status = 'error'"
+        meta = (
+            "m.version IS NULL OR m.version < ? OR m.read_size != files.size "
+            "OR m.read_mtime != files.mtime"
+        )
+        kinds = "'image'" if photos_only else "'image', 'video'"
+        rows = self.conn.execute(
+            f"SELECT dir, name, size, mtime, kind, NOT ({full}), e.shot "
+            f"FROM files LEFT JOIN exif e USING (dir, name) "
+            f"LEFT JOIN exif_meta m USING (dir, name) "
+            f"WHERE {where} AND size > 0 AND kind IN ({kinds}) AND ({full} OR {meta}) "
+            f"ORDER BY dir, name",
+            [*params, META_VERSION],
+        )
+        return [(d, n, size, mtime, kind, bool(refresh), shot if refresh else None)
+                for d, n, size, mtime, kind, refresh, shot in rows]  # fmt: skip
 
-    def put_exif(self, rows: Iterable[Sequence]) -> None:
-        """Insert or replace EXIF rows (values in EXIF_COLUMNS order), in one transaction."""
+    def put_exif(self, rows: Iterable[Sequence], metas: Iterable[Sequence] = ()) -> None:
+        """Insert or replace exif rows (values in EXIF_COLUMNS order) and exif_meta rows
+        (META_COLUMNS order), in one transaction."""
         marks = ", ".join("?" * len(EXIF_COLUMNS))
+        meta_marks = ", ".join("?" * len(META_COLUMNS))
         self._guarded = False
         with self.conn:
             self.conn.executemany(
                 f"INSERT OR REPLACE INTO exif ({', '.join(EXIF_COLUMNS)}) VALUES ({marks})", rows
+            )
+            self.conn.executemany(
+                f"INSERT OR REPLACE INTO exif_meta ({', '.join(META_COLUMNS)}) "
+                f"VALUES ({meta_marks})",
+                metas,
             )
 
     def exif_row(self, dir: str, name: str) -> dict | None:
@@ -764,6 +904,19 @@ class Index:
             f"SELECT {', '.join(EXIF_COLUMNS)} FROM exif WHERE dir = ? AND name = ?", (dir, name)
         ).fetchone()
         return dict(zip(EXIF_COLUMNS, row)) if row else None
+
+    def meta_row(self, dir: str, name: str) -> dict | None:
+        """The cached exif_meta row of one file (valid or not), `meta` decoded; None if
+        absent."""
+        row = self.conn.execute(
+            f"SELECT {', '.join(META_COLUMNS)} FROM exif_meta WHERE dir = ? AND name = ?",
+            (dir, name),
+        ).fetchone()
+        if not row:
+            return None
+        values = dict(zip(META_COLUMNS, row))
+        values["meta"] = json.loads(values["meta"])
+        return values
 
     def exif_status(self, roots: Sequence[str]) -> dict[str, int]:
         """Non-empty photos/videos under `roots` by EXIF state: "ok" (a usable shot key),

@@ -126,16 +126,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
 
     e = sub.add_parser(
-        "exif", help="read camera EXIF of indexed files, for mode 1b (slow, read-only)",
-        description="Read the camera make, model, body serial, shutter count and capture "
-        "time of the indexed photos under PATHs (or the connected drives of --pool) with "
-        "exiftool, and cache them in the index for `dpf find --mode 1b`. Videos are not "
-        "read (they match by name, size and date). Only files of the last scan without a "
-        "cached reading are read, so a rerun resumes; Ctrl-C keeps what was read. A PATH "
-        "may be a folder inside a scanned drive, to sample it first. Files are opened "
-        "read-only without changing their access times (a drive where that is not "
-        "possible is skipped: remount it read-only), and exiftool only reads copies "
-        "of them on the system disk.",
+        "exif", help="read photo/video metadata of indexed files (mode 1b, photo database)",
+        description="Read the metadata of the indexed photos and videos under PATHs (or "
+        "the connected drives of --pool) with exiftool, and cache it in the index: the "
+        "camera shot identity (make, model, body serial, shutter count, capture time) for "
+        "`dpf find --mode 1b`, and dates, GPS, lens and exposure, ratings, keywords, "
+        "editing software and video details for the `media` view of the index (README "
+        "\"Photo and video database\"). Videos never get a shot identity. Only files of the "
+        "last scan without a cached reading are read, so a rerun resumes; Ctrl-C keeps "
+        "what was read. A PATH may be a folder inside a scanned drive, to sample it first. "
+        "Files are opened read-only without changing their access times (a drive where "
+        "that is not possible is skipped: remount it read-only), and exiftool only reads "
+        "copies of them on the system disk.",
     )  # fmt: skip
     e.add_argument(
         "roots", nargs="*", metavar="PATH", help="scanned drives, or folders inside them"
@@ -154,6 +156,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     e.add_argument(
         "--retry-errors", action="store_true", help="read again files that failed before"
+    )
+    e.add_argument(
+        "--photos-only", action="store_true", help="read photos only, not videos"
     )
     e.add_argument("-q", "--quiet", action="store_true", help="no progress output")
 
@@ -773,7 +778,7 @@ _NO_EXIFTOOL = "dpf: exiftool not found; install it (apt install libimage-exifto
 
 
 def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
-    """`dpf exif`: cache camera EXIF of the indexed media under connected `roots`."""
+    """`dpf exif`: cache the metadata of the indexed media under connected `roots`."""
     from dpf.exif import ExifRun, ExifToolMissing, exiftool_available, read_exif
 
     if not exiftool_available():
@@ -787,8 +792,9 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
             print(f"dpf: nothing indexed under {r}; run `dpf scan` on it first", file=sys.stderr)
             return 1
     if not args.quiet:
+        what = "photos" if args.photos_only else "photos and videos"
         for r in roots:
-            print(f"reading EXIF under {r}", file=sys.stderr)
+            print(f"reading metadata of the {what} under {r}", file=sys.stderr)
     tty = sys.stderr.isatty()
     logged = [0.0]
 
@@ -796,7 +802,10 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         done = run.done
         rate = done / run.elapsed if run.elapsed else 0.0
         eta = duration((run.todo - done) / rate) if rate else "?"
-        line = f"exif: {done:,} of {run.todo:,} files, {rate:,.0f} files/s, ETA {eta}"
+        line = (
+            f"exif: {done:,} of {run.todo:,} files ({done - run.done_videos:,} photos, "
+            f"{run.done_videos:,} videos), {rate:,.0f} files/s, ETA {eta}"
+        )
         if tty:
             sys.stderr.write(CLEAR_LINE + line)
         elif run.elapsed - logged[0] >= 60:  # a log line a minute when not on a terminal
@@ -807,7 +816,7 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     try:
         run = read_exif(
             idx, roots, jobs=args.jobs, readers=args.readers, retry_errors=args.retry_errors,
-            progress=None if args.quiet else progress,
+            photos_only=args.photos_only, progress=None if args.quiet else progress,
         )  # fmt: skip
     except ExifToolMissing:
         print(_NO_EXIFTOOL, file=sys.stderr)
@@ -832,36 +841,63 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
         if unsafe:
             print(f"read nothing: {skipped}")
             return 1
-        print("nothing to read: every indexed photo there has EXIF cached")
+        what = "photo" if args.photos_only else "photo and video"
+        print(f"nothing to read: every indexed {what} there has its metadata cached")
         return 0
-    rate = run.done / run.elapsed if run.elapsed else 0.0
-    print(
-        f"read EXIF of {plural(run.read, 'photo')} in {duration(run.elapsed)} ({rate:,.0f}/s): "
-        f"{run.ok:,} with a camera shot identity, {run.none:,} without, "
-        f"{plural(run.errors, 'error')}"
-    )
-    if run.sparse or run.big or run.whole:
-        print(
-            f"  past the first 512 kB: {plural(run.sparse, 'file')} with TIFF directories "
-            f"further on (read where they lie), {run.big:,} read again up to 16 MB, "
-            f"{run.whole:,} in full"
-        )
-    if run.too_large:
-        print(f"  {plural(run.too_large, 'file')} over 256 MB needed in full: cached without "
-              "a shot identity")  # fmt: skip
-    if run.gone:
-        print(f"  {plural(run.gone, 'file')} no longer there; rescan to update the index")
-    if run.transient:
-        print(f"  {plural(run.transient, 'file')} not read (I/O error, drive gone or "
-              "exiftool failed): not cached, run again to retry")  # fmt: skip
-    if run.noatime:
-        print(f"  {plural(run.noatime, 'file')} skipped: the kernel refused to open them "
-              "without updating their access time (not ours?)")
-    if run.errors:
-        print("  errors are cached too; `dpf exif --retry-errors` reads them again")
+    for line in _exif_summary(run):
+        print(line)
     if unsafe:
         print(f"  {skipped}")
     return 0
+
+
+def _exif_summary(run: ExifRun) -> list[str]:
+    """The lines `dpf exif` prints after a run."""
+    rate = run.done / run.elapsed if run.elapsed else 0.0
+    lines = [
+        f"read metadata of {plural(run.photos, 'photo')} and {plural(run.videos, 'video')} "
+        f"in {duration(run.elapsed)} ({rate:,.0f} files/s)"
+    ]
+    if run.ok or run.none or run.errors:
+        lines.append(
+            f"  photos: {run.ok:,} with a camera shot identity, {run.none:,} without, "
+            f"{plural(run.errors, 'error')}"
+        )
+    if run.refreshed:
+        changed = (f"; {run.changed:,} would now get another shot key"
+                   if run.changed else "")  # fmt: skip
+        lines.append(
+            f"  {plural(run.refreshed, 'photo')} cached before read again for the new fields "
+            f"(their shot identity is kept{changed})"
+        )
+    if run.videos:
+        lines.append(
+            f"  videos: {plural(run.video_errors, 'error')}; videos never get a shot identity"
+        )
+    steps = [
+        (run.sparse, "with TIFF directories further on"),
+        (run.boxes, "with boxes further on (moov at the end)"),
+        (run.tail, "videos read at head and tail"),
+        (run.big, "read again up to 16 MB"),
+        (run.whole, "read in full"),
+    ]
+    if any(n for n, _ in steps):
+        parts = ", ".join(f"{n:,} {what}" for n, what in steps if n)
+        lines.append(f"  past the first 512 kB: {parts}")
+    if run.too_large:
+        lines.append(f"  {plural(run.too_large, 'file')} over 256 MB needed in full: cached "
+                     "without a shot identity")  # fmt: skip
+    if run.gone:
+        lines.append(f"  {plural(run.gone, 'file')} no longer there; rescan to update the index")
+    if run.transient:
+        lines.append(f"  {plural(run.transient, 'file')} not read (I/O error, drive gone or "
+                     "exiftool failed): not cached, run again to retry")  # fmt: skip
+    if run.noatime:
+        lines.append(f"  {plural(run.noatime, 'file')} skipped: the kernel refused to open "
+                     "them without updating their access time (not ours?)")  # fmt: skip
+    if run.errors or run.video_errors:
+        lines.append("  errors are cached too; `dpf exif --retry-errors` reads them again")
+    return lines
 
 
 def _add_health(overview: Overview, idx: Index, args: argparse.Namespace) -> None:

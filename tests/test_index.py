@@ -400,7 +400,6 @@ class IndexFileTest(unittest.TestCase):
             idx.conn.commit()
         with Index(path) as idx:
             self.assertEqual(idx.conn.execute("PRAGMA user_version").fetchone()[0], _VERSION)
-            self.assertEqual(_VERSION, 8)
             self.assertEqual(idx.totals(["/m"])[0], 1)
             self.assertEqual(idx.exif_row("/m/A", "x.jpg")["status"], "none")
             self.assertEqual(idx.smart_latest(), [])

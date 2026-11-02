@@ -127,8 +127,8 @@ class ExifCliTest(CliFixture):
         self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
         code, out, err = self.run_cli("exif", "-q", self.drives)
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("read EXIF of 21 photos", out)
-        self.assertIn("0 with a camera shot identity, 21 without", out)
+        self.assertIn("read metadata of 21 photos and 0 videos", out)
+        self.assertIn("photos: 0 with a camera shot identity, 21 without", out)
         code, out, _ = self.run_cli("exif", "-q", self.drives)
         self.assertIn("nothing to read", out)
         with Index(self.db) as idx:
@@ -139,12 +139,28 @@ class ExifCliTest(CliFixture):
         sample = os.path.join(self.drives, "one", "DCIM")
         code, out, err = self.run_cli("exif", sample)
         self.assertEqual(code, 0, err)
-        self.assertIn(f"reading EXIF under {sample}", err)
-        self.assertIn("read EXIF of 10 photos", out)
+        self.assertIn(f"reading metadata of the photos and videos under {sample}", err)
+        self.assertIn("read metadata of 10 photos", out)
         with Index(self.db) as idx:
             self.assertEqual(idx.exif_status([sample])["missing"], 0)
             other = os.path.join(self.drives, "two")
             self.assertEqual(idx.exif_status([other])["missing"], 10)
+
+    def test_exif_photos_only_then_videos(self):
+        clip = os.path.join(self.drives, "one", "DCIM", "C0001.MP4")
+        with open(clip, "wb") as fh:
+            fh.write(b"\0" * 64)
+        self.assertEqual(self.run_cli("scan", "-q", self.drives)[0], 0)
+        code, out, _ = self.run_cli("exif", "-q", "--photos-only", self.drives)
+        self.assertEqual(code, 0)
+        self.assertIn("read metadata of 20 photos and 0 videos", out)
+        code, out, _ = self.run_cli("exif", "-q", "--photos-only", self.drives)
+        self.assertIn("nothing to read: every indexed photo there has its metadata cached", out)
+        code, out, _ = self.run_cli("exif", "-q", self.drives)
+        self.assertIn("read metadata of 0 photos and 1 video", out)
+        self.assertIn("videos: 1 error; videos never get a shot identity", out)
+        with Index(self.db) as idx:
+            self.assertEqual(idx.exif_row(os.path.dirname(clip), "C0001.MP4")["status"], "error")
 
     def test_exif_refuses_unconnected_path(self):
         code, _, err = self.run_cli("exif", os.path.join(self.tmp, "nowhere"))
@@ -167,9 +183,9 @@ class ExifPoolCliTest(PoolsFixture):
         code, out, err = self.run_cli("exif", "--pool", "A")
         self.assertEqual(code, 0, err)
         self.assertIn(f"skipping {self.a2} (pool A, not connected)", err)
-        self.assertIn(f"reading EXIF under {self.a1}", err)
+        self.assertIn(f"reading metadata of the photos and videos under {self.a1}", err)
         self.assertNotIn(self.b1, err)
-        self.assertIn("read EXIF of 10 photos", out)
+        self.assertIn("read metadata of 10 photos", out)
 
 
 if __name__ == "__main__":
