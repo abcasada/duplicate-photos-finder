@@ -27,9 +27,10 @@ of the file's true size, so the offsets stay right and the holes read as zeros. 
 copy still lacks tags its format should carry, a BIG_HEAD copy is parsed, then (for
 missing tags, not just a missing pixel size) the whole file up to MAX_WHOLE bytes.
 
-The drives are only read, and their access times never change: dpf itself opens every
-file read-only with O_NOATIME (a file where the kernel refuses it is skipped and counted,
-unless allowed), and exiftool only ever sees the temp copies, never an original.
+The drives are only read, and their access times never change (hard rule 7, dpf.safety):
+a drive whose files cannot be opened with O_NOATIME (and is not mounted `ro` or `noatime`)
+is skipped whole, every file is opened read-only with O_NOATIME (a refusal skips and counts
+the file, never retried without it), and exiftool only ever sees the temp copies.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 
 from dpf.index import Index
+from dpf.safety import NoAtimeDenied, ReadCheck, check_root, open_read
 
 HEAD_BYTES = 512 * 1024
 BIG_HEAD = 16 * 1024 * 1024
@@ -125,10 +127,6 @@ class ExifToolMissing(RuntimeError):
 
 class ExifToolTimeout(OSError):
     pass
-
-
-class NoAtimeDenied(OSError):
-    """The kernel refused O_NOATIME (the file belongs to another user)."""
 
 
 def fmt_of(name: str) -> str:
@@ -391,6 +389,7 @@ class _Job:
     name: str
     size: int  # as found when the file was opened (fstat)
     mtime: float
+    plain_ok: bool = False  # on a ro/noatime mount: a plain open is fine (safety.open_read)
     head: str | None = None  # temp copy of the first bytes
     whole: bool = False  # the copy holds the whole file
     error: str | None = None  # why it could not be read
@@ -420,6 +419,7 @@ class ExifRun:
     noatime: int = 0  # skipped: the kernel refused O_NOATIME
     elapsed: float = 0.0
     skipped_roots: list[str] = field(default_factory=list)  # empty-looking mount folders
+    unsafe_roots: list[ReadCheck] = field(default_factory=list)  # would update access times
     stale_temp: int = 0  # leftover temp dirs of earlier runs removed
     interrupted: bool = False
 
@@ -429,25 +429,6 @@ class ExifRun:
 
 
 Progress = Callable[[ExifRun], None]
-
-
-def _open_read(path: str, allow_atime: bool = False) -> int:
-    """A read-only descriptor that never updates the file's access time.
-
-    Raises NoAtimeDenied when the kernel refuses O_NOATIME, unless `allow_atime`.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-    noatime = getattr(os, "O_NOATIME", 0)
-    if not noatime:
-        if allow_atime:
-            return os.open(path, flags)
-        raise NoAtimeDenied(errno.EPERM, "O_NOATIME is not available", path)
-    try:
-        return os.open(path, flags | noatime)
-    except PermissionError as e:
-        if allow_atime:
-            return os.open(path, flags)
-        raise NoAtimeDenied(errno.EPERM, "O_NOATIME refused", path) from e
 
 
 def _pread(fd: int, n: int, offset: int) -> bytes:
@@ -548,7 +529,7 @@ class _Reader:
 
 
 def copy_head(
-    path: str, dest: str, limit: int, allow_atime: bool = False
+    path: str, dest: str, limit: int, plain_ok: bool = False
 ) -> tuple[os.stat_result, int, int]:
     """Copy `path` to `dest` for exiftool: (stat of the open file, bytes read, of which
     past the first `limit`).
@@ -558,7 +539,7 @@ def copy_head(
     those are read in one go): then `dest` is a sparse file of the original's size, so
     exiftool finds everything at its offset and reads zeros in the holes.
     """
-    fd = _open_read(path, allow_atime)
+    fd = open_read(path, plain_ok)
     try:
         st = os.fstat(fd)
         head = _pread(fd, limit, 0)
@@ -648,13 +629,14 @@ def read_exif(
     head_bytes: int = HEAD_BYTES,
     big_head: int = BIG_HEAD,
     max_whole: int = MAX_WHOLE,
-    allow_atime: bool = False,
     timeout: float = TIMEOUT,
 ) -> ExifRun:
     """Read EXIF for the indexed photos under `roots` lacking a valid cached row.
 
     `roots` (drives or folders inside them) must be connected; the file list comes from
-    the index, so only files of a previous scan are read. Rows are committed in batches
+    the index, so only files of a previous scan are read. A root whose files cannot be
+    read without updating their access times (safety.check_root) is skipped whole and
+    listed in `unsafe_roots`. Rows are committed in batches
     by the calling thread, so an interrupted run keeps its progress (a KeyboardInterrupt
     is re-raised after the commit).
     """
@@ -670,7 +652,13 @@ def read_exif(
             run.skipped_roots.append(root)
             continue
         todo = index.exif_todo([root], retry_errors=retry_errors)
-        by_dev.setdefault(os.stat(root).st_dev, []).extend(todo)
+        if not todo:
+            continue
+        check = check_root(root, (os.path.join(t[0], t[1]) for t in todo))
+        if not check.ok:
+            run.unsafe_roots.append(check)
+            continue
+        by_dev.setdefault(os.stat(root).st_dev, []).extend((*t, check.plain_ok) for t in todo)
     run.todo = sum(len(t) for t in by_dev.values())
     if not run.todo:
         run.elapsed = time.monotonic() - started
@@ -684,7 +672,7 @@ def read_exif(
     heads: queue.Queue = queue.Queue(maxsize=jobs * BATCH * 2)
     results: queue.Queue = queue.Queue()
     seq = itertools.count()
-    reader_opts = _Reading(tmp, seq, head_bytes, big_head, max_whole, allow_atime, exe, timeout)
+    reader_opts = _Reading(tmp, seq, head_bytes, big_head, max_whole, exe, timeout)
 
     def put(q: queue.Queue, item: object) -> bool:
         while not stop.is_set():
@@ -700,9 +688,9 @@ def read_exif(
             with lock:
                 if cursor[0] >= len(files):
                     return
-                dir, name, size, mtime, _ = files[cursor[0]]
+                dir, name, size, mtime, _, plain_ok = files[cursor[0]]
                 cursor[0] += 1
-            job = _Job(dir, name, size, mtime)
+            job = _Job(dir, name, size, mtime, plain_ok)
             reader_opts.copy(job, head_bytes)
             if not put(heads, job):
                 return
@@ -840,7 +828,6 @@ class _Reading:
     head_bytes: int
     big_head: int
     max_whole: int
-    allow_atime: bool
     exe: str
     timeout: float
 
@@ -849,7 +836,7 @@ class _Reading:
         ext = "".join(c for c in fmt_of(job.name) if c.isalnum())
         dest = os.path.join(self.tmp, f"{next(self.seq)}.{ext or 'bin'}")
         try:
-            st, got, extra = copy_head(job.path, dest, limit, self.allow_atime)
+            st, got, extra = copy_head(job.path, dest, limit, job.plain_ok)
         except NoAtimeDenied:
             job.outcome, job.error = "noatime", "O_NOATIME refused"
             return

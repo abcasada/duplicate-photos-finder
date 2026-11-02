@@ -221,7 +221,8 @@ only verify the mode 1 candidates (fast), or do a full content scan?
   size too (exiftool reports the full-resolution IFD for DNG/TIFF raws). Sony
   `InternalSerialNumber` with -n is decimal bytes: kept as hex per byte. Videos are not
   read. exiftool never opens an original: a 16 MB copy, then the whole file up to 256 MB,
-  all read with O_NOATIME (EPERM: skipped and counted, `--allow-atime` overrides); 60 s
+  all read with O_NOATIME (EPERM: skipped and counted; `--allow-atime` was removed on
+  2026-11-01, see CLAUDE.md hard rule 7); 60 s
   watchdog per exiftool command (the batch is then retried file by file; failures are
   not cached), I/O errors not cached, stale `/dev/shm/dpf-exif-*` removed. Same-shot
   matches between files of different sizes are flagged on pairs/runs/trees and, in

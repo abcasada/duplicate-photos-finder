@@ -646,8 +646,23 @@ Backup coverage, the Drives summary (only copy, name match) and the dumps check 
 the same rule in mode 1b.
 
 **`dpf exif` only reads, and leaves even access times alone.** It opens every file
-read-only with `O_NOATIME`; a file the kernel will not open that way (not owned by
-you) is skipped and counted, unless `--allow-atime`. It copies the first 512 kB to
+read-only with `O_NOATIME`, which the kernel grants only for files you own. Before it
+reads anything on a drive it checks that drive: a drive mounted read-only (`ro`) or
+with `noatime` is read; a FUSE mount (ntfs-3g shows as `fuseblk`) that is neither is
+skipped, since ntfs-3g keeps access times itself; otherwise one file is opened as a
+probe, and if the kernel refuses `O_NOATIME` (files owned by root or another user) the
+whole drive is skipped with a message such as
+
+```
+dpf: skipping /run/media/adam/Storage 4A 8TB: files can't be read without updating their
+access time (mounted via fuseblk from /dev/loop24p2, which keeps access times itself);
+remount it read-only (see README, "Reading a drive from a read-only mount")
+```
+
+The other drives are still read; the summary counts the skipped ones, and the exit
+status is 1 only when every drive asked for was skipped. A single file refused later
+is skipped and counted, never opened without `O_NOATIME`. There is no override. It
+copies the first 512 kB to
 `/dev/shm` and exiftool parses only that copy, never the original. A TIFF-based file
 (DNG, ARW, PEF, NEF, CR2, TIF, …) whose directories lie further on (Lightroom writes a
 re-saved DNG's IFD0 at the end) gets a sparse copy instead: the head plus each
@@ -660,6 +675,27 @@ error, device gone) and exiftool runs that hang (60 s watchdog) or crash are cou
 and not cached, so a rerun tries those files again. Leftover temp folders of a run that
 died are removed at the next start. exiftool must be installed (`apt install
 libimage-exiftool-perl`).
+
+### Reading a drive from a read-only mount
+
+dpf never updates a file's access time. The simplest way to let it read a drive whose
+files it may not open with `O_NOATIME` (an NTFS drive mounted by ntfs-3g, or files owned
+by root) is a read-only mount: the kernel never updates access times on a `ro` mount, and
+nothing on the drive can change. Mount it at the folder it was scanned under, so the
+index recognises it, for example for Storage 4A:
+
+```sh
+udisksctl unmount -b /dev/loop24p2                    # the current ntfs-3g mount
+sudo losetup --read-only --find --show --partscan /dev/sdb    # prints e.g. /dev/loop30
+sudo mkdir -p "/run/media/adam/Storage 4A 8TB"
+sudo mount -t ntfs3 -o ro,uid=$(id -u),gid=$(id -g) /dev/loop30p2 \
+    "/run/media/adam/Storage 4A 8TB"
+grep "Storage" /proc/mounts                           # should show ntfs3 ro,...
+```
+
+The read-only loop device keeps even the mount itself from writing to the disk. `ro`
+or `noatime` in /proc/mounts is all dpf looks for; with `uid=` the files are also yours,
+so `O_NOATIME` works too.
 
 ### Reading the report
 

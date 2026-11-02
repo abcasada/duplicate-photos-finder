@@ -388,22 +388,10 @@ class ExifToolTest(unittest.TestCase):
         self.jpeg("a.jpg")
         scan_roots(self.idx, [self.root])
         refused = NoAtimeDenied(errno.EPERM, "O_NOATIME refused")
-        with mock.patch.object(exif, "_open_read", side_effect=refused):
+        with mock.patch.object(exif, "open_read", side_effect=refused):
             run = read_exif(self.idx, [self.root])
         self.assertEqual((run.noatime, run.read), (1, 0))
         self.assertIsNone(self.idx.exif_row(self.dir, "a.jpg"))
-        path = os.path.join(self.dir, "a.jpg")
-        calls = []
-
-        def fake_open(p, flags):
-            calls.append(flags)
-            raise PermissionError(errno.EPERM, "not the owner")
-
-        with mock.patch.object(exif.os, "open", fake_open):
-            with self.assertRaises(NoAtimeDenied):
-                exif._open_read(path)
-        self.assertEqual(len(calls), 1)  # no second try without O_NOATIME
-        self.assertTrue(calls[0] & os.O_NOATIME)
 
     def test_io_errors_are_not_cached(self):
         self.jpeg("a.jpg")

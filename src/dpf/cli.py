@@ -133,7 +133,8 @@ def _build_parser() -> argparse.ArgumentParser:
         "read (they match by name, size and date). Only files of the last scan without a "
         "cached reading are read, so a rerun resumes; Ctrl-C keeps what was read. A PATH "
         "may be a folder inside a scanned drive, to sample it first. Files are opened "
-        "read-only without changing their access times, and exiftool only reads copies "
+        "read-only without changing their access times (a drive where that is not "
+        "possible is skipped: remount it read-only), and exiftool only reads copies "
         "of them on the system disk.",
     )  # fmt: skip
     e.add_argument(
@@ -154,11 +155,6 @@ def _build_parser() -> argparse.ArgumentParser:
     e.add_argument(
         "--retry-errors", action="store_true", help="read again files that failed before"
     )
-    e.add_argument(
-        "--allow-atime", action="store_true",
-        help="read files the kernel refuses to open without updating their access time "
-        "(by default they are skipped and counted)",
-    )  # fmt: skip
     e.add_argument("-q", "--quiet", action="store_true", help="no progress output")
 
     d = sub.add_parser(
@@ -811,7 +807,7 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     try:
         run = read_exif(
             idx, roots, jobs=args.jobs, readers=args.readers, retry_errors=args.retry_errors,
-            progress=None if args.quiet else progress, allow_atime=args.allow_atime,
+            progress=None if args.quiet else progress,
         )  # fmt: skip
     except ExifToolMissing:
         print(_NO_EXIFTOOL, file=sys.stderr)
@@ -827,7 +823,15 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
     if run.stale_temp and not args.quiet:
         print(f"removed {plural(run.stale_temp, 'leftover temp folder')} of an earlier run",
               file=sys.stderr)  # fmt: skip
+    for check in run.unsafe_roots:
+        print(f"dpf: {check.message}", file=sys.stderr)
+    unsafe = len(run.unsafe_roots)
+    skipped = (f"{plural(unsafe, 'drive')} skipped: reading would update access times"
+               if unsafe else "")  # fmt: skip
     if not run.todo:
+        if unsafe:
+            print(f"read nothing: {skipped}")
+            return 1
         print("nothing to read: every indexed photo there has EXIF cached")
         return 0
     rate = run.done / run.elapsed if run.elapsed else 0.0
@@ -852,9 +856,11 @@ def _exif(idx: Index, roots: list[str], args: argparse.Namespace) -> int:
               "exiftool failed): not cached, run again to retry")  # fmt: skip
     if run.noatime:
         print(f"  {plural(run.noatime, 'file')} skipped: the kernel refused to open them "
-              "without updating their access time (not ours?); --allow-atime reads them")
+              "without updating their access time (not ours?)")
     if run.errors:
         print("  errors are cached too; `dpf exif --retry-errors` reads them again")
+    if unsafe:
+        print(f"  {skipped}")
     return 0
 
 

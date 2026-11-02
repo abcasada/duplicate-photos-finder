@@ -56,6 +56,18 @@ tool has.
    The one view that matches both pools together is **Duplicated in A and B**
    (`src/dpf/backed_dupes.py`, user request 2026-10-31): backed-up sequences with extra
    copies inside either pool; it never suggests removing the last copy in a pool.
+7. **Never update access times on scanned drives** (owner, 2026-11-01: updating atimes on
+   Storage 4A is "unacceptable"). Every open of an original file goes through
+   `safety.open_read`: read-only with `O_NOATIME`; a refusal (EPERM, files of another
+   user) is never retried without the flag, except on a `ro` or `noatime` mount, where
+   the kernel never updates atime. Before reading any file under a root,
+   `safety.check_root` decides for the whole drive: `ro`/`noatime` mounts are read;
+   FUSE mounts (ntfs-3g = fuseblk) that are neither are skipped (the daemon keeps atime
+   itself); otherwise one indexed file is opened with `O_NOATIME` as a probe (no byte
+   read), and a refusal skips the whole drive with a message naming the fstype. There
+   is no override (`--allow-atime` was removed). Mode 2 hashing must use the same helper.
+   Open point for the owner: `dpf scan` lists folders (`scandir`), which on `relatime`
+   mounts may update *directory* atimes; not covered by this rule yet.
 
 ## Environment
 
@@ -77,8 +89,10 @@ tool has.
     reads of 4A (`dpf smart`) are approved; they read no filesystem. Its SMART is clean
     (0 pending, 0 reallocated, 48 CRC errors), so the user now thinks it is in good shape,
     but keep away from heavy file reads unless the user asks. It is currently mounted via
-    ntfs-3g through `/dev/loop24p2`, a loop device on `/dev/sdb` (serial WD-CA13ZBDK,
-    linked in `[smart] links`).
+    ntfs-3g (fuseblk, files owned by root) through `/dev/loop24p2`, a loop device on
+    `/dev/sdb` (serial WD-CA13ZBDK, linked in `[smart] links`), so `dpf exif` skips it
+    (hard rule 7) until the owner remounts it read-only (README "Reading a drive from a
+    read-only mount"; probably `ntfs3 -o ro` on a read-only loop device).
 - Cameras that produce most duplicates: **two Sony A7R IV bodies** (`DSC#####`, ARW+JPG)
   and a **Pentax K-1 Mark II** (`IMGQ####`, DNG+JPG). There is also a Pentax K-50
   (`IMGP`), a Nikon D7500, GoPros (`GX`/`GH`), phones, and Sony video (`C####.MP4`).
@@ -131,6 +145,7 @@ Data flows **scan → index → match → group → report**.
 | `src/dpf/exif.py` | Mode 1b EXIF reading (photos only). `parse_entry` (exiftool `-json -n` → `ExifData`; serial tag per make: Sony `InternalSerialNumber`, others `SerialNumber`; `norm_serial`: -n byte lists to hex, numeric without leading zeros; shutter mode from Sony `Shutter`, Pentax `ShutterType`/`LiveView`: electronic = no identity), `ExifData.ident` (make\|model\|serial\|shutter\|DateTimeOriginal) and `.shot` (+ format family + pixel size; non-RAW needs one), `needs_more`, `ExifTool` (one `-stay_open` process, 60 s watchdog), `read_exif` (file list from `Index.exif_todo`; per `st_dev` 4 reader threads copy the first 512 kB with O_NOATIME (EPERM: skipped, counted) to `/dev/shm`; TIFF-based files get a sparse copy of their true size with the IFDs and needed tag data found past the head (`walk_tiff`, `_Reader`: 64 kB windows, the last 1 MB at once when IFD0 lies there, ≤ 8 MB per file), for Lightroom DNGs with IFD0 at the end; min(6, CPUs) exiftool processes parse batches of 16; more needed: a 16 MB copy (also sparse), then the whole file up to 256 MB, never the original; steps counted (`sparse`/`big`/`whole`); I/O errors and exiftool failures not cached; one writer commits every 500 rows/1 s, so Ctrl-C keeps progress; stale temp dirs cleaned). |
 | `src/dpf/match_shot.py` | Mode 1b matcher. `split_by_shot` (the veto: a mode-1 group with two shot keys splits by key, keyless files apart), `find_shot_duplicates` (shot groups from `Index.shot_groups` unioned with the vetoed mode-1 groups of the same key; disjoint, no chaining; shot groups get basis `SHOT_BASIS`, `shot=True` and no hours; `DuplicateGroup.sizes_differ` feeds `Run`/`FolderPair`/`TreePair.sizes_differ`, "; same shot, sizes differ"), `ShotStats` (summary["shots"]), `basis`. Coverage lists files copied only as a shot of another size (`Coverage.resaved`: text section, "… re-saved" sheet, missing.csv `status`). |
 | `src/dpf/coverage.py` | Backup coverage (see hard rule 6). `find_missing` / `missing_files` (`shots=True`: mode 1b via `_missing_by_shot`, counting `by_shot` and `vetoed` per dir) (uses `bucket_groups`, so hour shifts apply; counts files covered only through a shift), `roll_up` (whole trees bounded by roots and categories), `check_coverage` (raises ValueError on equal/nested roots across sides; `by_category`, `only`, `unindexed` non-media counts), `stale_warnings` (other pool scanned > 1 day before this pool's newest scan), `same_drive_warnings` (labels equal up to case / trailing " (N)"). |
+| `src/dpf/safety.py` | Hard rule 7: no access-time updates on scanned drives. `read_mounts`/`mount_of` (/proc/mounts with fstype and options; `MOUNTS` patchable), `Mount.keeps_atime` (False for `ro`/`noatime`), `Mount.fuse`, `check_root(root, probe paths)` → `ReadCheck` (ok, `plain_ok`, `reason`, `message`: "skipping ROOT: … (mounted via FSTYPE from DEV, files owned by USER); remount it read-only …"), `open_read(path, plain_ok)` (O_NOATIME; EPERM → `NoAtimeDenied`, plain open only when `plain_ok`; EACCES is not an atime refusal). Used by `exif.read_exif` per root; mode 2 hashing must use it too. |
 | `src/dpf/media.py` | Extension sets (images incl. RAW/HEIC, videos), `SKIP_DIRS` (`$RECYCLE.BIN`, `System Volume Information`, …), `is_junk` (`._*`, Thumbs.db, desktop.ini, .DS_Store). |
 | `src/dpf/models.py` | `FileRecord`, `DuplicateGroup`, `RootStats` (frozen dataclasses). |
 | `bin/dpf` | Launcher that adds `src/` to the path. It works through a symlink (e.g. `~/.local/bin/dpf`). |
@@ -159,7 +174,8 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
   `dpf space --set`, which never accesses the path. 2026-10-31: SMART reads of 4A are
   approved (user); its SMART is clean (0 pending/reallocated, 48 CRC errors) and the
   user says it turned out to be in good shape. Still no heavy file reads unless asked.
-  Mounted via ntfs-3g through `/dev/loop24p2` on `/dev/sdb`.
+  Mounted via ntfs-3g (fuseblk, root-owned files) through `/dev/loop24p2` on `/dev/sdb`:
+  `dpf exif` skips it whole (hard rule 7) until it is remounted read-only.
 - **Drive space (schema v5):** `roots` records each drive's used/total space.
   - Every scan takes one `os.statvfs` per root after its walk (`space_source`
     'statvfs'). A kept (empty-looking) root keeps its previous values.
@@ -383,6 +399,9 @@ with pool-prefixed sheets, `{"pools": …, "coverage": …}` JSON, a `pool` CSV 
      (fast) or do a full content scan?
 
 Known limitations (documented, not fixed):
+- `dpf scan` lists folders with `scandir`; on a `relatime`/`strictatime` mount that can
+  update *directory* access times (file atimes are never touched). For the owner to
+  decide (e.g. scan only `ro`/`noatime` mounts).
 - A file in N folders yields up to N(N-1)/2 folder pairs.
 - Small trees take tree-overview slots.
 - Hardlinks are not merged.
