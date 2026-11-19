@@ -10,16 +10,35 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from dpf.index import Index
 
+# snake_case, so the CSV loads straight into Python (csv.DictReader, pandas).
 FIELDS = (
-    "File name", "Folder name", "Full path", "Date/time taken", "Latitude", "Longitude",
-    "Altitude (m)", "Kind", "Camera", "Drive", "Pool", "Map link",
+    "file_name", "folder_name", "path", "taken", "utc_offset", "latitude", "longitude",
+    "altitude_m", "kind", "camera", "drive", "pool", "map_link",
 )  # fmt: skip
+
+_TAKEN = re.compile(r"(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})?$")
+
+
+def split_taken(taken: str | None) -> tuple[str, str]:
+    """("YYYY-MM-DDTHH:MM:SS", "+HH:MM" or ""): ISO 8601 local time and its UTC offset
+    when known (videos record one; most cameras don't). ("", "") when undated or odd."""
+    m = _TAKEN.match(taken or "")
+    if not m:
+        return "", ""
+    iso = f"{m.group(1)}T{m.group(2)}"
+    try:
+        datetime.fromisoformat(iso)
+    except ValueError:  # e.g. a camera's "2011:00:00 00:00:00"
+        return "", ""
+    offset = m.group(3) or ""
+    return iso, "+00:00" if offset == "Z" else offset
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,15 +116,17 @@ def gps_rows(
 
 
 def _cells(r: GpsRow) -> list:
-    return [r.name, os.path.basename(r.dir) or r.dir, r.path, r.taken or "", r.lat, r.lon,
+    taken, offset = split_taken(r.taken)
+    return [r.name, os.path.basename(r.dir) or r.dir, r.path, taken, offset, r.lat, r.lon,
             "" if r.alt is None else round(r.alt, 1), r.kind, r.camera, r.drive, r.pool,
             r.map_link]  # fmt: skip
 
 
 def write_gps_csv(rows: Sequence[GpsRow], path: str) -> None:
-    """UTF-8 with a byte-order mark, so Excel shows non-ASCII names correctly."""
-    with open(path, "w", encoding="utf-8-sig", newline="") as fh:
-        w = csv.writer(fh)
+    """Plain UTF-8 (no byte-order mark), comma-separated, minimal quoting, "\n" line ends,
+    empty cells for unknown values: made for other programs. Excel users get gps.xlsx."""
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
         w.writerow(FIELDS)
         w.writerows(_cells(r) for r in rows)
 
@@ -118,19 +139,22 @@ def write_gps_xlsx(rows: Sequence[GpsRow], path: str) -> None:
         ws = wb.add_worksheet("GPS")
         head = wb.add_format({"bold": True, "bg_color": "#D9E1F2", "bottom": 1})
         coord = wb.add_format({"num_format": "0.000000"})
-        widths = [24, 30, 70, 19, 11, 12, 10, 7, 22, 18, 5, 14]
+        when = wb.add_format({"num_format": "yyyy-mm-dd hh:mm:ss"})
+        widths = [24, 30, 70, 19, 10, 11, 12, 10, 7, 22, 18, 5, 14]
         for c, (title, width) in enumerate(zip(FIELDS, widths)):
             ws.write_string(0, c, title, head)
             ws.set_column(c, c, width)
         for n, r in enumerate(rows[:1_048_575], 1):
             cells = _cells(r)
-            for c in (0, 1, 2, 3, 7, 8, 9, 10):
+            for c in (0, 1, 2, 4, 8, 9, 10, 11):
                 ws.write_string(n, c, cells[c])
-            ws.write_number(n, 4, r.lat, coord)
-            ws.write_number(n, 5, r.lon, coord)
+            if cells[3]:
+                ws.write_datetime(n, 3, datetime.fromisoformat(cells[3]), when)
+            ws.write_number(n, 5, r.lat, coord)
+            ws.write_number(n, 6, r.lon, coord)
             if r.alt is not None:
-                ws.write_number(n, 6, round(r.alt, 1))
+                ws.write_number(n, 7, round(r.alt, 1))
             # A formula, not a cell link: Excel allows only 65,530 links per sheet.
-            ws.write_formula(n, 11, f'=HYPERLINK("{r.map_link}","map")', None, "map")
+            ws.write_formula(n, 12, f'=HYPERLINK("{r.map_link}","map")', None, "map")
         ws.autofilter(0, 0, max(len(rows), 1), len(FIELDS) - 1)
         ws.freeze_panes(1, 1)

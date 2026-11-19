@@ -544,7 +544,7 @@ need not be connected: everything comes from the index.
 ### GPS locations
 
 `dpf gps` writes `gps.csv` and `gps.xlsx` (in `~/.cache/dpf/reports/<timestamp>-gps/`):
-one row per photo or video with a GPS position, with file name, folder name, full path,
+one row per photo or video with a GPS position. The CSV is made for other programs (plain UTF-8, snake_case headers `file_name, folder_name, path, taken, utc_offset, latitude, longitude, altitude_m, kind, camera, drive, pool, map_link`, ISO 8601 `taken`, empty cells for unknowns); open the xlsx in Excel. Columns: file name, folder name, full path,
 date/time taken (EXIF capture time, else the created date), latitude, longitude,
 altitude, kind, camera, drive, pool and a map link. It reads the metadata `dpf exif`
 cached in the index, so the drives are not touched; files not yet read by `dpf exif`

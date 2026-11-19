@@ -57,11 +57,28 @@ class GpsTest(unittest.TestCase):
                          ("PENTAX K-50", "Storage 1A", "A"))  # fmt: skip
         path = os.path.join(self.tmp, "gps.csv")
         write_gps_csv(rows, path)
-        with open(path, encoding="utf-8-sig") as fh:
-            first = next(csv.DictReader(fh))
-        self.assertEqual((first["File name"], first["Folder name"], first["Full path"]),
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))  # no BOM
+        self.assertNotIn(b"\r\n", raw)
+        with open(path, encoding="utf-8", newline="") as fh:
+            first, video = list(csv.DictReader(fh))
+        self.assertEqual((first["file_name"], first["folder_name"], first["path"]),
                          ("a.jpg", "trip", R + "/trip/a.jpg"))  # fmt: skip
-        self.assertIn("38.500000,-97.600000", first["Map link"])
+        self.assertEqual((first["taken"], first["utc_offset"]), ("2021-01-02T10:00:00", ""))
+        self.assertEqual((float(first["latitude"]), first["altitude_m"]), (38.5, "400.0"))
+        self.assertIn("38.500000,-97.600000", first["map_link"])
+        self.assertEqual(video["altitude_m"], "")
+
+    def test_split_taken(self):
+        from dpf.gps import split_taken
+
+        self.assertEqual(split_taken("2011-01-02 09:53:24-05:00"),
+                         ("2011-01-02T09:53:24", "-05:00"))  # fmt: skip
+        self.assertEqual(split_taken("2020-01-01 00:00:00Z"), ("2020-01-01T00:00:00", "+00:00"))
+        self.assertEqual(split_taken(None), ("", ""))
+        self.assertEqual(split_taken("0000:00:00"), ("", ""))
+        self.assertEqual(split_taken("2011-00-00 00:00:00"), ("", ""))
 
     def test_date_ranges(self):
         ranges = [parse_range("2020-08-01:2021-03-07"), parse_range("2024-03-01")]
