@@ -300,6 +300,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )  # fmt: skip
     gp.add_argument("--photos-only", action="store_true", help="leave videos out")
     gp.add_argument(
+        "--exclude", metavar="TEXT", action="append", default=[],
+        help="leave out files whose full path contains TEXT (case ignored; repeatable), "
+        "e.g. --exclude exiftool_files",
+    )  # fmt: skip
+    gp.add_argument(
         "--dates", metavar="FROM:TO", action="append", default=[],
         help="only files taken between these days, both included (YYYY-MM-DD:YYYY-MM-DD, "
         "or one day); repeatable, e.g. --dates 2020-08-01:2021-03-07 --dates 2024-01-15:"
@@ -1723,6 +1728,9 @@ def _gps(idx: Index, args: argparse.Namespace) -> int:
     rows = gps_rows(idx, roots, lambda root: ", ".join(pools_of(pools, root)), ranges)
     if args.photos_only:
         rows = [r for r in rows if r.kind == "image"]
+    if args.exclude:
+        words = [w.casefold() for w in args.exclude]
+        rows = [r for r in rows if not any(w in r.path.casefold() for w in words)]
     os.makedirs(out, exist_ok=True)
     csv_path = os.path.join(out, "gps.csv")
     write_gps_csv(rows, csv_path)
