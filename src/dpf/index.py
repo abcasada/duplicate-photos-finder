@@ -905,6 +905,26 @@ class Index:
         ).fetchone()
         return dict(zip(EXIF_COLUMNS, row)) if row else None
 
+    def gps_rows(
+        self, roots: Sequence[str] | None = None
+    ) -> Iterator[tuple[str, str, str, str | None, float, float, float | None, str | None,
+                        str | None]]:  # fmt: skip
+        """(dir, name, kind, taken, lat, lon, alt, make, model) of every indexed photo/video
+        under `roots` (all when None) whose valid metadata row has a GPS position. `taken`
+        is the capture time (EXIF DateTimeOriginal, else the created date), ISO text."""
+        where, params = _prefix_clause(roots) if roots else ("1", [])
+        taken = _ISO_DATE.format(
+            "coalesce(CASE WHEN e.read_size = files.size AND e.read_mtime = files.mtime "
+            "THEN e.taken END, m.created)"
+        )
+        yield from self.conn.execute(
+            f"SELECT dir, name, kind, {taken}, m.gps_lat, m.gps_lon, m.gps_alt, e.make, e.model "
+            f"FROM exif_meta m JOIN files USING (dir, name) LEFT JOIN exif e USING (dir, name) "
+            f"WHERE {where} AND m.gps_lat IS NOT NULL AND m.gps_lon IS NOT NULL "
+            f"AND m.read_size = files.size AND m.read_mtime = files.mtime",
+            params,
+        )
+
     def meta_row(self, dir: str, name: str) -> dict | None:
         """The cached exif_meta row of one file (valid or not), `meta` decoded; None if
         absent."""

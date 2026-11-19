@@ -541,6 +541,18 @@ day), with three or more consecutive days as a range: `2024-06-01 - 2024-06-05,
 10,000 shots, so a same-name file of a quite different size is another photo. Drives
 need not be connected: everything comes from the index.
 
+### GPS locations
+
+`dpf gps` writes `gps.csv` and `gps.xlsx` (in `~/.cache/dpf/reports/<timestamp>-gps/`):
+one row per photo or video with a GPS position, with file name, folder name, full path,
+date/time taken (EXIF capture time, else the created date), latitude, longitude,
+altitude, kind, camera, drive, pool and a map link. It reads the metadata `dpf exif`
+cached in the index, so the drives are not touched; files not yet read by `dpf exif`
+are not listed. `--pool NAME` limits it to one pool; `--dates FROM:TO` (repeatable, both
+days included) to files taken in those ranges, e.g.
+
+    dpf gps --dates 2020-08-01:2021-03-07 --dates 2021-07-01:2021-12-01
+
 ### Personal files in only one pool
 
 The main focus of a `--pool A --pool B` run. Right after the Drives section (and as the

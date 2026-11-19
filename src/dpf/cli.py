@@ -287,6 +287,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="CSV file (default: ~/.cache/dpf/reports/<timestamp>-folders/folders.csv)",
     )  # fmt: skip
 
+    gp = sub.add_parser(
+        "gps", help="table of every GPS position in the photos and videos",
+        description="Write gps.csv and gps.xlsx: one row per photo or video with a GPS "
+        "position (file name, folder, full path, date/time taken, latitude, longitude, "
+        "altitude, camera, drive, pool, map link). Reads the metadata `dpf exif` cached in "
+        "the index; the drives are not touched.",
+    )  # fmt: skip
+    gp.add_argument(
+        "--pool", metavar="NAME", action="append",
+        help="only the indexed drives of this pool (repeatable; default: every drive)",
+    )  # fmt: skip
+    gp.add_argument(
+        "--dates", metavar="FROM:TO", action="append", default=[],
+        help="only files taken between these days, both included (YYYY-MM-DD:YYYY-MM-DD, "
+        "or one day); repeatable, e.g. --dates 2020-08-01:2021-03-07 --dates 2024-01-15:"
+        "2025-12-01. Files without a date are left out then",
+    )  # fmt: skip
+    gp.add_argument(
+        "-o", "--out", default=None, metavar="DIR",
+        help="output folder (default: ~/.cache/dpf/reports/<timestamp>-gps)",
+    )  # fmt: skip
+
     sm = sub.add_parser(
         "smart", help="read the drives' SMART health into the index (smartctl via sudo)",
         description="Read the SMART data of every drive smartctl finds (or only the drives "
@@ -1669,6 +1691,49 @@ def _card(args: argparse.Namespace) -> int:
     return 1 if check.unreadable else 0
 
 
+def _gps(idx: Index, args: argparse.Namespace) -> int:
+    """`dpf gps`: every GPS position cached by `dpf exif`, from the index only."""
+    from dpf.gps import gps_rows, parse_range, write_gps_csv, write_gps_xlsx
+    from dpf.scanner import drop_nested
+
+    try:
+        ranges = [parse_range(t) for t in args.dates]
+    except ValueError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+    try:
+        pools = load_pools(args.pools_file) if args.pool else _pools_for_drives(args.pools_file)
+        wanted = {get_pool(pools, n).name for n in args.pool or ()}
+    except PoolError as e:
+        print(f"dpf: {e}", file=sys.stderr)
+        return 1
+    # Matched against indexed roots only: globbing mount folders would touch the drives.
+    roots = drop_nested(r.root for r in idx.roots())
+    if wanted:
+        roots = [r for r in roots if wanted & set(pools_of(pools, r))]
+    if not roots:
+        print("dpf: no indexed drives" + (" in that pool" if wanted else ""), file=sys.stderr)
+        return 1
+    out = args.out or _default_out_dir("gps")
+    _check_output_location(
+        out, roots, "the GPS table", allow_same_drive=args.allow_same_drive,
+        offline=set(roots),
+    )  # fmt: skip
+    rows = gps_rows(idx, roots, lambda root: ", ".join(pools_of(pools, root)), ranges)
+    os.makedirs(out, exist_ok=True)
+    csv_path = os.path.join(out, "gps.csv")
+    write_gps_csv(rows, csv_path)
+    print(f"{len(rows):,} files with a GPS position written to {csv_path}")
+    try:
+        write_gps_xlsx(rows, os.path.join(out, "gps.xlsx"))
+        print(f"  and {os.path.join(out, 'gps.xlsx')}")
+    except ModuleNotFoundError as e:
+        if e.name != "xlsxwriter":
+            raise
+        print("dpf: gps.xlsx skipped (install python3-xlsxwriter)", file=sys.stderr)
+    return 0
+
+
 def _folders(idx: Index, args: argparse.Namespace) -> int:
     """`dpf folders`: the folder overview CSV, from the index only."""
     from dpf.folders import sort_roots, write_folders_csv
@@ -1866,6 +1931,13 @@ def main(argv: list[str] | None = None) -> int:
         return _space(args, parser)
     if args.command == "card":
         return _card(args)
+    if args.command == "gps":
+        db = args.db or default_db_path()
+        if not os.path.exists(db):
+            print(f"dpf: nothing indexed yet ({db}); run `dpf scan PATH`", file=sys.stderr)
+            return 1
+        with Index(db) as idx:
+            return _gps(idx, args)
     if args.command == "folders":
         db = args.db or default_db_path()
         if not os.path.exists(db):
