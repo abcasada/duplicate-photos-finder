@@ -298,6 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pool", metavar="NAME", action="append",
         help="only the indexed drives of this pool (repeatable; default: every drive)",
     )  # fmt: skip
+    gp.add_argument("--photos-only", action="store_true", help="leave videos out")
     gp.add_argument(
         "--dates", metavar="FROM:TO", action="append", default=[],
         help="only files taken between these days, both included (YYYY-MM-DD:YYYY-MM-DD, "
@@ -1720,6 +1721,8 @@ def _gps(idx: Index, args: argparse.Namespace) -> int:
         offline=set(roots),
     )  # fmt: skip
     rows = gps_rows(idx, roots, lambda root: ", ".join(pools_of(pools, root)), ranges)
+    if args.photos_only:
+        rows = [r for r in rows if r.kind == "image"]
     os.makedirs(out, exist_ok=True)
     csv_path = os.path.join(out, "gps.csv")
     write_gps_csv(rows, csv_path)

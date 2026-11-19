@@ -548,7 +548,7 @@ one row per photo or video with a GPS position, with file name, folder name, ful
 date/time taken (EXIF capture time, else the created date), latitude, longitude,
 altitude, kind, camera, drive, pool and a map link. It reads the metadata `dpf exif`
 cached in the index, so the drives are not touched; files not yet read by `dpf exif`
-are not listed. `--pool NAME` limits it to one pool; `--dates FROM:TO` (repeatable, both
+are not listed. `--pool NAME` limits it to one pool, `--photos-only` leaves videos out, `--dates FROM:TO` (repeatable, both
 days included) to files taken in those ranges, e.g.
 
     dpf gps --dates 2020-08-01:2021-03-07 --dates 2021-07-01:2021-12-01
